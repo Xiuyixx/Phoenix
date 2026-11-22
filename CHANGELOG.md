@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.2 - 2026-11-22
+
+- 修复 GitHub Actions Release 的 Windows 打包方式，改用 PowerShell 原生压缩和 SHA256 校验。
+- 移除当前 GitHub 账户无法稳定调度的 macOS arm64 runner，避免矩阵任务卡住 Release。
+- 统一 Release 构建的跨平台 shell 处理。
+
 ## 0.0.1 - 2026-11-22
 
 - 创建 Phoenix CLIProxyAPI 原生插件项目。

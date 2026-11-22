@@ -32,10 +32,6 @@ jobs:
             goos: darwin
             goarch: amd64
             ext: dylib
-          - runner: macos-14
-            goos: darwin
-            goarch: arm64
-            ext: dylib
           - runner: windows-2025
             goos: windows
             goarch: amd64
@@ -58,7 +54,8 @@ jobs:
           test "$version" = "$(cat VERSION)"
           grep -q '^## '"$version"' ' CHANGELOG.md
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Build plugin
+      - name: Build plugin (Unix)
+        if: matrix.goos != 'windows'
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -72,6 +69,22 @@ jobs:
           printf '%s\n' "$VERSION" > dist/package/VERSION
           (cd dist/package && zip -q -r "../phoenix_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" .)
           sha256sum "dist/phoenix_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" > "dist/phoenix_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.sha256"
+      - name: Build plugin (Windows)
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist/package | Out-Null
+          $env:CGO_ENABLED = '1'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          go build -trimpath -buildmode=c-shared -ldflags "-X main.pluginVersion=$env:VERSION" -o dist/package/phoenix.dll .
+          Set-Content -Path dist/package/VERSION -Value $env:VERSION -NoNewline
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/phoenix_${env:VERSION}_windows_amd64.zip" -Force
+          $hash = (Get-FileHash "dist/phoenix_${env:VERSION}_windows_amd64.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  phoenix_${env:VERSION}_windows_amd64.zip" | Set-Content "dist/phoenix_${env:VERSION}_windows_amd64.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: phoenix-${{ matrix.goos }}-${{ matrix.goarch }}
