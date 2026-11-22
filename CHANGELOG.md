@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.7 - 2026-11-23
+
+- 管理接口需要 CPA 管理密钥：页面按 Lamplighter 的做法，从管理中心 `localStorage`（`cli-proxy-auth`）读取已记住的密钥，取不到时弹出密钥输入框（只保存在当前标签页 `sessionStorage`），401 时提示重新输入；之前页面调管理接口不带密钥，会直接 401 导致状态刷不出来。
+
 ## 0.0.6 - 2026-11-23
 
 - 修复管理页面空白：`handleManagement` 全部路由改回类型化的 `pluginapi.ManagementResponse`（`StatusCode` / `Headers` / `Body`），不再把 HTML 页或 JSON 包进 `okEnvelope` 当 result。之前宿主解码时报 `json: cannot unmarshal string into Go value of type pluginapi.ManagementResponse`，`/v0/resource/plugins/phoenix/page` 返回 502，页面空白；同时 `/status` 等接口的 Body 也为空，页面状态刷不出来。做法与 Lamplighter 的 `jsonResponse` 一致。
