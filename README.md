@@ -4,20 +4,13 @@ Phoenix 是一个面向 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyA
 
 项目名称取自“重生”：当周用量窗口耗尽且账号仍有 reset credit 时，Phoenix 可以消耗一张 credit，清除 CLIProxyAPI 对该凭证的本地冷却，让凭证恢复可调度状态。
 
-> 当前版本：`0.0.5`。项目仍在持续开发中，安装到生产 CPA 前建议先使用测试凭证验证上游 reset credit 接口和 CPA 版本兼容性。
+> 当前版本：`0.0.6`。项目仍在持续开发中，安装到生产 CPA 前建议先使用测试凭证验证上游 reset credit 接口和 CPA 版本兼容性。
 
 ## 主要功能
 
 ### 额度与账号状态
 
-Phoenix 通过 CLIProxyAPI 的插件生命周期和 usage 回调接收请求结果，记录与凭证相关的状态，并在管理页面显示账号卡片。页面采用 Lamplighter 的管理中心风格，包含：
-
-- 额度视图和设置视图。
-- 账号状态卡片。
-- 周用量窗口状态和预计重置时间展示。
-- 最近操作入口。
-- 运行状态提示。
-- 与 CPA 管理中心主题相适配的简洁界面结构。
+Phoenix 通过两条路径收集额度数据：主动轮询按 `poll_interval_seconds`（默认 300 秒）枚举 Codex 凭证并查询上游 `/wham/usage`，按窗口时长识别周窗口；被动接收 CPA 的 usage 回调，成功记为正常、`usage_limit_reached` 的 429 记为周窗口耗尽并记录重置时间。页面新增“最近事件”列表，账号异常、重置与点火结果都会记录在内。
 
 额度数据是否完整取决于 CPA 版本、凭证类型以及上游响应中是否包含可解析的额度字段。没有收到有效额度数据时，页面会显示等待状态，不会把缺失数据当成 100% 或 0% 使用量。
 
@@ -66,14 +59,14 @@ Bot Token 只用于调用 Telegram Bot API，不写入 Git 仓库。配置文件
 
 ### 手动重置与点火入口
 
-管理页面的操作顺序固定为：
+管理页面的“立即操作”卡片内操作顺序固定为：
 
 1. `立即重置`
 2. `立即点火`
 
 这样可以先处理周额度和本地冷却，再执行后续点火操作。按钮请求会被记录到 CPA 日志，页面会反馈请求已提交。
 
-当前版本已提供自动点火配置、管理入口和插件日志接口；点火请求的实际模型选择、CPA 执行器调用和完整的主动额度轮询仍在持续接入中。部署时应以页面状态和 CPA 日志为准，不要仅根据按钮出现就判断点火已经成功完成。
+点火通过宿主的模型执行回调发送一次最小 Codex 请求（只要求回复 `OK`，不推理、不用工具），从而开始一个新的 5 小时窗口。自动点火在每日开始—结束时段内每个凭证最多执行一次，重置成功后也会按配置的延迟自动点火一次。点火模型默认 `gpt-5-codex`，可在设置页修改。
 
 ## 兼容性与构建平台
 
@@ -105,12 +98,12 @@ uname -m
 
 ### 1. 下载正确的 Release 包
 
-打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.0.5`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
+打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.0.6`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
 
 Linux amd64 示例：
 
 ```bash
-VERSION=0.0.5
+VERSION=0.0.6
 mkdir -p /tmp/phoenix-$VERSION
 cd /tmp/phoenix-$VERSION
 curl -fL -o phoenix.zip "https://github.com/Xiuyixx/Phoenix/releases/download/v$VERSION/phoenix_${VERSION}_linux_amd64.zip"
@@ -128,7 +121,7 @@ unzip -o phoenix.zip
 Windows 使用 PowerShell 校验：
 
 ```powershell
-$version = "0.0.5"
+$version = "0.0.6"
 $file = "phoenix_${version}_windows_amd64.zip"
 (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
 Get-Content "${file}.sha256"
@@ -266,12 +259,15 @@ sha256sum -c dist/checksums.txt
 | `reset.enabled` | 是否允许自动和手动重置流程。 |
 | `reset.weekly_only` | 只处理周用量窗口，建议开启。 |
 | `reset.minimum_reset_seconds` | 触发自动重置所需的最少剩余秒数，默认 `86400`。 |
+| `reset.credentials` | 纳入重置的凭证（auth_index 或 auth_id），多个值用分号或 YAML 列表表示，留空为全部 Codex 凭证。 |
 | `ignition.enabled` | 自动点火开关。 |
 | `ignition.start_hour` | 自动点火每日开始小时。 |
 | `ignition.end_hour` | 自动点火每日结束小时。 |
 | `ignition.grace_seconds` | 额度窗口重置后等待的秒数。 |
+| `ignition.model` | 点火使用的模型，默认 `gpt-5-codex`。 |
+| `poll_interval_seconds` | 主动额度查询间隔（秒），默认 `300`，最小 `60`。 |
 
-设置页面可以修改 Telegram、重置和点火相关字段。修改后应重新读取页面状态确认保存结果，并查看 CPA 日志确认插件已经应用配置。
+设置页面可以修改 Telegram、重置和点火相关字段，保存时按字段合并，不会清空页面不展示的配置。页面保存立即生效，但只保存在内存里，CPA 重启后会恢复为 `config.yaml` 中的配置；需要长期生效的配置请写进 `config.yaml`。修改后应重新读取页面状态确认保存结果，并查看 CPA 日志确认插件已经应用配置。
 
 ## 安全与运行边界
 
@@ -329,18 +325,18 @@ sha256sum -c dist/checksums.txt
 
 ## 版本与发布流程
 
-版本号统一保存在 `VERSION`，并同步到 `main.go` 和 `CHANGELOG.md`。当前版本为 `0.0.5`。
+版本号统一保存在 `VERSION`，并同步到 `main.go` 和 `CHANGELOG.md`。当前版本为 `0.0.6`。
 
-后续每次功能、修复或文档变更都递增版本号，例如从 `0.0.5` 到 `0.0.6`，完成验证后执行：
+后续每次功能、修复或文档变更都递增版本号，例如从 `0.0.6` 到 `0.0.7`，完成验证后执行：
 
 ```bash
-make check-version VERSION=0.0.5
+make check-version VERSION=0.0.6
 go test ./...
 git add .
 git commit -m "..."
 git push origin master
-git tag -a v0.0.5 -m "Phoenix v0.0.5"
-git push origin v0.0.5
+git tag -a v0.0.6 -m "Phoenix v0.0.6"
+git push origin v0.0.6
 ```
 
 推送版本 tag 后，GitHub Actions 会自动构建并发布：
