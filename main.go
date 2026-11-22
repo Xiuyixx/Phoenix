@@ -43,7 +43,7 @@ import (
 
 const (
 	pluginID       = "phoenix"
-	pluginVersion  = "0.0.4"
+	pluginVersion  = "0.0.5"
 	repository     = "https://github.com/Xiuyixx/Phoenix"
 	managementBase = "/v0/management/phoenix"
 	resourcePath   = "/page"
@@ -253,9 +253,32 @@ func parseYAML(b []byte, c *Config) {
 	}
 }
 
-func registration() any {
-	return map[string]any{"schema_version": pluginabi.SchemaVersion, "metadata": map[string]any{"name": "Phoenix", "version": pluginVersion, "author": "Xiuyixx", "github_repository": repository, "config_fields": configFields()}, "capabilities": map[string]bool{"management_api": true, "usage_plugin": true}}
+func registration() pluginRegistration {
+	return pluginRegistration{
+		SchemaVersion: pluginabi.SchemaVersion,
+		Metadata: pluginapi.Metadata{
+			Name:             "Phoenix",
+			Version:          pluginVersion,
+			Author:           "Xiuyixx",
+			GitHubRepository: repository,
+			ConfigFields:     configFields(),
+		},
+		Capabilities: map[string]bool{"management_api": true, "usage_plugin": true},
+	}
 }
+
+// pluginRegistration mirrors the shape Lamplighter uses: Metadata must be the
+// typed pluginapi.Metadata struct, not a map. Its fields have no JSON tags,
+// so the host decodes them by Go field name ("GitHubRepository",
+// "ConfigFields"). A map with snake_case keys ("github_repository",
+// "config_fields") decoded those fields as empty, and the host then rejected
+// the plugin as "invalid metadata or no capabilities".
+type pluginRegistration struct {
+	SchemaVersion uint32             `json:"schema_version"`
+	Metadata      pluginapi.Metadata `json:"metadata"`
+	Capabilities  map[string]bool    `json:"capabilities"`
+}
+
 func configFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{{Name: "telegram", Type: pluginapi.ConfigFieldTypeObject, Description: "Telegram Bot Token 与多个 Chat ID（使用分号分隔）"}, {Name: "alerts", Type: pluginapi.ConfigFieldTypeObject, Description: "额度阈值、恢复提醒与账号错误提醒"}, {Name: "reset", Type: pluginapi.ConfigFieldTypeObject, Description: "周用量窗口耗尽时使用 reset credit 自动重置"}, {Name: "ignition", Type: pluginapi.ConfigFieldTypeObject, Description: "窗口重置后自动发送最小请求"}, {Name: "poll_interval_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "额度查询间隔（秒）"}}
 }

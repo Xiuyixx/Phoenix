@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.5 - 2026-11-23
+
+- 修复 Phoenix 在 CLIProxyAPI 8.1.1 上启动即被拒绝的问题：注册信息改用类型化的 `pluginapi.Metadata`，不再用 snake_case 的 map 键（`github_repository` / `config_fields`），宿主按 Go 字段名解码时这两个字段会丢成空值，导致 `validPlugin` 判定失败并报 `plugin phoenix returned invalid metadata or no capabilities`。
+- 增加回归测试 `TestRegistrationMetadataParses`，确保注册 JSON 能被宿主正确解析出名称、版本、作者、仓库地址和 capabilities。
+
 ## 0.0.4 - 2026-11-22
 
 - 重新整理并扩充 README，补充功能边界、安装路径、平台匹配、配置、验证、升级和故障排查说明。

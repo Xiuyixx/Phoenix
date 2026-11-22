@@ -4,7 +4,7 @@ Phoenix 是一个面向 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyA
 
 项目名称取自“重生”：当周用量窗口耗尽且账号仍有 reset credit 时，Phoenix 可以消耗一张 credit，清除 CLIProxyAPI 对该凭证的本地冷却，让凭证恢复可调度状态。
 
-> 当前版本：`0.0.4`。项目仍在持续开发中，安装到生产 CPA 前建议先使用测试凭证验证上游 reset credit 接口和 CPA 版本兼容性。
+> 当前版本：`0.0.5`。项目仍在持续开发中，安装到生产 CPA 前建议先使用测试凭证验证上游 reset credit 接口和 CPA 版本兼容性。
 
 ## 主要功能
 
@@ -105,12 +105,12 @@ uname -m
 
 ### 1. 下载正确的 Release 包
 
-打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.0.4`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
+打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.0.5`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
 
 Linux amd64 示例：
 
 ```bash
-VERSION=0.0.4
+VERSION=0.0.5
 mkdir -p /tmp/phoenix-$VERSION
 cd /tmp/phoenix-$VERSION
 curl -fL -o phoenix.zip "https://github.com/Xiuyixx/Phoenix/releases/download/v$VERSION/phoenix_${VERSION}_linux_amd64.zip"
@@ -128,7 +128,7 @@ unzip -o phoenix.zip
 Windows 使用 PowerShell 校验：
 
 ```powershell
-$version = "0.0.4"
+$version = "0.0.5"
 $file = "phoenix_${version}_windows_amd64.zip"
 (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
 Get-Content "${file}.sha256"
@@ -329,9 +329,9 @@ sha256sum -c dist/checksums.txt
 
 ## 版本与发布流程
 
-版本号统一保存在 `VERSION`，并同步到 `main.go` 和 `CHANGELOG.md`。当前版本为 `0.0.4`。
+版本号统一保存在 `VERSION`，并同步到 `main.go` 和 `CHANGELOG.md`。当前版本为 `0.0.5`。
 
-后续每次功能、修复或文档变更都递增版本号，例如从 `0.0.4` 到 `0.0.5`，完成验证后执行：
+后续每次功能、修复或文档变更都递增版本号，例如从 `0.0.5` 到 `0.0.6`，完成验证后执行：
 
 ```bash
 make check-version VERSION=0.0.5
