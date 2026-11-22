@@ -25,11 +25,13 @@ static void free_host(void* p, size_t n) { if (stored_host && stored_host->free_
 import "C"
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -44,7 +46,7 @@ import (
 
 const (
 	pluginID       = "phoenix"
-	pluginVersion  = "0.0.7"
+	pluginVersion  = "0.0.8"
 	repository     = "https://github.com/Xiuyixx/Phoenix"
 	managementBase = "/v0/management/phoenix"
 	resourcePath   = "/page"
@@ -62,8 +64,46 @@ type runtime struct {
 	lastUsage  map[string]UsageSnapshot
 	events     []panelEvent
 	resetState map[string]resetGuard
-	lastIgnite map[string]time.Time
 	stopCh     chan struct{}
+
+	// Dual-window account state, keyed by auth_index (windows.go).
+	accounts map[string]*accountState
+	// pollErrs records the last active-poll failure per credential so a
+	// poll failure is surfaced in status instead of silently swallowed.
+	pollErrs  map[string]string
+	lastPoll  time.Time
+	nextPoll  time.Time
+	listErr   string
+	configErr string
+	// lastNotifyErr / modelsErr feed status.errors.
+	lastNotifyErr string
+	modelsErr     string
+	// configAppliedToken is the config_token of the config this runtime
+	// applied; the page compares it with the token it saved via CPA PATCH.
+	configAppliedToken string
+	// dataDir is <plugins.dir>/data/phoenix, or "" for memory-only mode
+	// (no data dir could be resolved; see persist.go).
+	dataDir string
+	// state is the persisted state.json content (alert baselines,
+	// ignition targets, credential problems, cooldown notices).
+	state      *persistedState
+	stateDirty bool
+	// histMem holds history records when dataDir == "" (memory-only).
+	histMem   []historyRecord
+	histMu    sync.Mutex
+	lastPrune time.Time
+	// pendingNotifies / pendingEvents are queued while rt.mu is held and
+	// drained after the lock is released (alerts.go).
+	pendingNotifies []pendingNotify
+	pendingEvents   []pendingEvent
+	// models list cache (10 min TTL) for ignition candidate selection.
+	modelsCache   []string
+	modelsFetched time.Time
+	modelsKey     string
+	// confirmDelays / sleep override the ignition-confirmation timing in
+	// tests; nil means the defaults / time.Sleep.
+	confirmDelays []time.Duration
+	sleepFunc     func(time.Duration)
 }
 
 // panelEvent is one row of the "最近事件" list on the management page.
@@ -71,6 +111,17 @@ type panelEvent struct {
 	Time    time.Time `json:"time"`
 	Kind    string    `json:"kind"`
 	Message string    `json:"message"`
+	// Notify reports the delivery outcome of a notification tied to this
+	// event, when one was sent ("sent" | "failed").
+	Notify string `json:"notify,omitempty"`
+	// AuthIndex / Window / Event / Params let the panel and the history
+	// endpoint filter events per account and window instead of matching
+	// message text. Event is the history event type ("ignite", "reset",
+	// "alert", "error", "info", ...).
+	AuthIndex string            `json:"auth_index,omitempty"`
+	Window    string            `json:"window,omitempty"`
+	Event     string            `json:"event,omitempty"`
+	Params    map[string]string `json:"params,omitempty"`
 }
 
 // resetGuard implements mrchi's debounce: one in-flight reset flow per
@@ -86,22 +137,46 @@ type resetGuard struct {
 const resetSuppressWindow = 5 * time.Minute
 
 type Config struct {
-	Enabled             bool           `yaml:"enabled" json:"enabled"`
-	Telegram            TelegramConfig `yaml:"telegram" json:"telegram"`
-	Alerts              AlertConfig    `yaml:"alerts" json:"alerts"`
-	Reset               ResetConfig    `yaml:"reset" json:"reset"`
-	Ignition            IgnitionConfig `yaml:"ignition" json:"ignition"`
-	PollIntervalSeconds int            `yaml:"poll_interval_seconds" json:"poll_interval_seconds"`
+	Enabled              bool           `yaml:"enabled" json:"enabled"`
+	Telegram             TelegramConfig `yaml:"telegram" json:"telegram"`
+	Alerts               AlertConfig    `yaml:"alerts" json:"alerts"`
+	Reset                ResetConfig    `yaml:"reset" json:"reset"`
+	Ignition             IgnitionConfig `yaml:"ignition" json:"ignition"`
+	PollIntervalSeconds  int            `yaml:"poll_interval_seconds" json:"poll_interval_seconds"`
+	HistoryRetentionDays int            `yaml:"history_retention_days" json:"history_retention_days"`
+	// ConfigToken is the 16-hex-char token the page sends with every CPA
+	// PATCH save. It is stored and echoed as status.config_applied_token
+	// so the page can confirm the save was applied. It is never a secret
+	// and is never used for authentication.
+	ConfigToken string `yaml:"config_token" json:"-"`
+	// DataDir overrides the resolved data directory (<plugins.dir>/data/phoenix).
+	DataDir string `yaml:"data_dir" json:"-"`
 }
 type TelegramConfig struct {
 	BotToken string `yaml:"bot_token" json:"bot_token"`
 	ChatIDs  string `yaml:"chat_ids" json:"chat_ids"`
 	Enabled  bool   `yaml:"enabled" json:"enabled"`
 }
+
+// WindowModes holds one notification mode per window kind.
+type WindowModes struct {
+	FiveHour string `yaml:"five_hour" json:"five_hour"`
+	SevenDay string `yaml:"seven_day" json:"seven_day"`
+}
+
 type AlertConfig struct {
-	Thresholds     []int `yaml:"thresholds" json:"thresholds"`
-	NotifyRecovery bool  `yaml:"notify_recovery" json:"notify_recovery"`
-	NotifyErrors   bool  `yaml:"notify_errors" json:"notify_errors"`
+	Thresholds []int `yaml:"thresholds" json:"thresholds"`
+	// Thresholds are notice/low/critical, validated to notice >= low >=
+	// critical at parse time.
+	// RecoveryNotify modes are "off" | "all" | "after_exhausted" (5h
+	// default after_exhausted, 7d default all); ResetReminder modes are
+	// "off" | "all" | "has_remaining" (5h default all, 7d default
+	// has_remaining). NotifyRecovery is derived: true when any window's
+	// recovery mode is not "off".
+	RecoveryNotify WindowModes `yaml:"recovery_notify" json:"recovery_notify"`
+	ResetReminder  WindowModes `yaml:"reset_reminder" json:"reset_reminder"`
+	NotifyRecovery bool        `yaml:"notify_recovery" json:"notify_recovery"`
+	NotifyErrors   bool        `yaml:"notify_errors" json:"notify_errors"`
 }
 type ResetConfig struct {
 	Enabled             bool     `yaml:"enabled" json:"enabled"`
@@ -110,17 +185,32 @@ type ResetConfig struct {
 	MinimumResetSeconds int      `yaml:"minimum_reset_seconds" json:"minimum_reset_seconds"`
 }
 type IgnitionConfig struct {
-	Enabled      bool   `yaml:"enabled" json:"enabled"`
-	StartHour    int    `yaml:"start_hour" json:"start_hour"`
-	EndHour      int    `yaml:"end_hour" json:"end_hour"`
-	GraceSeconds int    `yaml:"grace_seconds" json:"grace_seconds"`
-	Model        string `yaml:"model" json:"model"`
+	Enabled   bool `yaml:"enabled" json:"enabled"`
+	StartHour int  `yaml:"start_hour" json:"start_hour"`
+	EndHour   int  `yaml:"end_hour" json:"end_hour"`
+	// EndGraceMinutes extends the daily window past end_hour.
+	EndGraceMinutes int `yaml:"end_grace_minutes" json:"end_grace_minutes"`
+	GraceSeconds    int `yaml:"grace_seconds" json:"grace_seconds"`
+	// FailureRetrySeconds is the base transient-failure retry delay;
+	// retries back off x3 per consecutive failure.
+	FailureRetrySeconds int `yaml:"failure_retry_seconds" json:"failure_retry_seconds"`
+	// MaxTransientFailures opens the circuit breaker (until next daily
+	// start) when reached; hard errors open it immediately.
+	MaxTransientFailures int    `yaml:"max_transient_failures" json:"max_transient_failures"`
+	Model                string `yaml:"model" json:"model"`
+	// ModelsAPIKey is the CPA API key used to fetch /v1/models for
+	// candidate selection. It is never returned in status (see
+	// maskedConfig); the configured Model always wins when non-empty.
+	ModelsAPIKey string `yaml:"models_api_key" json:"-"`
+	CPABaseURL   string `yaml:"cpa_base_url" json:"cpa_base_url"`
 }
 type UsageSnapshot struct {
 	Provider        string    `json:"provider"`
 	AuthID          string    `json:"auth_id"`
 	WeeklyRemaining int       `json:"weekly_remaining"`
 	WeeklyResetAt   time.Time `json:"weekly_reset_at"`
+	FiveRemaining   int       `json:"five_remaining"`
+	FiveResetAt     time.Time `json:"five_reset_at"`
 	Status          string    `json:"status"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -244,7 +334,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if active != nil && active.stopCh != nil {
 			close(active.stopCh)
 		}
-		rt := &runtime{cfg: cfg, host: cgoHost{}, lastUsage: map[string]UsageSnapshot{}, resetState: map[string]resetGuard{}, lastIgnite: map[string]time.Time{}, stopCh: make(chan struct{})}
+		rt := &runtime{cfg: cfg, host: cgoHost{}, lastUsage: map[string]UsageSnapshot{}, resetState: map[string]resetGuard{}, accounts: map[string]*accountState{}, pollErrs: map[string]string{}, stopCh: make(chan struct{})}
+		rt.dataDir = resolveDataDir(cfg)
+		rt.state = loadPersistedState(rt.dataDir)
+		rt.configAppliedToken = cfg.ConfigToken
+		if rt.dataDir != "" {
+			rt.events = loadRecentEvents(rt.dataDir+"/history", 7, maxPanelEvents, time.Now())
+		}
 		active = rt
 		hostMu.Unlock()
 		go rt.pollLoop()
@@ -263,7 +359,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func defaultConfig() Config {
-	return Config{Enabled: true, Alerts: AlertConfig{Thresholds: []int{50, 20, 10}, NotifyErrors: true}, Reset: ResetConfig{Enabled: true, WeeklyOnly: true, MinimumResetSeconds: 86400}, Ignition: IgnitionConfig{Enabled: true, StartHour: 7, EndHour: 22, GraceSeconds: 3, Model: "gpt-5-codex"}, PollIntervalSeconds: 300}
+	return Config{Enabled: true, Alerts: AlertConfig{Thresholds: []int{50, 20, 10}, NotifyErrors: true, RecoveryNotify: WindowModes{FiveHour: "after_exhausted", SevenDay: "all"}, ResetReminder: WindowModes{FiveHour: "all", SevenDay: "has_remaining"}}, Reset: ResetConfig{Enabled: true, WeeklyOnly: true, MinimumResetSeconds: 86400}, Ignition: IgnitionConfig{Enabled: true, StartHour: 7, EndHour: 22, EndGraceMinutes: 30, GraceSeconds: 3, FailureRetrySeconds: 300, MaxTransientFailures: 3, Model: "gpt-5-codex", CPABaseURL: "http://127.0.0.1:8317"}, PollIntervalSeconds: 300, HistoryRetentionDays: 40}
 }
 func parseYAML(b []byte, c *Config) {
 	lines := strings.Split(string(b), "\n")
@@ -281,6 +377,7 @@ func parseYAML(b []byte, c *Config) {
 		if t == "" || strings.HasPrefix(t, "#") {
 			continue
 		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
 		if strings.HasPrefix(t, "- ") {
 			if dst := listTarget(); dst != nil {
 				*dst = append(*dst, strings.Trim(strings.TrimSpace(strings.TrimPrefix(t, "- ")), "\"'"))
@@ -289,12 +386,13 @@ func parseYAML(b []byte, c *Config) {
 		}
 		if !strings.HasPrefix(t, "-") && strings.HasSuffix(t, ":") {
 			key := strings.TrimSuffix(t, ":")
-			if len(line)-len(strings.TrimLeft(line, " ")) == 0 {
+			if indent == 0 {
 				// Top-level header, e.g. "telegram:".
 				section = key
 				sub = ""
 			} else {
-				// Nested header, e.g. "  credentials:" under "reset:".
+				// Nested header, e.g. "  credentials:" under "reset:", or
+				// "  recovery_notify:" under "alerts:".
 				sub = key
 			}
 			continue
@@ -304,16 +402,35 @@ func parseYAML(b []byte, c *Config) {
 			continue
 		}
 		k, v := strings.TrimSpace(parts[0]), strings.Trim(strings.TrimSpace(parts[1]), "\"'")
+		if indent <= 2 {
+			// A section-level key ends any nested block.
+			sub = ""
+		}
 		if section == "" {
 			switch k {
 			case "enabled":
 				c.Enabled = v == "true"
 			case "poll_interval_seconds":
 				fmt.Sscanf(v, "%d", &c.PollIntervalSeconds)
+			case "history_retention_days":
+				fmt.Sscanf(v, "%d", &c.HistoryRetentionDays)
+			case "config_token":
+				// The page PATCHes this through CPA with every save; the
+				// plugin stores it and echoes it as
+				// status.config_applied_token so the page can confirm the
+				// save was applied. Persistence lives in CPA's config.yaml,
+				// never in a plugin-owned file.
+				c.ConfigToken = v
+			case "data_dir":
+				c.DataDir = v
 			}
 			continue
 		}
-		switch section + "." + k {
+		fullKey := section + "." + k
+		if sub != "" {
+			fullKey = section + "." + sub + "." + k
+		}
+		switch fullKey {
 		case "telegram.bot_token":
 			c.Telegram.BotToken = v
 		case "telegram.chat_ids":
@@ -326,6 +443,14 @@ func parseYAML(b []byte, c *Config) {
 			c.Alerts.NotifyErrors = v == "true"
 		case "alerts.thresholds":
 			c.Alerts.Thresholds = parseInts(v)
+		case "alerts.recovery_notify.five_hour", "alerts.recovery_5h":
+			c.Alerts.RecoveryNotify.FiveHour = v
+		case "alerts.recovery_notify.seven_day", "alerts.recovery_7d":
+			c.Alerts.RecoveryNotify.SevenDay = v
+		case "alerts.reset_reminder.five_hour", "alerts.reminder_5h":
+			c.Alerts.ResetReminder.FiveHour = v
+		case "alerts.reset_reminder.seven_day", "alerts.reminder_7d":
+			c.Alerts.ResetReminder.SevenDay = v
 		case "reset.enabled":
 			c.Reset.Enabled = v != "false"
 		case "reset.weekly_only":
@@ -341,11 +466,58 @@ func parseYAML(b []byte, c *Config) {
 			fmt.Sscanf(v, "%d", &c.Ignition.StartHour)
 		case "ignition.end_hour":
 			fmt.Sscanf(v, "%d", &c.Ignition.EndHour)
+		case "ignition.end_grace_minutes":
+			fmt.Sscanf(v, "%d", &c.Ignition.EndGraceMinutes)
 		case "ignition.grace_seconds":
 			fmt.Sscanf(v, "%d", &c.Ignition.GraceSeconds)
+		case "ignition.failure_retry_seconds":
+			fmt.Sscanf(v, "%d", &c.Ignition.FailureRetrySeconds)
+		case "ignition.max_transient_failures":
+			fmt.Sscanf(v, "%d", &c.Ignition.MaxTransientFailures)
+		case "ignition.models_api_key":
+			c.Ignition.ModelsAPIKey = v
+		case "ignition.cpa_base_url":
+			c.Ignition.CPABaseURL = strings.TrimRight(v, "/")
 		case "ignition.model":
 			c.Ignition.Model = v
 		}
+	}
+	// Validate/normalize: thresholds notice >= low >= critical, recovery
+	// and reminder modes restricted to their allowed sets, retention
+	// bounded. The configured ignition model is never touched here.
+	normalizeAlertModes(&c.Alerts)
+	if c.HistoryRetentionDays < 1 {
+		c.HistoryRetentionDays = 1
+	}
+	if c.HistoryRetentionDays > 365 {
+		c.HistoryRetentionDays = 365
+	}
+	if c.Ignition.StartHour < 0 {
+		c.Ignition.StartHour = 0
+	}
+	if c.Ignition.StartHour > 23 {
+		c.Ignition.StartHour = 23
+	}
+	if c.Ignition.EndHour < 0 {
+		c.Ignition.EndHour = 0
+	}
+	if c.Ignition.EndHour > 23 {
+		c.Ignition.EndHour = 23
+	}
+	if c.Ignition.EndGraceMinutes < 0 {
+		c.Ignition.EndGraceMinutes = 0
+	}
+	if c.Ignition.FailureRetrySeconds < 60 {
+		c.Ignition.FailureRetrySeconds = 60
+	}
+	if c.Ignition.MaxTransientFailures < 1 {
+		c.Ignition.MaxTransientFailures = 1
+	}
+	if c.Ignition.MaxTransientFailures > 10 {
+		c.Ignition.MaxTransientFailures = 10
+	}
+	if c.Ignition.CPABaseURL == "" {
+		c.Ignition.CPABaseURL = "http://127.0.0.1:8317"
 	}
 }
 
@@ -408,8 +580,13 @@ func configFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{{Name: "telegram", Type: pluginapi.ConfigFieldTypeObject, Description: "Telegram Bot Token 与多个 Chat ID（使用分号分隔）"}, {Name: "alerts", Type: pluginapi.ConfigFieldTypeObject, Description: "额度阈值、恢复提醒与账号错误提醒"}, {Name: "reset", Type: pluginapi.ConfigFieldTypeObject, Description: "周用量窗口耗尽时使用 reset credit 自动重置"}, {Name: "reset.credentials", Type: pluginapi.ConfigFieldTypeArray, Description: "纳入重置的凭证（auth_index 或 auth_id），留空为全部 Codex 凭证"}, {Name: "ignition", Type: pluginapi.ConfigFieldTypeObject, Description: "窗口重置后自动发送最小请求"}, {Name: "ignition.model", Type: pluginapi.ConfigFieldTypeString, Description: "点火使用的模型，默认 gpt-5-codex"}, {Name: "poll_interval_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "额度查询间隔（秒）"}}
 }
 func managementRegistration() any {
-	return map[string]any{"routes": []map[string]string{{"method": "GET", "path": managementBase + "/status"}, {"method": "POST", "path": managementBase + "/refresh"}, {"method": "POST", "path": managementBase + "/reset"}, {"method": "POST", "path": managementBase + "/ignite"}, {"method": "POST", "path": managementBase + "/test-notify"}, {"method": "PUT", "path": managementBase + "/settings"}}, "resources": []map[string]string{{"path": resourcePath, "menu": "Phoenix", "description": "额度监控、推送提醒、立即重置与自动点火"}}}
+	return map[string]any{"routes": []map[string]string{{"method": "GET", "path": managementBase + "/status"}, {"method": "GET", "path": managementBase + "/history"}, {"method": "POST", "path": managementBase + "/refresh"}, {"method": "POST", "path": managementBase + "/reset"}, {"method": "POST", "path": managementBase + "/ignite"}, {"method": "POST", "path": managementBase + "/test-notify"}, {"method": "PUT", "path": managementBase + "/settings"}}, "resources": []map[string]string{{"path": resourcePath, "menu": "Phoenix", "description": "额度监控、推送提醒、立即重置与自动点火"}}}
 }
+
+// maxPanelEvents is the size of the "最近事件" ring (200); events are
+// also persisted to history JSONL and the last 7 days are reloaded at
+// startup, so the list survives a restart.
+const maxPanelEvents = 200
 
 func handleUsage(request []byte) ([]byte, error) {
 	var r pluginapi.UsageRecord
@@ -422,51 +599,119 @@ func handleUsage(request []byte) ([]byte, error) {
 	if rt == nil {
 		return okEnvelope(struct{}{}), nil
 	}
-	// Passive quota tracking: every usage record refreshes the account card.
-	// UsageRecord carries no remaining-percent fields, so a successful record
-	// marks the account healthy, and a usage_limit_reached 429 marks the
-	// weekly window exhausted with its reset time. Active polling
-	// (pollLoop) fills in the actual remaining percentage.
-	rt.mu.Lock()
-	snap, ok := rt.lastUsage[r.AuthID]
-	if !ok {
-		snap = UsageSnapshot{Provider: r.Provider, AuthID: r.AuthID}
+	// Passive quota tracking, keyed by auth_index (never auth_id/name).
+	// A UsageRecord carries no remaining-percent fields, so only a
+	// usage_limit_reached 429 updates a window — split by window
+	// (limit_window_minutes 300 -> 5h, 10080 -> 7d) — and only for windows
+	// the active poll has confirmed, so a retired window is never
+	// resurrected by a stale passive record. A successful record clears
+	// the account error and any credential problem.
+	index := r.AuthIndex
+	if index == "" {
+		index = r.AuthID
 	}
-	snap.UpdatedAt = time.Now()
+	now := time.Now()
+	var records []historyRecord
+	triggerReset := false
+	rt.mu.Lock()
+	acct := rt.getOrCreateAccountLocked(index)
+	acct.Provider = r.Provider
+	acct.AuthID = r.AuthID
+	if acct.Title == "" {
+		acct.Title = "凭证 " + index
+	}
+	acct.UpdatedAt = now
 	if r.Failed {
-		snap.Status = "error"
+		acct.Error = fmt.Sprintf("upstream status %d", r.Failure.StatusCode)
 		if r.Provider == "codex" && r.Failure.StatusCode == 429 && strings.Contains(strings.ToLower(r.Failure.Body), "usage_limit_reached") {
-			snap.WeeklyRemaining = 0
-			if secs := usageLimitResetsIn(r.Failure.Body); secs > 0 {
-				snap.WeeklyResetAt = time.Now().Add(time.Duration(secs) * time.Second)
+			kind, secs := usageLimitWindow(r.Failure.Body)
+			if kind != "" && acct.activeConfirmed(kind) {
+				w := acct.window(kind)
+				w.Remaining = 0
+				if secs > 0 {
+					w.Reset = now.Add(time.Duration(secs) * time.Second)
+					acct.CooldownUntil = w.Reset
+				}
+				w.Source = "passive"
+				w.ObservedAt = now
+				records = append(records, historyRecord{Kind: "s", Time: now.Unix(), Group: index, Window: kind, Remaining: 0, Reset: w.Reset.Unix(), Source: "passive"})
+				rt.evaluateWindowAlertsLocked(acct, kind, *w, "passive", now)
+				observeReset(rt.state.target(index), w.Reset, now, true)
+			}
+			if rt.cfg.Reset.Enabled && included(rt.cfg.Reset.Credentials, r) && exhaustedForReset(r.Failure.Body, rt.cfg.Reset.MinimumResetSeconds, rt.cfg.Reset.WeeklyOnly) {
+				triggerReset = true
 			}
 		}
+		if kind, detail := classifyAccountFailure(r.Failure.StatusCode, r.Failure.Body); kind != "" {
+			if prob := rt.recordCredentialFailureLocked(acct, kind, detail, now); prob != nil && rt.cfg.Alerts.NotifyErrors {
+				title := "Phoenix 账号异常"
+				if kind == "disabled" {
+					title = "Phoenix 账号已停用"
+				}
+				rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "credential", authIndex: index, title: title, body: fmt.Sprintf("凭证 %s（%s）%s，请检查凭证。", index, acct.Title, problemText(kind, r.Failure.StatusCode))})
+				rt.pendingEvents = append(rt.pendingEvents, pendingEvent{kind: "error", message: fmt.Sprintf("%s：凭证 %s 返回错误状态码 %d", title, index, r.Failure.StatusCode), authIndex: index, eventType: "error"})
+			}
+		} else if rt.cfg.Alerts.NotifyErrors && (r.Failure.StatusCode == 401 || r.Failure.StatusCode == 403 || r.Failure.StatusCode == 429) {
+			// Non-classified upstream errors still notify once per record
+			// when error notifications are on, as before — but respect
+			// alerts.notify_errors (previously unconditional).
+			disabled := isAccountDisabled(r.Failure.Body)
+			title := "Phoenix 账号异常"
+			if disabled {
+				title = "Phoenix 账号已停用"
+			}
+			rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "credential", authIndex: index, title: title, body: fmt.Sprintf("账号 %s 返回错误状态码 %d", r.AuthID, r.Failure.StatusCode)})
+			rt.pendingEvents = append(rt.pendingEvents, pendingEvent{kind: "error", message: fmt.Sprintf("%s：账号 %s 返回错误状态码 %d", title, r.AuthID, r.Failure.StatusCode), authIndex: index, eventType: "error"})
+		}
+	} else {
+		acct.Error = ""
+		delete(rt.pollErrs, index)
+		rt.clearCredentialProblemLocked(acct)
+	}
+	// Keep the legacy usage map in sync (keyed by auth_index).
+	snap := rt.lastUsage[index]
+	snap.Provider = r.Provider
+	snap.AuthID = r.AuthID
+	snap.UpdatedAt = now
+	if r.Failed {
+		snap.Status = "error"
 	} else {
 		snap.Status = "ok"
 	}
-	rt.lastUsage[r.AuthID] = snap
-	rt.mu.Unlock()
-	if r.Failed && (r.Failure.StatusCode == 401 || r.Failure.StatusCode == 403 || r.Failure.StatusCode == 429) {
-		disabled := isAccountDisabled(r.Failure.Body)
-		title := "Phoenix 账号异常"
-		if disabled {
-			title = "Phoenix 账号已停用"
-		}
-		rt.host.log("warn", title, map[string]any{"auth_id": r.AuthID, "provider": r.Provider, "status_code": r.Failure.StatusCode})
-		rt.addEvent("error", fmt.Sprintf("%s：账号 %s 返回错误状态码 %d", title, r.AuthID, r.Failure.StatusCode))
-		go rt.notify(title, fmt.Sprintf("账号 %s 返回错误状态码 %d", r.AuthID, r.Failure.StatusCode))
+	if w, ok := acct.Windows[windowSevenDay]; ok {
+		snap.WeeklyRemaining = int(w.Remaining)
+		snap.WeeklyResetAt = w.Reset
 	}
-	if r.Failed && r.Failure.StatusCode == 429 && r.Provider == "codex" && strings.Contains(strings.ToLower(r.Failure.Body), "usage_limit_reached") && rt.cfg.Reset.Enabled && included(rt.cfg.Reset.Credentials, r) {
-		if weeklyExhausted(r.Failure.Body, rt.cfg.Reset.MinimumResetSeconds) {
-			if rt.beginReset(r.AuthIndex) {
-				go func() {
-					defer rt.finishReset(r.AuthIndex, "done")
-					rt.resetFor(r.AuthIndex, false)
-				}()
-			}
+	if w, ok := acct.Windows[windowFiveHour]; ok {
+		snap.FiveRemaining = int(w.Remaining)
+		snap.FiveResetAt = w.Reset
+	}
+	rt.lastUsage[index] = snap
+	rt.mu.Unlock()
+	rt.appendHistoryRecords(records)
+	rt.drainPending()
+	if triggerReset {
+		if rt.beginReset(index) {
+			go func() {
+				defer rt.finishReset(index, "done")
+				rt.resetFor(index, false)
+			}()
 		}
 	}
 	return okEnvelope(struct{}{}), nil
+}
+
+func problemText(kind string, statusCode int) string {
+	switch kind {
+	case "disabled":
+		return "账号已被停用"
+	case "auth":
+		return fmt.Sprintf("认证失败（HTTP %d）", statusCode)
+	case "rate_limit":
+		return fmt.Sprintf("触发限流（HTTP %d）", statusCode)
+	default:
+		return fmt.Sprintf("返回错误状态码 %d", statusCode)
+	}
 }
 
 // isAccountDisabled spots a disabled/suspended account in an upstream
@@ -509,12 +754,124 @@ func (rt *runtime) finishReset(index, decided string) {
 }
 
 func (rt *runtime) addEvent(kind, message string) {
+	rt.addEventFor(kind, message, "", "", kind, nil)
+}
+
+// addEventFor records a panel event with its account, window, history event
+// type and params, so the history endpoint and the detail chart can filter
+// ignition/reset markers per account instead of matching message text.
+// The event is also persisted to history JSONL (reloaded on start).
+func (rt *runtime) addEventFor(kind, message, authIndex, window, eventType string, params map[string]string) {
+	if eventType == "" {
+		eventType = kind
+	}
+	now := time.Now()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	rt.events = append([]panelEvent{{Time: time.Now(), Kind: kind, Message: message}}, rt.events...)
-	if len(rt.events) > 50 {
-		rt.events = rt.events[:50]
+	rt.events = append([]panelEvent{{Time: now, Kind: kind, Message: message, AuthIndex: authIndex, Window: window, Event: eventType, Params: params}}, rt.events...)
+	if len(rt.events) > maxPanelEvents {
+		rt.events = rt.events[:maxPanelEvents]
 	}
+	rec := historyRecord{Kind: "e", Time: now.Unix(), Group: authIndex, Window: window, Event: eventType, Level: kind, Message: message, Params: params}
+	if rt.dataDir != "" {
+		_ = appendHistory(rt.dataDir+"/history", rec)
+	} else {
+		rt.histMem = append(rt.histMem, rec)
+	}
+}
+
+// initLocked lazily initializes runtime maps for runtimes built without the
+// register path (notably in tests). Caller must hold rt.mu.
+func (rt *runtime) initLocked() {
+	if rt.accounts == nil {
+		rt.accounts = map[string]*accountState{}
+	}
+	if rt.pollErrs == nil {
+		rt.pollErrs = map[string]string{}
+	}
+	if rt.lastUsage == nil {
+		rt.lastUsage = map[string]UsageSnapshot{}
+	}
+	if rt.resetState == nil {
+		rt.resetState = map[string]resetGuard{}
+	}
+	if rt.state == nil {
+		rt.state = newPersistedState()
+	}
+}
+
+// getOrCreateAccountLocked returns the auth_index-keyed account state.
+// Caller must hold rt.mu.
+func (rt *runtime) getOrCreateAccountLocked(index string) *accountState {
+	rt.initLocked()
+	acct, ok := rt.accounts[index]
+	if !ok {
+		acct = &accountState{AuthIndex: index, Provider: "codex", Title: "凭证 " + index, Windows: map[string]*windowState{}}
+		rt.accounts[index] = acct
+	}
+	if acct.Windows == nil {
+		acct.Windows = map[string]*windowState{}
+	}
+	return acct
+}
+
+// appendHistoryRecords appends sample/event records to the JSONL history
+// (or to the in-memory list in memory-only mode).
+func (rt *runtime) appendHistoryRecords(records []historyRecord) {
+	if len(records) == 0 {
+		return
+	}
+	rt.mu.RLock()
+	dir := rt.dataDir
+	rt.mu.RUnlock()
+	if dir != "" {
+		_ = appendHistory(dir+"/history", records...)
+		return
+	}
+	rt.histMu.Lock()
+	rt.histMem = append(rt.histMem, records...)
+	rt.histMu.Unlock()
+}
+
+// saveStateIfDirty writes state.json when it changed. The state is
+// marshalled under a read lock (all mutations hold the write lock) and the
+// file write happens after the lock is released.
+func (rt *runtime) saveStateIfDirty() {
+	rt.mu.RLock()
+	if !rt.stateDirty || rt.state == nil {
+		rt.mu.RUnlock()
+		return
+	}
+	raw, err := json.Marshal(rt.state)
+	dir := rt.dataDir
+	rt.mu.RUnlock()
+	if err != nil {
+		return
+	}
+	if err := saveStateBytes(dir, raw); err != nil {
+		return
+	}
+	rt.mu.Lock()
+	rt.stateDirty = false
+	rt.mu.Unlock()
+}
+
+// pollInterval returns the active poll interval, clamped to >= 60s.
+func (rt *runtime) pollInterval() time.Duration {
+	interval := rt.cfg.PollIntervalSeconds
+	if interval < 60 {
+		interval = 60
+	}
+	return time.Duration(interval) * time.Second
+}
+
+// sleepOrDefault sleeps d, using the test override when set.
+func (rt *runtime) sleepOrDefault(d time.Duration) {
+	if rt.sleepFunc != nil {
+		rt.sleepFunc(d)
+		return
+	}
+	time.Sleep(d)
 }
 
 func included(list []string, r pluginapi.UsageRecord) bool {
@@ -611,13 +968,13 @@ func (rt *runtime) resetFor(index string, manual bool) {
 	a, err := rt.host.authGet(index)
 	if err != nil {
 		rt.host.log("warn", "Phoenix reset skipped: credential unavailable", map[string]any{"error": err.Error()})
-		rt.addEvent("error", fmt.Sprintf("重置跳过：凭证 %s 不可用", index))
+		rt.addEventFor("error", fmt.Sprintf("重置跳过：凭证 %s 不可用", index), index, windowSevenDay, "reset", nil)
 		return
 	}
 	creds := extractCredentials(a.JSON)
 	if creds.AccessToken == "" {
 		rt.host.log("warn", "Phoenix reset skipped: access token unavailable", nil)
-		rt.addEvent("error", fmt.Sprintf("重置跳过：凭证 %s 无 access token", index))
+		rt.addEventFor("error", fmt.Sprintf("重置跳过：凭证 %s 无 access token", index), index, windowSevenDay, "reset", nil)
 		return
 	}
 	// The credit list is a read-only call: retry up to 3 times, 1s apart;
@@ -651,9 +1008,15 @@ func (rt *runtime) resetFor(index string, manual bool) {
 	}
 	if listErr != nil {
 		rt.host.log("warn", "Phoenix reset credit list failed", map[string]any{"error": listErr.Error()})
-		rt.addEvent("error", fmt.Sprintf("重置失败：凭证 %s 查询 credit 列表失败", index))
+		rt.mu.Lock()
+		rt.listErr = listErr.Error()
+		rt.mu.Unlock()
+		rt.addEventFor("error", fmt.Sprintf("重置失败：凭证 %s 查询 credit 列表失败", index), index, windowSevenDay, "reset", nil)
 		return
 	}
+	rt.mu.Lock()
+	rt.listErr = ""
+	rt.mu.Unlock()
 	now := time.Now()
 	sort.Slice(list.Credits, func(i, j int) bool { return creditExpiry(list.Credits[i]) < creditExpiry(list.Credits[j]) })
 	var pick resetCredit
@@ -666,7 +1029,7 @@ func (rt *runtime) resetFor(index string, manual bool) {
 	}
 	if pick.ID == "" {
 		rt.host.log("info", "Phoenix reset skipped: no available credit", nil)
-		rt.addEvent("info", fmt.Sprintf("重置跳过：凭证 %s 无可用 credit", index))
+		rt.addEventFor("info", fmt.Sprintf("重置跳过：凭证 %s 无可用 credit", index), index, windowSevenDay, "reset", nil)
 		return
 	}
 	// One UUIDv4 per flow, never retried once issued: a consume that has
@@ -679,19 +1042,30 @@ func (rt *runtime) resetFor(index string, manual bool) {
 	}
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 || json.Unmarshal(resp.Body, &result) != nil || (result.Code != "reset" && result.Code != "already_redeemed") {
 		rt.host.log("warn", "Phoenix reset credit consume failed", map[string]any{"error": fmt.Sprint(err), "status": resp.StatusCode})
-		rt.addEvent("error", fmt.Sprintf("重置失败：凭证 %s 消耗 credit 失败", index))
+		rt.addEventFor("error", fmt.Sprintf("重置失败：凭证 %s 消耗 credit 失败", index), index, windowSevenDay, "reset", nil)
 		return
 	}
 	if err = rt.host.resetCooldown(index); err != nil {
 		rt.host.log("warn", "Phoenix reset succeeded but cooldown clear failed", map[string]any{"error": err.Error()})
-		rt.addEvent("error", fmt.Sprintf("重置已完成但清除冷却失败：凭证 %s", index))
+		rt.addEventFor("error", fmt.Sprintf("重置已完成但清除冷却失败：凭证 %s", index), index, windowSevenDay, "reset", nil)
 		go rt.notify("Phoenix 重置未完全成功", fmt.Sprintf("凭证 %s 已消耗 reset credit，但清除 CPA 本地冷却失败，请检查 CPA 日志。", index))
 		return
 	}
 	rt.host.log("info", "Phoenix reset completed", map[string]any{"auth_index": index, "credit_id": pick.ID, "manual": manual})
-	rt.addEvent("ok", fmt.Sprintf("重置完成：凭证 %s 已消耗 reset credit，并清除 CPA 本地冷却", index))
+	// One call records both the panel event and the history "reset" event
+	// (auth_index + 7d window), so the chart can filter it per account.
+	rt.addEventFor("ok", fmt.Sprintf("重置完成：凭证 %s 已消耗 reset credit，并清除 CPA 本地冷却", index), index, windowSevenDay, "reset", nil)
+	rt.mu.Lock()
+	if acct, ok := rt.accounts[index]; ok {
+		acct.CooldownUntil = time.Time{}
+		rt.clearCredentialProblemLocked(acct)
+	}
+	rt.mu.Unlock()
 	rt.notify("Phoenix 已完成重置", fmt.Sprintf("凭证 %s 已消耗 reset credit，并清除 CPA 本地冷却。", index))
-	if rt.cfg.Ignition.Enabled {
+	// Manual reset and ignition are independent operations: the reset
+	// button must NOT auto-trigger ignition from the manual path. Only
+	// the automatic reset chain ignites after the grace period.
+	if !manual && rt.cfg.Ignition.Enabled {
 		grace := time.Duration(rt.cfg.Ignition.GraceSeconds) * time.Second
 		go func() {
 			time.Sleep(grace)
@@ -818,8 +1192,33 @@ func handleManagement(request []byte) ([]byte, error) {
 	switch {
 	case req.Method == http.MethodGet && strings.HasSuffix(req.Path, "/status"):
 		return jsonManagementResponse(http.StatusOK, rt.status())
+	case req.Method == http.MethodGet && strings.HasSuffix(req.Path, "/history"):
+		// Defaults: 5h window -> 6h range, 7d window -> 8d range.
+		window := req.Query.Get("window")
+		if window != windowFiveHour && window != windowSevenDay {
+			window = windowFiveHour
+		}
+		rangeName := req.Query.Get("range")
+		if rangeName == "" {
+			if window == windowSevenDay {
+				rangeName = "8d"
+			} else {
+				rangeName = "6h"
+			}
+		}
+		return jsonManagementResponse(http.StatusOK, rt.historyResponse(rangeName, window, time.Now()))
 	case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/refresh"):
-		go rt.pollOnce()
+		// Synchronous refresh: run one poll and return the fresh status,
+		// with a 30s guard so a stuck upstream call cannot hang the page.
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			rt.pollOnce()
+		}()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+		}
 		return jsonManagementResponse(http.StatusOK, rt.status())
 	case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/reset"):
 		var in struct {
@@ -839,15 +1238,26 @@ func handleManagement(request []byte) ([]byte, error) {
 		go rt.ignite(in.AuthIndex)
 		return jsonManagementResponse(http.StatusOK, map[string]any{"accepted": true, "action": "ignite"})
 	case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/test-notify"):
-		ok := rt.notify("Phoenix 测试推送", "Telegram 通知配置测试成功")
-		if !ok {
-			return jsonManagementResponse(http.StatusBadGateway, map[string]any{"error": "telegram send failed"})
+		results := rt.testNotifyResults()
+		ok := false
+		for _, r := range results {
+			if r["ok"] == true {
+				ok = true
+			}
 		}
-		return jsonManagementResponse(http.StatusOK, map[string]any{"accepted": true})
+		if !ok {
+			return jsonManagementResponse(http.StatusBadGateway, map[string]any{"results": results})
+		}
+		return jsonManagementResponse(http.StatusOK, map[string]any{"accepted": true, "results": results})
 	case req.Method == http.MethodPut && strings.HasSuffix(req.Path, "/settings"):
 		// Merge per section instead of replacing the whole config, so a
 		// save from the settings page cannot wipe fields the page does
-		// not show (notably reset.credentials).
+		// not show (notably reset.credentials). This is an in-memory
+		// apply only (compat): durable persistence goes through the CPA
+		// PATCH /v0/management/plugins/phoenix/config with a fresh
+		// config_token, which CPA merges into config.yaml and re-delivers
+		// via register/reconfigure. A config_token sent here is ignored
+		// for that reason.
 		var patch map[string]json.RawMessage
 		if err := json.Unmarshal(req.Body, &patch); err != nil {
 			return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": "invalid settings"})
@@ -865,20 +1275,30 @@ func handleManagement(request []byte) ([]byte, error) {
 				_ = json.Unmarshal(raw, &rt.cfg.Ignition)
 			case "poll_interval_seconds":
 				_ = json.Unmarshal(raw, &rt.cfg.PollIntervalSeconds)
+			case "history_retention_days":
+				_ = json.Unmarshal(raw, &rt.cfg.HistoryRetentionDays)
 			case "enabled":
 				_ = json.Unmarshal(raw, &rt.cfg.Enabled)
 			}
 		}
+		rt.cfg.Alerts.Thresholds = validateThresholds(rt.cfg.Alerts.Thresholds)
+		normalizeAlertModes(&rt.cfg.Alerts)
+		if rt.cfg.HistoryRetentionDays < 1 {
+			rt.cfg.HistoryRetentionDays = 1
+		}
+		if rt.cfg.HistoryRetentionDays > 365 {
+			rt.cfg.HistoryRetentionDays = 365
+		}
+		if rt.cfg.Ignition.CPABaseURL == "" {
+			rt.cfg.Ignition.CPABaseURL = "http://127.0.0.1:8317"
+		}
+		// A poll-interval change takes effect without restart: pollLoop
+		// rebuilds its timer from the current config every iteration.
 		rt.mu.Unlock()
 		rt.host.log("info", "Phoenix settings updated", nil)
 		return jsonManagementResponse(http.StatusOK, rt.status())
 	}
 	return jsonManagementResponse(http.StatusNotFound, map[string]any{"error": "route not found"})
-}
-func (rt *runtime) status() any {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	return map[string]any{"plugin": "phoenix", "version": pluginVersion, "config": rt.cfg, "usage": rt.lastUsage, "events": rt.events}
 }
 func (rt *runtime) reset(index string) {
 	rt.host.log("info", "Phoenix manual reset requested", nil)
@@ -903,7 +1323,7 @@ func (rt *runtime) reset(index string) {
 		return
 	}
 	if !rt.beginReset(index) {
-		rt.addEvent("info", fmt.Sprintf("手动重置跳过：凭证 %s 已有进行中的重置", index))
+		rt.addEventFor("info", fmt.Sprintf("手动重置跳过：凭证 %s 已有进行中的重置", index), index, windowSevenDay, "reset", nil)
 		return
 	}
 	go func() {
@@ -928,105 +1348,249 @@ func (rt *runtime) notify(title, body string) bool {
 		return false
 	}
 	sent := false
+	var lastErr string
 	for _, id := range strings.Split(rt.cfg.Telegram.ChatIDs, ";") {
 		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
 		}
-		b, _ := json.Marshal(map[string]string{"chat_id": id, "text": title + "\n\n" + body})
-		resp, err := http.Post("https://api.telegram.org/bot"+rt.cfg.Telegram.BotToken+"/sendMessage", "application/json", strings.NewReader(string(b)))
-		if err != nil {
-			rt.host.log("warn", "Phoenix telegram send failed", map[string]any{"chat_id": id, "error": err.Error()})
-			continue
+		ok, errStr := rt.sendTelegram(id, title, body)
+		if ok {
+			sent = true
+		} else if errStr != "" {
+			lastErr = errStr
 		}
-		resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			rt.host.log("warn", "Phoenix telegram send failed", map[string]any{"chat_id": id, "status": resp.StatusCode})
-			continue
-		}
-		sent = true
 	}
+	rt.mu.Lock()
+	if sent {
+		rt.lastNotifyErr = ""
+	} else if lastErr != "" {
+		rt.lastNotifyErr = lastErr
+	}
+	rt.mu.Unlock()
 	return sent
+}
+
+// sendTelegram delivers one Telegram message, returning ok and an error
+// string for per-channel reporting (POST /test-notify).
+func (rt *runtime) sendTelegram(chatID, title, body string) (bool, string) {
+	b, _ := json.Marshal(map[string]string{"chat_id": chatID, "text": title + "\n\n" + body})
+	resp, err := http.Post("https://api.telegram.org/bot"+rt.cfg.Telegram.BotToken+"/sendMessage", "application/json", strings.NewReader(string(b)))
+	if err != nil {
+		rt.host.log("warn", "Phoenix telegram send failed", map[string]any{"chat_id": chatID, "error": err.Error()})
+		return false, err.Error()
+	}
+	resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg := fmt.Sprintf("telegram HTTP %d", resp.StatusCode)
+		rt.host.log("warn", "Phoenix telegram send failed", map[string]any{"chat_id": chatID, "status": resp.StatusCode})
+		return false, msg
+	}
+	return true, ""
 }
 func (rt *runtime) statusBody() []byte { b, _ := json.Marshal(rt.status()); return b }
 
-// pollLoop actively refreshes quota data on the configured interval and
-// runs the daily auto-ignition check. It stops when the plugin is
-// reconfigured or shut down (runtime.stopCh).
+// pollLoop actively refreshes quota data and runs the daily auto-ignition
+// check. The timer is rebuilt from the current config every iteration, so
+// a poll-interval change (PUT /settings or a CPA reconfigure) takes effect
+// without restart. It stops when the plugin is reconfigured or shut down
+// (runtime.stopCh).
 func (rt *runtime) pollLoop() {
-	interval := rt.cfg.PollIntervalSeconds
-	if interval < 60 {
-		interval = 60
-	}
 	go rt.pollOnce()
-	ticker := time.NewTicker(time.Duration(interval) * time.Second)
-	defer ticker.Stop()
 	for {
+		timer := time.NewTimer(rt.pollInterval())
 		select {
 		case <-rt.stopCh:
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			rt.pollOnce()
 			rt.maybeIgnite()
+			rt.pruneIfDue()
 		}
 	}
 }
 
+// pruneIfDue prunes history files older than the retention window at most
+// once every 6 hours.
+func (rt *runtime) pruneIfDue() {
+	rt.mu.Lock()
+	if time.Since(rt.lastPrune) < 6*time.Hour {
+		rt.mu.Unlock()
+		return
+	}
+	rt.lastPrune = time.Now()
+	dir := rt.dataDir
+	retention := rt.cfg.HistoryRetentionDays
+	rt.mu.Unlock()
+	rt.histMu.Lock()
+	mem := pruneHistory(dir, rt.histMem, retention, time.Now())
+	rt.histMem = mem
+	rt.histMu.Unlock()
+	rt.mu.Lock()
+	if dir != "" {
+		pruneHistory(dir+"/history", nil, retention, time.Now())
+	}
+	rt.mu.Unlock()
+}
+
 // pollOnce enumerates Codex credentials through the host, queries the
-// upstream usage endpoint for each, and fills lastUsage with the weekly
-// window's remaining percentage and reset time. This is the active half of
-// quota monitoring; handleUsage fills in the passive half from CPA's usage
-// records (which carry no remaining-percent fields).
+// upstream usage endpoint for each, and fills the dual-window account
+// state. Poll failures are recorded per account (pollErrs) and surfaced in
+// status, not silently swallowed.
 func (rt *runtime) pollOnce() {
 	if !rt.cfg.Enabled {
 		return
 	}
+	rt.mu.Lock()
+	rt.initLocked()
+	rt.mu.Unlock()
 	entries, err := rt.host.authList()
 	if err != nil {
+		rt.mu.Lock()
+		rt.listErr = err.Error()
+		rt.mu.Unlock()
 		rt.host.log("warn", "Phoenix quota poll skipped: auth list failed", map[string]any{"error": err.Error()})
 		return
 	}
+	rt.mu.Lock()
+	rt.listErr = ""
+	rt.mu.Unlock()
 	for _, e := range entries {
 		if e.Provider != "codex" {
 			continue
 		}
-		rt.pollCredential(e.AuthIndex)
+		rt.pollCredential(e.AuthIndex, e)
 	}
+	now := time.Now()
+	rt.mu.Lock()
+	rt.lastPoll = now
+	rt.nextPoll = now.Add(rt.pollInterval())
+	rt.retryPendingRecoveriesLocked(now)
+	rt.checkStaleCooldownsLocked(now)
+	rt.mu.Unlock()
+	rt.drainPending()
+	rt.saveStateIfDirty()
 }
 
-func (rt *runtime) pollCredential(index string) {
+func (rt *runtime) pollCredential(index string, entry pluginapi.HostAuthFileEntry) {
 	a, err := rt.host.authGet(index)
 	if err != nil {
+		rt.recordPollErr(index, err.Error())
 		return
 	}
 	creds := extractCredentials(a.JSON)
 	if creds.AccessToken == "" {
+		rt.recordPollErr(index, "access token unavailable")
 		return
 	}
 	resp, err := rt.host.httpDo(pluginapi.HTTPRequest{Method: http.MethodGet, URL: "https://chatgpt.com/backend-api/wham/usage", Headers: resetHeaders(creds)})
-	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if err != nil {
+		rt.recordPollErr(index, err.Error())
 		return
 	}
-	remaining, resetAt, ok := parseCodexUsage(resp.Body)
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		rt.recordPollErr(index, fmt.Sprintf("upstream status %d", resp.StatusCode))
+		rt.mu.Lock()
+		acct := rt.getOrCreateAccountLocked(index)
+		rt.recordCredentialFailureLocked(acct, "auth", fmt.Sprintf("upstream status %d", resp.StatusCode), time.Now())
+		rt.mu.Unlock()
+		rt.drainPending()
+		return
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		rt.recordPollErr(index, fmt.Sprintf("upstream status %d", resp.StatusCode))
+		return
+	}
+	windows, plan, ok := parseCodexUsageDual(resp.Body)
 	if !ok {
+		rt.recordPollErr(index, "usage response has no recognizable window")
 		return
 	}
-	authID := a.Name
-	if authID == "" {
-		authID = index
-	}
+	now := time.Now()
+	var records []historyRecord
 	rt.mu.Lock()
-	snap := rt.lastUsage[authID]
-	snap.Provider = "codex"
-	snap.AuthID = authID
-	snap.WeeklyRemaining = remaining
-	if !resetAt.IsZero() {
-		snap.WeeklyResetAt = resetAt
+	rt.initLocked()
+	acct := rt.getOrCreateAccountLocked(index)
+	acct.Provider = "codex"
+	acct.AuthID = a.Name
+	if acct.AuthID == "" {
+		acct.AuthID = index
 	}
+	if entry.Name != "" {
+		acct.Title = entry.Name
+	} else if a.Name != "" {
+		acct.Title = a.Name
+	}
+	if plan != "" {
+		acct.Plan = plan
+	}
+	acct.Error = ""
+	acct.UpdatedAt = now
+	delete(rt.pollErrs, index)
+	rt.clearCredentialProblemLocked(acct)
+	// A successful active sample proves the quota is back: any recorded
+	// CPA cooldown is stale history, not a live cooldown.
+	if len(windows) > 0 {
+		anyExhausted := false
+		for _, s := range windows {
+			if s.Remaining <= exhaustedRemaining {
+				anyExhausted = true
+			}
+		}
+		if !anyExhausted {
+			acct.CooldownUntil = time.Time{}
+		}
+	}
+	var confirmed []string
+	for _, kind := range []string{windowFiveHour, windowSevenDay} {
+		sample, ok := windows[kind]
+		if !ok {
+			continue
+		}
+		confirmed = append(confirmed, kind)
+		w := acct.window(kind)
+		w.Remaining = sample.Remaining
+		w.Reset = sample.Reset
+		w.Source = "active"
+		w.ObservedAt = now
+		records = append(records, historyRecord{Kind: "s", Time: now.Unix(), Group: index, Window: kind, Remaining: sample.Remaining, Reset: sample.Reset.Unix(), Source: "active"})
+		rt.evaluateWindowAlertsLocked(acct, kind, *w, "active", now)
+		if kind == windowFiveHour {
+			observeReset(rt.state.target(index), sample.Reset, now, false)
+		}
+	}
+	acct.ActiveWindows = confirmed
+	// Keep the legacy usage map in sync (keyed by auth_index).
+	snap := rt.lastUsage[index]
+	snap.Provider = "codex"
+	snap.AuthID = acct.AuthID
 	snap.Status = "ok"
-	snap.UpdatedAt = time.Now()
-	rt.lastUsage[authID] = snap
+	snap.UpdatedAt = now
+	if w, ok := acct.Windows[windowSevenDay]; ok {
+		snap.WeeklyRemaining = int(w.Remaining)
+		snap.WeeklyResetAt = w.Reset
+	}
+	if w, ok := acct.Windows[windowFiveHour]; ok {
+		snap.FiveRemaining = int(w.Remaining)
+		snap.FiveResetAt = w.Reset
+	}
+	rt.lastUsage[index] = snap
 	rt.mu.Unlock()
+	rt.appendHistoryRecords(records)
+	rt.drainPending()
+}
+
+// recordPollErr records a per-account poll failure for status surfacing.
+func (rt *runtime) recordPollErr(index, msg string) {
+	rt.mu.Lock()
+	rt.initLocked()
+	rt.pollErrs[index] = msg
+	acct := rt.getOrCreateAccountLocked(index)
+	acct.Error = msg
+	acct.UpdatedAt = time.Now()
+	rt.mu.Unlock()
+	rt.host.log("warn", "Phoenix quota poll failed", map[string]any{"auth_index": index, "error": msg})
 }
 
 // parseCodexUsage reads a /wham/usage payload the way Jeffery's quota
@@ -1095,6 +1659,20 @@ func windowResetAt(w map[string]any) time.Time {
 // protocol "openai-response", a "Reply with only OK" prompt, no reasoning,
 // no tools. Starting a new 5-hour window is the point; the response body
 // is discarded.
+//
+// The configured Ignition.Model always wins when non-empty. Only when it
+// is empty are candidates picked from the CPA model list (newest non-image
+// luna first, then gpt-* excluding oss/image, max 6) — and a model the
+// provider rejects (400/404) is skipped for the next candidate.
+//
+// After a successful request the ignition is confirmed: the usage endpoint
+// is re-queried at 5s, 10s, 15s, 30s, 15s until a fixed future 5h reset is
+// observed (a rolling placeholder does not count). Unconfirmed, hard, or
+// budget-exhausted failures open the circuit breaker until the next daily
+// start; transient failures retry with failure_retry_seconds x backoff 3;
+// a short CPA cooldown (<=10min) waits without counting as a failure.
+// Manual ignition bypasses schedule and circuit but does not change
+// retry/circuit state.
 func (rt *runtime) igniteFor(index string, manual bool) {
 	if !rt.cfg.Ignition.Enabled {
 		rt.host.log("info", "Phoenix ignition skipped: disabled", nil)
@@ -1120,10 +1698,131 @@ func (rt *runtime) igniteFor(index string, manual bool) {
 	if authID == "" {
 		authID = index
 	}
-	model := strings.TrimSpace(rt.cfg.Ignition.Model)
-	if model == "" {
-		model = "gpt-5-codex"
+	now := time.Now()
+	rt.mu.Lock()
+	rt.initLocked()
+	acct := rt.getOrCreateAccountLocked(index)
+	// Auto-ignition pauses while the credential has a confirmed problem,
+	// until the fingerprint changes or a manual ignition succeeds.
+	if !manual && rt.credentialProblemFor(index) != "" {
+		rt.mu.Unlock()
+		rt.host.log("info", "Phoenix ignition skipped: credential problem", map[string]any{"auth_index": index})
+		return
 	}
+	ts := rt.state.target(index)
+	// A circuit or retry wait only gates automatic ignition.
+	if !manual {
+		if !ts.CircuitUntil.IsZero() && now.Before(ts.CircuitUntil) {
+			rt.mu.Unlock()
+			return
+		}
+		if !ts.RetryAt.IsZero() && now.Before(ts.RetryAt) {
+			rt.mu.Unlock()
+			return
+		}
+	}
+	rt.mu.Unlock()
+
+	models := []string{strings.TrimSpace(rt.cfg.Ignition.Model)}
+	if models[0] == "" {
+		models = rt.ignitionCandidates()
+	}
+	if len(models) == 0 {
+		models = []string{"gpt-5-codex"}
+	}
+	var lastErr error
+	var lastStatus int
+	succeeded := false
+	usedModel := ""
+	for _, model := range models {
+		if model == "" {
+			continue
+		}
+		status, err := rt.executeIgnition(index, authID, model)
+		lastErr, lastStatus = err, status
+		if err == nil {
+			usedModel = model
+			succeeded = true
+			break
+		}
+		// A rejected model falls through to the next candidate; any
+		// other error stops the attempt loop.
+		if !modelRejected(err, status) {
+			break
+		}
+	}
+	now = time.Now()
+	if !succeeded {
+		if lastErr == nil {
+			lastErr = ErrNoModel
+		}
+		rt.mu.Lock()
+		ts := rt.state.target(index)
+		ts.LastAttempt = now
+		ts.LastModel = usedModel
+		ts.LastError = truncateRunes(lastErr.Error(), 500)
+		if !manual {
+			outcome := recordTargetFailure(ts, rt.cfg.Ignition, now, lastErr, lastStatus)
+			rt.stateDirty = true
+			rt.mu.Unlock()
+			rt.addEventFor("error", fmt.Sprintf("点火失败：凭证 %s（%s）", index, lastErr.Error()), index, windowFiveHour, "ignite", map[string]string{"model": usedModel})
+			if outcome.CircuitOpened && outcome.NotifyCircuit {
+				go rt.notify("Phoenix 点火已暂停", fmt.Sprintf("凭证 %s 点火失败已触发熔断，将暂停到明天 %d 点：%s", index, rt.cfg.Ignition.StartHour, lastErr.Error()))
+			} else if manual || lastStatus == 401 || lastStatus == 403 || isAccountDisabled(lastErr.Error()) {
+				go rt.notify("Phoenix 点火失败", fmt.Sprintf("凭证 %s 点火失败：%s", index, lastErr.Error()))
+			}
+			rt.saveStateIfDirty()
+			return
+		}
+		rt.stateDirty = true
+		rt.mu.Unlock()
+		rt.addEventFor("error", fmt.Sprintf("点火失败：凭证 %s（%s）", index, lastErr.Error()), index, windowFiveHour, "ignite", map[string]string{"model": usedModel})
+		go rt.notify("Phoenix 点火失败", fmt.Sprintf("凭证 %s 点火失败：%s", index, lastErr.Error()))
+		rt.saveStateIfDirty()
+		return
+	}
+	// Confirm: a fixed future 5h reset must be observed.
+	if err := rt.confirmIgnition(index); err != nil {
+		now = time.Now()
+		rt.mu.Lock()
+		ts := rt.state.target(index)
+		ts.LastAttempt = now
+		ts.LastModel = usedModel
+		ts.LastError = truncateRunes(err.Error(), 500)
+		if !manual {
+			outcome := recordTargetFailure(ts, rt.cfg.Ignition, now, err, 0)
+			rt.stateDirty = true
+			rt.mu.Unlock()
+			rt.addEventFor("error", fmt.Sprintf("点火未确认：凭证 %s（%s）", index, err.Error()), index, windowFiveHour, "ignite", map[string]string{"model": usedModel})
+			if outcome.CircuitOpened && outcome.NotifyCircuit {
+				go rt.notify("Phoenix 点火已暂停", fmt.Sprintf("凭证 %s 点火未确认，已触发熔断，将暂停到明天 %d 点。", index, rt.cfg.Ignition.StartHour))
+			}
+			rt.saveStateIfDirty()
+			return
+		}
+		rt.stateDirty = true
+		rt.mu.Unlock()
+		rt.addEventFor("error", fmt.Sprintf("点火未确认：凭证 %s（%s）", index, err.Error()), index, windowFiveHour, "ignite", map[string]string{"model": usedModel})
+		rt.saveStateIfDirty()
+		return
+	}
+	now = time.Now()
+	rt.mu.Lock()
+	ts = rt.state.target(index)
+	recordTargetSuccess(ts, usedModel, now)
+	ts.LastAttempt = now
+	acct = rt.getOrCreateAccountLocked(index)
+	rt.clearCredentialProblemLocked(acct)
+	rt.stateDirty = true
+	rt.mu.Unlock()
+	rt.host.log("info", "Phoenix ignition succeeded", map[string]any{"auth_index": index, "model": usedModel})
+	rt.addEventFor("ok", fmt.Sprintf("点火成功：凭证 %s 已开始新的 5 小时窗口", index), index, windowFiveHour, "ignite", map[string]string{"model": usedModel})
+	rt.saveStateIfDirty()
+}
+
+// executeIgnitionAttempt sends one minimal Codex request for model and
+// returns the upstream status and error (nil on 2xx).
+func (rt *runtime) executeIgnition(index, authID, model string) (int, error) {
 	body, _ := json.Marshal(map[string]any{
 		"model": model,
 		"input": []any{map[string]any{
@@ -1144,35 +1843,154 @@ func (rt *runtime) igniteFor(index string, manual bool) {
 		ForcedProvider: "codex",
 		AuthID:         authID,
 	})
-	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg := fmt.Sprint(err)
-		if err == nil {
-			msg = fmt.Sprintf("upstream status %d", resp.StatusCode)
-		}
-		rt.host.log("warn", "Phoenix ignition failed", map[string]any{"auth_index": index, "error": msg})
-		rt.addEvent("error", fmt.Sprintf("点火失败：凭证 %s（%s）", index, msg))
-		if manual || resp.StatusCode == 401 || resp.StatusCode == 403 || isAccountDisabled(msg) {
-			go rt.notify("Phoenix 点火失败", fmt.Sprintf("凭证 %s 点火失败：%s", index, msg))
-		}
-		return
+	if err != nil {
+		return 0, err
 	}
-	rt.host.log("info", "Phoenix ignition succeeded", map[string]any{"auth_index": index, "model": model})
-	rt.addEvent("ok", fmt.Sprintf("点火成功：凭证 %s 已开始新的 5 小时窗口", index))
-	rt.mu.Lock()
-	rt.lastIgnite[index] = time.Now()
-	rt.mu.Unlock()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return resp.StatusCode, fmt.Errorf("upstream status %d", resp.StatusCode)
+	}
+	return resp.StatusCode, nil
 }
 
-// maybeIgnite runs once per poll tick: within the configured daily window,
-// ignite each Codex credential at most once per day.
+// ignitionCandidates returns the ordered candidate models for ignition
+// when no model is configured, fetched from CPA /v1/models with the
+// configured models API key (cached 10 minutes). Empty when no key is set.
+func (rt *runtime) ignitionCandidates() []string {
+	key := strings.TrimSpace(rt.cfg.Ignition.ModelsAPIKey)
+	if key == "" {
+		return nil
+	}
+	rt.mu.Lock()
+	if rt.modelsKey == key && time.Since(rt.modelsFetched) < 10*time.Minute && len(rt.modelsCache) > 0 {
+		cached := append([]string(nil), rt.modelsCache...)
+		rt.mu.Unlock()
+		return pickIgnitionCandidates(cached)
+	}
+	rt.mu.Unlock()
+	available, err := fetchModelsList(rt.cfg.Ignition.CPABaseURL, key)
+	rt.mu.Lock()
+	if err != nil {
+		rt.modelsErr = err.Error()
+		rt.mu.Unlock()
+		return nil
+	}
+	rt.modelsErr = ""
+	rt.modelsCache = available
+	rt.modelsFetched = time.Now()
+	rt.modelsKey = key
+	rt.mu.Unlock()
+	return pickIgnitionCandidates(available)
+}
+
+// fetchModelsList reads the CPA model list at baseURL/v1/models with a
+// Bearer API key. The request goes to CPA itself, so it must not use a
+// proxy. (Lamplighter internal/models Lister.)
+func fetchModelsList(baseURL, apiKey string) ([]string, error) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1:8317"
+	}
+	client := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, baseURL+"/v1/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("读取 CPA 模型列表失败: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("读取 CPA 模型列表失败: HTTP %d", resp.StatusCode)
+	}
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("CPA 模型列表格式错误: %w", err)
+	}
+	var ids []string
+	for _, item := range payload.Data {
+		if id := strings.TrimSpace(item.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// fetchFiveHourReset queries the upstream usage endpoint for one
+// credential and returns its current 5h reset time.
+func (rt *runtime) fetchFiveHourReset(index string) (time.Time, error) {
+	a, err := rt.host.authGet(index)
+	if err != nil {
+		return time.Time{}, err
+	}
+	creds := extractCredentials(a.JSON)
+	if creds.AccessToken == "" {
+		return time.Time{}, errors.New("access token unavailable")
+	}
+	resp, err := rt.host.httpDo(pluginapi.HTTPRequest{Method: http.MethodGet, URL: "https://chatgpt.com/backend-api/wham/usage", Headers: resetHeaders(creds)})
+	if err != nil {
+		return time.Time{}, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return time.Time{}, fmt.Errorf("upstream status %d", resp.StatusCode)
+	}
+	windows, _, ok := parseCodexUsageDual(resp.Body)
+	if !ok {
+		return time.Time{}, errors.New("usage response has no recognizable window")
+	}
+	sample, ok := windows[windowFiveHour]
+	if !ok {
+		return time.Time{}, errors.New("usage response has no 5h window")
+	}
+	return sample.Reset, nil
+}
+
+// confirmIgnition re-queries the 5h reset after an ignition attempt until
+// a fixed future reset is observed (not a rolling placeholder), or the
+// delay schedule is exhausted. A rolling observation is not confirmation:
+// the reset must stay put across two observations.
+func (rt *runtime) confirmIgnition(index string) error {
+	delays := rt.confirmDelays
+	if len(delays) == 0 {
+		delays = defaultConfirmDelays
+	}
+	for _, delay := range delays {
+		rt.sleepOrDefault(delay)
+		now := time.Now()
+		reset, err := rt.fetchFiveHourReset(index)
+		if err != nil {
+			continue
+		}
+		rt.mu.Lock()
+		rt.initLocked()
+		ts := rt.state.target(index)
+		rolling := observeReset(ts, reset, now, false)
+		rt.stateDirty = true
+		rt.mu.Unlock()
+		if !rolling && isFixedReset(reset, now) {
+			rt.saveStateIfDirty()
+			return nil
+		}
+	}
+	return ErrNotConfirmed
+}
+
+// maybeIgnite runs once per poll tick: for each Codex credential whose
+// ignition is due per ignitionDueAt, ignite once. Auto-ignition skips
+// credentials with a confirmed credential problem and credentials whose
+// 7d window is still exhausted (their requests would be rejected).
 func (rt *runtime) maybeIgnite() {
 	if !rt.cfg.Ignition.Enabled {
 		return
 	}
 	now := time.Now()
-	if now.Hour() < rt.cfg.Ignition.StartHour || now.Hour() >= rt.cfg.Ignition.EndHour {
-		return
-	}
 	entries, err := rt.host.authList()
 	if err != nil {
 		return
@@ -1182,9 +2000,29 @@ func (rt *runtime) maybeIgnite() {
 			continue
 		}
 		rt.mu.RLock()
-		last, done := rt.lastIgnite[e.AuthIndex]
+		acct := rt.accounts[e.AuthIndex]
+		var reset time.Time
+		exhausted7d := false
+		if acct != nil {
+			if w, ok := acct.Windows[windowFiveHour]; ok {
+				reset = w.Reset
+			}
+			if w, ok := acct.Windows[windowSevenDay]; ok && w.Remaining <= exhaustedRemaining && (w.Reset.IsZero() || w.Reset.After(now)) {
+				exhausted7d = true
+			}
+		}
+		problem := rt.credentialProblemFor(e.AuthIndex)
+		ts := &targetState{}
+		if rt.state != nil {
+			if saved, ok := rt.state.Targets[e.AuthIndex]; ok && saved != nil {
+				ts = saved
+			}
+		}
 		rt.mu.RUnlock()
-		if done && last.YearDay() == now.YearDay() && last.Year() == now.Year() {
+		if problem != "" || exhausted7d {
+			continue
+		}
+		if due := ignitionDueAt(rt.cfg.Ignition, ts, reset, now); due.After(now) {
 			continue
 		}
 		go rt.igniteFor(e.AuthIndex, false)

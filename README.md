@@ -4,13 +4,15 @@ Phoenix 是一个面向 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyA
 
 项目名称取自“重生”：当周用量窗口耗尽且账号仍有 reset credit 时，Phoenix 可以消耗一张 credit，清除 CLIProxyAPI 对该凭证的本地冷却，让凭证恢复可调度状态。
 
-> 当前版本：`0.0.7`。项目仍在持续开发中，安装到生产 CPA 前建议先使用测试凭证验证上游 reset credit 接口和 CPA 版本兼容性。
+> 当前版本：`0.0.8`。项目仍在持续开发中，安装到生产 CPA 前建议先使用测试凭证验证上游 reset credit 接口和 CPA 版本兼容性。
 
 ## 主要功能
 
 ### 额度与账号状态
 
-Phoenix 通过两条路径收集额度数据：主动轮询按 `poll_interval_seconds`（默认 300 秒）枚举 Codex 凭证并查询上游 `/wham/usage`，按窗口时长识别周窗口；被动接收 CPA 的 usage 回调，成功记为正常、`usage_limit_reached` 的 429 记为周窗口耗尽并记录重置时间。页面新增“最近事件”列表，账号异常、重置与点火结果都会记录在内。
+Phoenix 通过两条路径收集额度数据：主动轮询按 `poll_interval_seconds`（默认 300 秒）枚举 Codex 凭证并查询上游 `/wham/usage`，按窗口时长识别 5 小时窗口与周窗口；被动接收 CPA 的 usage 回调，成功记为正常、`usage_limit_reached` 的 429 记为对应窗口耗尽并记录重置时间。页面新增“最近事件”列表，账号异常、重置与点火结果都会记录在内。
+
+额度采样会持久化到插件数据目录下的历史文件（默认保留 40 天），管理页面用“额度变化”图表展示：总览按采样点着色（满/高/中/低/空五档），可点开单账号详情曲线（含匀速参考线、预测线与重置标记），支持 5 小时 / 7 天窗口与时间范围切换。
 
 额度数据是否完整取决于 CPA 版本、凭证类型以及上游响应中是否包含可解析的额度字段。没有收到有效额度数据时，页面会显示等待状态，不会把缺失数据当成 100% 或 0% 使用量。
 
@@ -26,8 +28,12 @@ Phoenix 通过两条路径收集额度数据：主动轮询按 `poll_interval_se
 
 - 账号返回 `401` 或 `403`，通常表示凭证失效、账号未授权或账号被停用。
 - 账号返回 `429`，通常表示限流或额度耗尽。
+- 额度降到提醒阈值（默认剩余 50% / 20% / 10% 各通知一次），额度恢复、重置前提醒。
 - 自动重置成功。
+- 点火失败或熔断。
 - 测试推送。
+
+管理接口返回的配置中 Bot Token 一律脱敏（只返回是否已设置），页面留空表示不修改。
 
 Bot Token 只用于调用 Telegram Bot API，不写入 Git 仓库。配置文件和管理接口中的 Token 应按敏感信息保护。
 
@@ -59,14 +65,14 @@ Bot Token 只用于调用 Telegram Bot API，不写入 Git 仓库。配置文件
 
 ### 手动重置与点火入口
 
-管理页面的“立即操作”卡片内操作顺序固定为：
+管理页面的“立即操作”卡片是一张点火目标表，每行对应一个凭证，包含当前重置、最近成功、模型与状态。**每行都有两个独立按钮，顺序固定为：**
 
 1. `立即重置`
 2. `立即点火`
 
-这样可以先处理周额度和本地冷却，再执行后续点火操作。按钮请求会被记录到 CPA 日志，页面会反馈请求已提交。
+立即重置只走重置流程（消耗 reset credit 并清除 CPA 本地冷却），立即点火只走点火流程，两者互不触发。手动重置不再像之前那样自动跟一点火；自动重置成功后仍会按配置的延迟自动点火一次。按钮请求会被记录到 CPA 日志，页面会反馈请求已提交。
 
-点火通过宿主的模型执行回调发送一次最小 Codex 请求（只要求回复 `OK`，不推理、不用工具），从而开始一个新的 5 小时窗口。自动点火在每日开始—结束时段内每个凭证最多执行一次，重置成功后也会按配置的延迟自动点火一次。点火模型默认 `gpt-5-codex`，可在设置页修改。
+点火通过宿主的模型执行回调发送一次最小 Codex 请求（只要求回复 `OK`，不推理、不用工具），从而开始一个新的 5 小时窗口；点火后会多次复查，确认出现固定的未来 5 小时重置才算成功，否则报未确认并按退避重试，多次失败后熔断到次日开始。自动点火在每日开始—结束（加宽限分钟）时段内按 5 小时窗口的重置时间调度。点火模型按插件当前配置显示，不会被页面重置为默认值；设置了模型列表 API key 后，插件会从 CPA 的 `/v1/models` 读取候选模型（最新 luna 优先），但已配置的模型始终优先。
 
 ## 兼容性与构建平台
 
@@ -98,12 +104,12 @@ uname -m
 
 ### 1. 下载正确的 Release 包
 
-打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.0.7`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
+打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.0.8`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
 
 Linux amd64 示例：
 
 ```bash
-VERSION=0.0.7
+VERSION=0.0.8
 mkdir -p /tmp/phoenix-$VERSION
 cd /tmp/phoenix-$VERSION
 curl -fL -o phoenix.zip "https://github.com/Xiuyixx/Phoenix/releases/download/v$VERSION/phoenix_${VERSION}_linux_amd64.zip"
@@ -121,7 +127,7 @@ unzip -o phoenix.zip
 Windows 使用 PowerShell 校验：
 
 ```powershell
-$version = "0.0.7"
+$version = "0.0.8"
 $file = "phoenix_${version}_windows_amd64.zip"
 (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
 Get-Content "${file}.sha256"
@@ -260,14 +266,24 @@ sha256sum -c dist/checksums.txt
 | `reset.weekly_only` | 只处理周用量窗口，建议开启。 |
 | `reset.minimum_reset_seconds` | 触发自动重置所需的最少剩余秒数，默认 `86400`。 |
 | `reset.credentials` | 纳入重置的凭证（auth_index 或 auth_id），多个值用分号或 YAML 列表表示，留空为全部 Codex 凭证。 |
+| `alerts.thresholds` | 提醒阈值（剩余百分比），默认 `50, 20, 10`，须从高到低。 |
+| `alerts.recovery_notify` | 额度恢复通知模式，分 5 小时 / 7 天窗口：`off` / `all` / `after_exhausted`。 |
+| `alerts.reset_reminder` | 重置前提醒模式，分 5 小时 / 7 天窗口：`off` / `all` / `has_remaining`。 |
+| `alerts.notify_errors` | 账号错误时是否推送。 |
 | `ignition.enabled` | 自动点火开关。 |
 | `ignition.start_hour` | 自动点火每日开始小时。 |
 | `ignition.end_hour` | 自动点火每日结束小时。 |
+| `ignition.end_grace_minutes` | 每日结束后的宽限分钟，默认 `30`。 |
 | `ignition.grace_seconds` | 额度窗口重置后等待的秒数。 |
+| `ignition.failure_retry_seconds` | 点火瞬时失败后的重试间隔（秒），默认 `300`。 |
+| `ignition.max_transient_failures` | 点火熔断前的瞬时失败上限，默认 `3`。 |
 | `ignition.model` | 点火使用的模型，默认 `gpt-5-codex`。 |
+| `ignition.models_api_key` | 从 CPA 读取模型列表用的 API key（请用专用 key，不要填管理密钥）。 |
+| `ignition.cpa_base_url` | CPA 地址，用于读取模型列表，默认 `http://127.0.0.1:8317`，请按 CPA 实际监听地址填写。 |
 | `poll_interval_seconds` | 主动额度查询间隔（秒），默认 `300`，最小 `60`。 |
+| `history_retention_days` | 额度历史保留天数，默认 `40`。 |
 
-设置页面可以修改 Telegram、重置和点火相关字段，保存时按字段合并，不会清空页面不展示的配置。页面保存立即生效，但只保存在内存里，CPA 重启后会恢复为 `config.yaml` 中的配置；需要长期生效的配置请写进 `config.yaml`。修改后应重新读取页面状态确认保存结果，并查看 CPA 日志确认插件已经应用配置。
+设置页面可以修改 Telegram、重置、提醒规则、点火与高级字段。保存时页面调用 CPA 的管理接口 `PATCH /v0/management/plugins/phoenix/config`，每次带一个随机 `config_token`；CPA 合并后写入 `config.yaml` 并重新下发给插件，页面等到自己的 token 被回显才显示“已生效”，重启后配置仍然有效。管理接口返回的 Bot Token 与模型列表 API key 一律脱敏，页面留空表示不修改。
 
 ## 安全与运行边界
 
@@ -295,6 +311,10 @@ sha256sum -c dist/checksums.txt
 ### 页面显示运行中但没有账号数据
 
 这通常表示插件已加载，但 CPA 尚未产生可识别的 usage 记录，或上游响应没有可解析的额度字段。先通过 CPA 发起一次 Codex 请求，再查看 Phoenix 页面和 CPA 日志。
+
+### 设置保存后没有生效
+
+页面保存后会等 CPA 回显 `config_token` 才显示“已生效”。如果一直显示“未能验证”，检查 CPA 版本是否支持 `PATCH /v0/management/plugins/<id>/config`，以及 `config.yaml` 是否可写；页面在该接口不可用时会回退到内存保存（重启丢失），并在保存状态里说明。
 
 ### Telegram 没有收到消息
 
@@ -325,18 +345,18 @@ sha256sum -c dist/checksums.txt
 
 ## 版本与发布流程
 
-版本号统一保存在 `VERSION`，并同步到 `main.go` 和 `CHANGELOG.md`。当前版本为 `0.0.7`。
+版本号统一保存在 `VERSION`，并同步到 `main.go` 和 `CHANGELOG.md`。当前版本为 `0.0.8`。
 
-后续每次功能、修复或文档变更都递增版本号，例如从 `0.0.7` 到 `0.0.8`，完成验证后执行：
+后续每次功能、修复或文档变更都递增版本号，例如从 `0.0.8` 到 `0.0.9`，完成验证后执行：
 
 ```bash
-make check-version VERSION=0.0.7
+make check-version VERSION=0.0.8
 go test ./...
 git add .
 git commit -m "..."
 git push origin master
-git tag -a v0.0.7 -m "Phoenix v0.0.7"
-git push origin v0.0.7
+git tag -a v0.0.8 -m "Phoenix v0.0.8"
+git push origin v0.0.8
 ```
 
 推送版本 tag 后，GitHub Actions 会自动构建并发布：

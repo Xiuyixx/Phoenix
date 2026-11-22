@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -9,6 +12,65 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
+
+// fakeHost is a hostClient backed by canned responses, for tests that need
+// poll/ignition behaviour without a real CPA host.
+type fakeHost struct {
+	authListEntries []pluginapi.HostAuthFileEntry
+	usageBody       string
+	usageStatus     int
+	modelStatus     int
+	modelErr        error
+	modelCalls      []string
+	usageCalls      int
+}
+
+func (f *fakeHost) log(level, message string, fields map[string]any) {}
+func (f *fakeHost) authGet(index string) (pluginapi.HostAuthGetResponse, error) {
+	return pluginapi.HostAuthGetResponse{AuthIndex: index, Name: "test.json", JSON: json.RawMessage(`{"access_token":"tok","account_id":"acc-1"}`)}, nil
+}
+func (f *fakeHost) authList() ([]pluginapi.HostAuthFileEntry, error) {
+	if f.authListEntries != nil {
+		return f.authListEntries, nil
+	}
+	return []pluginapi.HostAuthFileEntry{{ID: "id-0", AuthIndex: "0", Name: "test.json", Provider: "codex"}}, nil
+}
+func (f *fakeHost) httpDo(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	f.usageCalls++
+	status := f.usageStatus
+	if status == 0 {
+		status = 200
+	}
+	return pluginapi.HTTPResponse{StatusCode: status, Body: []byte(f.usageBody)}, nil
+}
+func (f *fakeHost) modelExecute(req pluginapi.HostModelExecutionRequest) (pluginapi.HostModelExecutionResponse, error) {
+	f.modelCalls = append(f.modelCalls, req.Model)
+	if f.modelErr != nil {
+		return pluginapi.HostModelExecutionResponse{}, f.modelErr
+	}
+	status := f.modelStatus
+	if status == 0 {
+		status = 200
+	}
+	return pluginapi.HostModelExecutionResponse{StatusCode: status}, nil
+}
+func (f *fakeHost) resetCooldown(index string) error { return nil }
+
+func newTestRuntime(host hostClient) *runtime {
+	return &runtime{cfg: defaultConfig(), host: host, lastUsage: map[string]UsageSnapshot{}, resetState: map[string]resetGuard{}, accounts: map[string]*accountState{}, pollErrs: map[string]string{}, state: newPersistedState(), stopCh: make(chan struct{})}
+}
+
+func setActive(t *testing.T, rt *runtime) {
+	t.Helper()
+	hostMu.Lock()
+	active = rt
+	hostMu.Unlock()
+	t.Cleanup(func() {
+		hostMu.Lock()
+		active = nil
+		hostMu.Unlock()
+	})
+}
 
 // TestRegistrationMetadataParses reproduces the CPA 8.1.1 startup failure:
 // the host unmarshals the registration result into pluginapi.Metadata, whose
@@ -275,4 +337,687 @@ func decodeManagementResponse(t *testing.T, out []byte) pluginapi.ManagementResp
 		t.Fatalf("unmarshal ManagementResponse: %v (%s)", err, env.Result)
 	}
 	return resp
+}
+
+func TestParseCodexUsageDual(t *testing.T) {
+	body := `{"plan_type":"plus","rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":19,"resets_in_seconds":17000},"secondary_window":{"limit_window_seconds":604800,"used_percent":6,"resets_in_seconds":500000}}}`
+	windows, plan, ok := parseCodexUsageDual([]byte(body))
+	if !ok {
+		t.Fatalf("parseCodexUsageDual failed")
+	}
+	if plan != "plus" {
+		t.Errorf("plan = %q, want plus", plan)
+	}
+	five, ok := windows["5h"]
+	if !ok || five.Remaining != 81 || five.PeriodSeconds != 18000 {
+		t.Errorf("5h window = %+v, want remaining 81 period 18000", five)
+	}
+	seven, ok := windows["7d"]
+	if !ok || seven.Remaining != 94 || seven.PeriodSeconds != 604800 {
+		t.Errorf("7d window = %+v, want remaining 94 period 604800", seven)
+	}
+	if five.Reset.IsZero() || seven.Reset.IsZero() {
+		t.Errorf("reset times must be set: 5h=%v 7d=%v", five.Reset, seven.Reset)
+	}
+}
+
+func TestParseCodexUsageDualNoWindowLength(t *testing.T) {
+	// Without limit_window_seconds, primary is 5h and secondary is 7d.
+	body := `{"rate_limit":{"primary_window":{"used_percent":50},"secondary_window":{"used_percent":25}}}`
+	windows, _, ok := parseCodexUsageDual([]byte(body))
+	if !ok {
+		t.Fatalf("parseCodexUsageDual failed")
+	}
+	if windows["5h"].Remaining != 50 || windows["7d"].Remaining != 75 {
+		t.Errorf("windows = %v, want 5h=50 7d=75", windows)
+	}
+}
+
+func TestParseCodexUsageDualClamps(t *testing.T) {
+	body := `{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":150},"secondary_window":{"limit_window_seconds":604800,"used_percent":-5}}}`
+	windows, _, ok := parseCodexUsageDual([]byte(body))
+	if !ok {
+		t.Fatalf("parseCodexUsageDual failed")
+	}
+	if windows["5h"].Remaining != 0 || windows["7d"].Remaining != 100 {
+		t.Errorf("windows = %v, want 5h=0 7d=100", windows)
+	}
+}
+
+// TestAuthIndexUnification checks that passive usage records are keyed by
+// auth_index: two records for the same index but different auth_ids land
+// on one account, and 429 bodies are split by window (300 -> 5h,
+// 10080 -> 7d).
+func TestAuthIndexUnification(t *testing.T) {
+	rt := newTestRuntime(&fakeHost{})
+	setActive(t, rt)
+	now := time.Now()
+	send := func(authID string, minutes int, resets int) {
+		t.Helper()
+		body := fmt.Sprintf(`{"error":{"type":"usage_limit_reached","limit_window_minutes":%d,"resets_in_seconds":%d}}`, minutes, resets)
+		rec, err := json.Marshal(pluginapi.UsageRecord{Provider: "codex", AuthIndex: "0", AuthID: authID, Failed: true, Failure: pluginapi.UsageFailure{StatusCode: 429, Body: body}})
+		if err != nil {
+			t.Fatalf("marshal usage record: %v", err)
+		}
+		if _, err := handleUsage(rec); err != nil {
+			t.Fatalf("handleUsage: %v", err)
+		}
+	}
+	send("old-id", 300, 17000)
+	send("new-id", 10080, 200000)
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if len(rt.accounts) != 1 {
+		t.Fatalf("accounts = %d, want 1 (keyed by auth_index)", len(rt.accounts))
+	}
+	acct := rt.accounts["0"]
+	if acct == nil {
+		t.Fatalf("account 0 missing")
+	}
+	if acct.AuthID != "new-id" {
+		t.Errorf("auth_id = %q, want new-id (latest record wins)", acct.AuthID)
+	}
+	five := acct.Windows["5h"]
+	if five == nil || five.Remaining != 0 || five.Source != "passive" {
+		t.Errorf("5h window = %+v, want remaining 0 source passive", five)
+	}
+	if five != nil && five.Reset.Sub(now) < 16900*time.Second {
+		t.Errorf("5h reset = %v, want ~now+17000s", five.Reset)
+	}
+	seven := acct.Windows["7d"]
+	if seven == nil || seven.Remaining != 0 {
+		t.Errorf("7d window = %+v, want remaining 0", seven)
+	}
+}
+
+// TestPassiveOnlyConfirmedWindows checks that a passive 429 never
+// resurrects a window the active poll has not confirmed.
+func TestPassiveOnlyConfirmedWindows(t *testing.T) {
+	rt := newTestRuntime(&fakeHost{})
+	setActive(t, rt)
+	rt.mu.Lock()
+	acct := rt.getOrCreateAccountLocked("0")
+	acct.ActiveWindows = []string{"7d"}
+	rt.mu.Unlock()
+	body := `{"error":{"type":"usage_limit_reached","limit_window_minutes":300,"resets_in_seconds":17000}}`
+	rec, _ := json.Marshal(pluginapi.UsageRecord{Provider: "codex", AuthIndex: "0", AuthID: "x", Failed: true, Failure: pluginapi.UsageFailure{StatusCode: 429, Body: body}})
+	if _, err := handleUsage(rec); err != nil {
+		t.Fatalf("handleUsage: %v", err)
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if _, ok := rt.accounts["0"].Windows["5h"]; ok {
+		t.Errorf("passive 429 created an unconfirmed 5h window")
+	}
+}
+
+func TestHistoryBucketing(t *testing.T) {
+	if got := historyBucket(6 * time.Hour); got != 60 {
+		t.Errorf("bucket(6h) = %d, want 60", got)
+	}
+	if got := historyBucket(3 * 24 * time.Hour); got != 600 {
+		t.Errorf("bucket(3d) = %d, want 600", got)
+	}
+	if got := historyBucket(6 * 24 * time.Hour); got != 900 {
+		t.Errorf("bucket(6d) = %d, want 900", got)
+	}
+	if got := historyBucket(10 * 24 * time.Hour); got != 1800 {
+		t.Errorf("bucket(10d) = %d, want 1800", got)
+	}
+	if got := historyBucket(20 * 24 * time.Hour); got != 3600 {
+		t.Errorf("bucket(20d) = %d, want 3600", got)
+	}
+	// resetMarkers emits [reset_time_unix, remaining_after_reset] so the
+	// frontend can derive pace segments as [reset - period, reset].
+	base := time.Now().Unix()
+	samples := []historyRecord{
+		{Kind: "s", Time: base - 3600, Window: "5h", Remaining: 90, Reset: base + 17000, Source: "active"},
+		{Kind: "s", Time: base - 1800, Window: "5h", Remaining: 80, Reset: base + 17000, Source: "active"},
+		{Kind: "s", Time: base - 60, Window: "5h", Remaining: 99, Reset: base + 18000 + 17000, Source: "active"},
+	}
+	markers := resetMarkers(samples, base-7200)
+	if len(markers) != 2 {
+		t.Fatalf("markers = %v, want 2", markers)
+	}
+	if int64(markers[0][0].(int64)) != base+17000 || markers[0][1].(float64) != 90 {
+		t.Errorf("first marker = %v, want [%d 90]", markers[0], base+17000)
+	}
+	if int64(markers[1][0].(int64)) != base+35000 || markers[1][1].(float64) != 99 {
+		t.Errorf("second marker = %v, want [%d 99]", markers[1], base+35000)
+	}
+	// bucketSamples keeps the last sample per bucket and prepends the
+	// last sample before the range start.
+	points := bucketSamples(samples, base-3600, 60)
+	if len(points) != 3 {
+		t.Fatalf("points = %v, want 3", points)
+	}
+}
+
+func TestStatusMasking(t *testing.T) {
+	rt := newTestRuntime(&fakeHost{})
+	rt.cfg.Telegram.BotToken = "123:SECRET"
+	rt.cfg.Telegram.ChatIDs = "1;2"
+	rt.cfg.Telegram.Enabled = true
+	rt.cfg.Ignition.ModelsAPIKey = "cpa-key-secret"
+	rt.cfg.Ignition.Model = "gpt-6-luna"
+	rt.configAppliedToken = "abcdef0123456789"
+	raw := rt.statusJSON()
+	if strings.Contains(string(raw), "123:SECRET") || strings.Contains(string(raw), "cpa-key-secret") {
+		t.Fatalf("status leaks a secret: %s", raw)
+	}
+	var status map[string]any
+	if err := json.Unmarshal(raw, &status); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	if status["config_applied_token"] != "abcdef0123456789" {
+		t.Errorf("config_applied_token = %v, want abcdef0123456789", status["config_applied_token"])
+	}
+	cfg := status["config"].(map[string]any)
+	tg := cfg["telegram"].(map[string]any)
+	if tg["bot_token"] != "" || tg["bot_token_set"] != true {
+		t.Errorf("telegram = %v, want bot_token empty + bot_token_set true", tg)
+	}
+	ig := cfg["ignition"].(map[string]any)
+	if ig["models_api_key"] != "" || ig["models_api_key_set"] != true {
+		t.Errorf("ignition = %v, want models_api_key empty + set true", ig)
+	}
+	if ig["model"] != "gpt-6-luna" {
+		t.Errorf("ignition model = %v, want gpt-6-luna untouched", ig["model"])
+	}
+	if ig["end_grace_minutes"] != float64(30) || ig["failure_retry_seconds"] != float64(300) || ig["max_transient_failures"] != float64(3) {
+		t.Errorf("ignition hardening fields = %v", ig)
+	}
+	if _, ok := status["accounts"]; !ok {
+		t.Errorf("status has no accounts array")
+	}
+	if _, ok := status["targets"]; !ok {
+		t.Errorf("status has no targets array")
+	}
+	if _, ok := status["errors"]; !ok {
+		t.Errorf("status has no errors object")
+	}
+	if status["utc_offset_seconds"] == nil || status["now"] == nil {
+		t.Errorf("status lacks now/utc_offset_seconds: %s", raw)
+	}
+}
+
+func TestConfigTokenAndNestedAlertModes(t *testing.T) {
+	cfg := defaultConfig()
+	parseYAML([]byte(`config_token: abcdef0123456789
+history_retention_days: 30
+alerts:
+  thresholds: [80, 40, 5]
+  notify_errors: false
+  recovery_notify:
+    five_hour: off
+    seven_day: all
+  reset_reminder:
+    five_hour: has_remaining
+    seven_day: off
+ignition:
+  end_grace_minutes: 45
+  failure_retry_seconds: 120
+  max_transient_failures: 5
+  models_api_key: "key-1"
+  model: "gpt-6-luna"
+`), &cfg)
+	if cfg.ConfigToken != "abcdef0123456789" {
+		t.Errorf("config_token = %q", cfg.ConfigToken)
+	}
+	if cfg.HistoryRetentionDays != 30 {
+		t.Errorf("history_retention_days = %d, want 30", cfg.HistoryRetentionDays)
+	}
+	if cfg.Alerts.RecoveryNotify.FiveHour != "off" || cfg.Alerts.RecoveryNotify.SevenDay != "all" {
+		t.Errorf("recovery_notify = %+v, want {off all}", cfg.Alerts.RecoveryNotify)
+	}
+	if cfg.Alerts.ResetReminder.FiveHour != "has_remaining" || cfg.Alerts.ResetReminder.SevenDay != "off" {
+		t.Errorf("reset_reminder = %+v, want {has_remaining off}", cfg.Alerts.ResetReminder)
+	}
+	if !cfg.Alerts.NotifyRecovery {
+		t.Errorf("notify_recovery must be derived true (7d is all)")
+	}
+	if cfg.Alerts.Thresholds[2] != 5 {
+		t.Errorf("thresholds = %v", cfg.Alerts.Thresholds)
+	}
+	if cfg.Ignition.EndGraceMinutes != 45 || cfg.Ignition.FailureRetrySeconds != 120 || cfg.Ignition.MaxTransientFailures != 5 {
+		t.Errorf("ignition = %+v", cfg.Ignition)
+	}
+	if cfg.Ignition.Model != "gpt-6-luna" {
+		t.Errorf("model = %q, must survive untouched", cfg.Ignition.Model)
+	}
+	// All-off recovery derives notify_recovery false.
+	cfg2 := defaultConfig()
+	parseYAML([]byte("alerts:\n  recovery_notify:\n    five_hour: off\n    seven_day: off\n"), &cfg2)
+	if cfg2.Alerts.NotifyRecovery {
+		t.Errorf("notify_recovery must be derived false when both windows are off")
+	}
+	// Invalid thresholds clamp to notice >= low >= critical.
+	cfg3 := defaultConfig()
+	parseYAML([]byte("alerts:\n  thresholds: [10, 80, 90]\n"), &cfg3)
+	if len(cfg3.Alerts.Thresholds) != 3 || cfg3.Alerts.Thresholds[0] != 10 || cfg3.Alerts.Thresholds[1] != 10 || cfg3.Alerts.Thresholds[2] != 10 {
+		t.Errorf("thresholds = %v, want [10 10 10]", cfg3.Alerts.Thresholds)
+	}
+	// Status round-trips the nested modes.
+	rt := newTestRuntime(&fakeHost{})
+	rt.cfg = cfg
+	raw := rt.statusJSON()
+	var status map[string]any
+	_ = json.Unmarshal(raw, &status)
+	alerts := status["config"].(map[string]any)["alerts"].(map[string]any)
+	rn := alerts["recovery_notify"].(map[string]any)
+	if rn["five_hour"] != "off" || rn["seven_day"] != "all" {
+		t.Errorf("status recovery_notify = %v, want {off all}", rn)
+	}
+	rr := alerts["reset_reminder"].(map[string]any)
+	if rr["five_hour"] != "has_remaining" || rr["seven_day"] != "off" {
+		t.Errorf("status reset_reminder = %v", rr)
+	}
+	if status["config"].(map[string]any)["history_retention_days"] != float64(30) {
+		t.Errorf("status history_retention_days = %v, want 30", status["config"].(map[string]any)["history_retention_days"])
+	}
+}
+
+// TestThresholdCrossingNotifyOnce checks the per-window per-severity
+// notify-once behaviour: a crossing queues one notification, a repeat at
+// the same severity queues nothing, a worse severity queues again, and an
+// improvement resets the notified severity.
+func TestThresholdCrossingNotifyOnce(t *testing.T) {
+	rt := newTestRuntime(&fakeHost{})
+	now := time.Now()
+	acct := &accountState{AuthIndex: "0", Title: "凭证 0", Windows: map[string]*windowState{}}
+	eval := func(remaining float64) int {
+		t.Helper()
+		rt.mu.Lock()
+		rt.pendingNotifies = nil
+		rt.evaluateWindowAlertsLocked(acct, "5h", windowState{Remaining: remaining, Reset: now.Add(5 * time.Hour), ObservedAt: now}, "active", now)
+		n := len(rt.pendingNotifies)
+		rt.mu.Unlock()
+		return n
+	}
+	if n := eval(60); n != 0 {
+		t.Errorf("60%% queued %d notifies, want 0", n)
+	}
+	if n := eval(15); n != 1 {
+		t.Fatalf("15%% (low) queued %d notifies, want 1", n)
+	}
+	// Simulate a successful send.
+	rt.mu.Lock()
+	rt.state.baseline("0", "5h").NotifiedSeverity = "low"
+	rt.mu.Unlock()
+	if n := eval(12); n != 0 {
+		t.Errorf("12%% (still low) queued %d notifies, want 0", n)
+	}
+	if n := eval(5); n != 1 {
+		t.Fatalf("5%% (critical) queued %d notifies, want 1", n)
+	}
+	rt.mu.Lock()
+	rt.state.baseline("0", "5h").NotifiedSeverity = "critical"
+	rt.mu.Unlock()
+	if n := eval(80); n != 0 {
+		t.Errorf("80%% (recovered) queued %d notifies, want 0", n)
+	}
+	if n := eval(15); n != 1 {
+		t.Errorf("15%% after recovery queued %d notifies, want 1", n)
+	}
+}
+
+// TestRecoveryDetection checks that a window whose cycle was exhausted and
+// then reports a new reset queues a recovery notification.
+func TestRecoveryDetection(t *testing.T) {
+	rt := newTestRuntime(&fakeHost{})
+	now := time.Now()
+	acct := &accountState{AuthIndex: "0", Title: "凭证 0", Windows: map[string]*windowState{}}
+	rt.mu.Lock()
+	base := rt.state.baseline("0", "5h")
+	base.Remaining = 0
+	base.Reset = now.Add(time.Hour).Format(time.RFC3339)
+	base.Exhausted = true
+	base.NotifiedSeverity = "exhausted"
+	rt.pendingNotifies = nil
+	rt.evaluateWindowAlertsLocked(acct, "5h", windowState{Remaining: 98, Reset: now.Add(6 * time.Hour), ObservedAt: now}, "active", now)
+	queued := len(rt.pendingNotifies)
+	rec := rt.state.baseline("0", "5h").PendingRecovery
+	rt.mu.Unlock()
+	if queued != 1 {
+		t.Fatalf("recovery queued %d notifies, want 1", queued)
+	}
+	if rec == nil || !rec.Exhausted {
+		t.Errorf("pending recovery = %+v, want exhausted recovery", rec)
+	}
+}
+
+func TestIgnitionDueAt(t *testing.T) {
+	cfg := defaultConfig().Ignition
+	cfg.StartHour = 0
+	cfg.EndHour = 23
+	cfg.EndGraceMinutes = 30
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.Local)
+	// Rolling (unstarted) window ignites immediately.
+	ts := &targetState{RollingReset: true}
+	if due := ignitionDueAt(cfg, ts, time.Time{}, now); !due.Equal(now) {
+		t.Errorf("rolling due = %v, want now", due)
+	}
+	// Fixed future reset ignites at reset + grace.
+	ts = &targetState{}
+	reset := now.Add(2 * time.Hour)
+	if due := ignitionDueAt(cfg, ts, reset, now); !due.Equal(reset.Add(3 * time.Second)) {
+		t.Errorf("fixed due = %v, want reset+grace", due)
+	}
+	// Post-success hold delays the next due time.
+	ts = &targetState{LastSuccess: now.Add(-30 * time.Second), RollingReset: true}
+	if due := ignitionDueAt(cfg, ts, time.Time{}, now); !due.Equal(now.Add(30 * time.Second)) {
+		t.Errorf("hold due = %v, want now+30s", due)
+	}
+	// Circuit until next daily start.
+	ts = &targetState{CircuitUntil: now.Add(2 * time.Hour), RetryAt: now.Add(2 * time.Hour)}
+	if got := ts.ignitionStatus(now); got != "circuit" {
+		t.Errorf("status = %q, want circuit", got)
+	}
+}
+
+func TestObserveResetRolling(t *testing.T) {
+	ts := &targetState{}
+	now := time.Now()
+	reset1 := now.Add(5 * time.Hour)
+	if rolling := observeReset(ts, reset1, now, false); rolling {
+		t.Errorf("first observation must not be rolling")
+	}
+	// 5s later the reset moved ~5s forward: still a rolling placeholder.
+	reset2 := now.Add(5 * time.Second).Add(5 * time.Hour)
+	if rolling := observeReset(ts, reset2, now.Add(5*time.Second), false); !rolling {
+		t.Errorf("moving reset must be rolling")
+	}
+	// A fixed reset does not move.
+	ts2 := &targetState{}
+	fixed := now.Add(5 * time.Hour)
+	observeReset(ts2, fixed, now, false)
+	if rolling := observeReset(ts2, fixed, now.Add(5*time.Second), false); rolling {
+		t.Errorf("fixed reset must not be rolling")
+	}
+}
+
+func TestRecordTargetFailure(t *testing.T) {
+	cfg := defaultConfig().Ignition
+	now := time.Now()
+	// Transient failure: retry with backoff, no circuit.
+	ts := &targetState{}
+	out := recordTargetFailure(ts, cfg, now, fmt.Errorf("upstream timeout"), 0)
+	if out.CircuitOpened || out.Cooldown {
+		t.Errorf("transient outcome = %+v, want retry only", out)
+	}
+	if out.RetryIn != 300*time.Second {
+		t.Errorf("first retry = %v, want 300s", out.RetryIn)
+	}
+	out = recordTargetFailure(ts, cfg, now, fmt.Errorf("upstream timeout"), 0)
+	if out.RetryIn != 900*time.Second {
+		t.Errorf("second retry = %v, want 900s (x3 backoff)", out.RetryIn)
+	}
+	// Third transient failure exhausts the budget -> circuit.
+	out = recordTargetFailure(ts, cfg, now, fmt.Errorf("upstream timeout"), 0)
+	if !out.CircuitOpened || !out.NotifyCircuit {
+		t.Errorf("third failure outcome = %+v, want circuit opened + notify", out)
+	}
+	if ts.CircuitUntil.IsZero() {
+		t.Errorf("circuit_until must be set")
+	}
+	// Hard error opens the circuit immediately.
+	ts2 := &targetState{}
+	out = recordTargetFailure(ts2, cfg, now, fmt.Errorf("upstream status 401"), 401)
+	if !out.CircuitOpened {
+		t.Errorf("hard error outcome = %+v, want circuit", out)
+	}
+	// Short CPA cooldown waits without counting as a failure.
+	ts3 := &targetState{}
+	out = recordTargetFailure(ts3, cfg, now, fmt.Errorf(`model_cooldown {"reset_seconds": 120}`), 429)
+	if !out.Cooldown || ts3.ConsecutiveFailures != 0 {
+		t.Errorf("cooldown outcome = %+v failures=%d, want cooldown wait, 0 failures", out, ts3.ConsecutiveFailures)
+	}
+	if out.RetryIn != 123*time.Second {
+		t.Errorf("cooldown retry = %v, want 123s (120 + grace 3)", out.RetryIn)
+	}
+}
+
+func TestClassifyIgniteError(t *testing.T) {
+	if got := classifyIgniteError(fmt.Errorf("upstream status 429"), 429); got != "hard" {
+		t.Errorf("429 = %q, want hard", got)
+	}
+	if got := classifyIgniteError(ErrNotConfirmed, 0); got != "hard" {
+		t.Errorf("not confirmed = %q, want hard", got)
+	}
+	if got := classifyIgniteError(fmt.Errorf("auth_not_found"), 0); got != "unsupported" {
+		t.Errorf("auth_not_found = %q, want unsupported", got)
+	}
+	if got := classifyIgniteError(fmt.Errorf("are cooling down"), 0); got != "transient" {
+		t.Errorf("cooling down = %q, want transient", got)
+	}
+	if !modelRejected(fmt.Errorf("upstream status 404"), 404) {
+		t.Errorf("404 must be a model rejection")
+	}
+	if modelRejected(fmt.Errorf("upstream status 401"), 401) {
+		t.Errorf("401 must not be a model rejection")
+	}
+}
+
+func TestPickIgnitionCandidates(t *testing.T) {
+	got := pickIgnitionCandidates([]string{"gpt-5-codex", "gpt-6-luna", "gpt-6-luna-image", "gpt-5.1-oss", "gpt-4-luna", "codex-mini"})
+	want := []string{"gpt-6-luna", "gpt-4-luna", "gpt-5-codex"}
+	if len(got) != len(want) {
+		t.Fatalf("candidates = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("candidates = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestConfirmIgnition uses the fake host: a fixed 5h reset observed after
+// the request confirms the ignition; a missing 5h window never confirms.
+func TestConfirmIgnition(t *testing.T) {
+	fixed := time.Now().Add(5 * time.Hour).Format(time.RFC3339)
+	usage := `{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":2,"reset_at":"` + fixed + `"},"secondary_window":{"limit_window_seconds":604800,"used_percent":10}}}`
+	rt := newTestRuntime(&fakeHost{usageBody: usage})
+	rt.confirmDelays = []time.Duration{0}
+	rt.sleepFunc = func(time.Duration) {}
+	if err := rt.confirmIgnition("0"); err != nil {
+		t.Errorf("confirmIgnition = %v, want nil (fixed reset)", err)
+	}
+	rt2 := newTestRuntime(&fakeHost{usageBody: `{"rate_limit":{"secondary_window":{"limit_window_seconds":604800,"used_percent":10}}}`})
+	rt2.confirmDelays = []time.Duration{0, 0}
+	rt2.sleepFunc = func(time.Duration) {}
+	if err := rt2.confirmIgnition("0"); !errorsIs(err, ErrNotConfirmed) {
+		t.Errorf("confirmIgnition = %v, want ErrNotConfirmed", err)
+	}
+}
+
+func errorsIs(err, target error) bool {
+	return err != nil && target != nil && (err == target || strings.Contains(err.Error(), target.Error()))
+}
+
+// TestIgniteForSuccess runs the full manual ignition path against the fake
+// host: configured model wins, the request executes, confirmation observes
+// a fixed reset, and the target records success with an ignite event that
+// carries auth_index/window/params.
+func TestIgniteForSuccess(t *testing.T) {
+	fixed := time.Now().Add(5 * time.Hour).Format(time.RFC3339)
+	usage := `{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":2,"reset_at":"` + fixed + `"},"secondary_window":{"limit_window_seconds":604800,"used_percent":10}}}`
+	host := &fakeHost{usageBody: usage}
+	rt := newTestRuntime(host)
+	rt.cfg.Ignition.Model = "gpt-6-luna"
+	rt.confirmDelays = []time.Duration{0}
+	rt.sleepFunc = func(time.Duration) {}
+	rt.igniteFor("0", true)
+	if len(host.modelCalls) != 1 || host.modelCalls[0] != "gpt-6-luna" {
+		t.Fatalf("model calls = %v, want [gpt-6-luna]", host.modelCalls)
+	}
+	rt.mu.RLock()
+	ts := rt.state.Targets["0"]
+	events := rt.events
+	rt.mu.RUnlock()
+	if ts == nil || ts.LastSuccess.IsZero() || ts.LastModel != "gpt-6-luna" {
+		t.Errorf("target after success = %+v", ts)
+	}
+	found := false
+	for _, e := range events {
+		if e.Event == "ignite" && e.AuthIndex == "0" && e.Window == "5h" && e.Params["model"] == "gpt-6-luna" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no ignite event with auth_index/window/params in %v", events)
+	}
+}
+
+// TestPollCredentialDualWindows checks the active poll fills both windows,
+// records the plan, and surfaces poll failures in status.
+func TestPollCredentialDualWindows(t *testing.T) {
+	usage := `{"plan_type":"plus","rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":19,"resets_in_seconds":17000},"secondary_window":{"limit_window_seconds":604800,"used_percent":6,"resets_in_seconds":500000}}}`
+	rt := newTestRuntime(&fakeHost{usageBody: usage})
+	rt.pollCredential("0", pluginapi.HostAuthFileEntry{AuthIndex: "0", Name: "test.json", Provider: "codex"})
+	rt.mu.RLock()
+	acct := rt.accounts["0"]
+	rt.mu.RUnlock()
+	if acct == nil {
+		t.Fatalf("account 0 missing after poll")
+	}
+	if acct.Windows["5h"] == nil || acct.Windows["5h"].Remaining != 81 || acct.Windows["5h"].Source != "active" {
+		t.Errorf("5h window = %+v, want remaining 81 active", acct.Windows["5h"])
+	}
+	if acct.Windows["7d"] == nil || acct.Windows["7d"].Remaining != 94 {
+		t.Errorf("7d window = %+v, want remaining 94", acct.Windows["7d"])
+	}
+	if acct.Plan != "plus" {
+		t.Errorf("plan = %q, want plus", acct.Plan)
+	}
+	if len(acct.ActiveWindows) != 2 {
+		t.Errorf("active windows = %v, want [5h 7d]", acct.ActiveWindows)
+	}
+	// A failing poll is recorded and surfaced.
+	rt2 := newTestRuntime(&fakeHost{usageBody: `not json`, usageStatus: 500})
+	rt2.pollCredential("0", pluginapi.HostAuthFileEntry{AuthIndex: "0", Name: "test.json", Provider: "codex"})
+	raw := rt2.statusJSON()
+	if !strings.Contains(string(raw), "upstream status 500") {
+		t.Errorf("status does not surface the poll failure: %s", raw)
+	}
+}
+
+func TestHistoryResponse(t *testing.T) {
+	now := time.Now()
+	rt := newTestRuntime(&fakeHost{})
+	rt.histMem = []historyRecord{
+		{Kind: "s", Time: now.Add(-5 * time.Hour).Unix(), Group: "0", Window: "5h", Remaining: 90, Reset: now.Add(-5*time.Hour + 17000*time.Second).Unix(), Source: "active"},
+		{Kind: "s", Time: now.Add(-30 * time.Minute).Unix(), Group: "0", Window: "5h", Remaining: 80, Reset: now.Add(-5*time.Hour + 17000*time.Second).Unix(), Source: "active"},
+		{Kind: "s", Time: now.Add(-10 * time.Minute).Unix(), Group: "0", Window: "5h", Remaining: 99, Reset: now.Add(17000 * time.Second).Unix(), Source: "active"},
+		{Kind: "e", Time: now.Add(-10 * time.Minute).Unix(), Group: "0", Window: "5h", Event: "ignite", Level: "ok", Message: "点火成功", Params: map[string]string{"model": "gpt-6-luna"}},
+	}
+	resp := rt.historyResponse("6h", "5h", now)
+	series := resp["series"].([]map[string]any)
+	if len(series) != 1 {
+		t.Fatalf("series = %v, want 1", series)
+	}
+	points := series[0]["points"].([][3]any)
+	if len(points) != 3 {
+		t.Fatalf("points = %v, want 3", points)
+	}
+	if points[0][2] != "active" {
+		t.Errorf("point source = %v, want active", points[0][2])
+	}
+	resets := series[0]["resets"].([][2]any)
+	if len(resets) != 2 {
+		t.Fatalf("resets = %v, want 2 entries of [reset_time, remaining]", resets)
+	}
+	// The second marker is the new reset time with the post-reset remaining.
+	if int64(resets[1][0].(int64)) != now.Add(17000*time.Second).Unix() || resets[1][1].(float64) != 99 {
+		t.Errorf("second reset marker = %v, want [now+17000s 99]", resets[1])
+	}
+	events := resp["events"].([]map[string]any)
+	if len(events) != 1 {
+		t.Fatalf("events = %v, want 1", events)
+	}
+	if events[0]["auth_index"] != "0" || events[0]["window"] != "5h" || events[0]["kind"] != "ignite" {
+		t.Errorf("event = %v, want auth_index 0 window 5h kind ignite", events[0])
+	}
+	params, ok := events[0]["params"].(map[string]string)
+	if !ok || params["model"] != "gpt-6-luna" {
+		t.Errorf("event params = %v, want model gpt-6-luna", events[0]["params"])
+	}
+	if resp["bucket_seconds"] != int64(60) {
+		t.Errorf("bucket_seconds = %v, want 60", resp["bucket_seconds"])
+	}
+}
+
+// TestResolveDataDir checks the Lamplighter data-dir convention: with a
+// CPA config.yaml in the working directory, the data dir is
+// <plugins.dir>/data/phoenix; without one, the plugin runs memory-only.
+func TestResolveDataDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if got := resolveDataDir(defaultConfig()); got != "" {
+		t.Errorf("data dir without config = %q, want empty (memory-only)", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("plugins:\n  dir: plugins\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	want := filepath.Join(dir, "plugins", "data", "phoenix")
+	if got := resolveDataDir(defaultConfig()); got != want {
+		t.Errorf("data dir = %q, want %q", got, want)
+	}
+	cfg := defaultConfig()
+	cfg.DataDir = "/tmp/custom-phoenix"
+	if got := resolveDataDir(cfg); got != "/tmp/custom-phoenix" {
+		t.Errorf("explicit data_dir = %q", got)
+	}
+}
+
+// TestStateRoundTrip checks state.json survives a save/load cycle.
+func TestStateRoundTrip(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	s := newPersistedState()
+	s.baseline("0", "5h").NotifiedSeverity = "low"
+	s.baseline("0", "5h").Remaining = 15
+	s.target("0").ConsecutiveFailures = 2
+	s.CredProblems["0"] = &credProblem{Kind: "auth", Fingerprint: "auth:x", Confirmed: true, Failures: 3}
+	if err := savePersistedState(dir, s); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	loaded := loadPersistedState(dir)
+	if loaded.baseline("0", "5h").NotifiedSeverity != "low" {
+		t.Errorf("baseline not persisted: %+v", loaded.Baselines)
+	}
+	if loaded.target("0").ConsecutiveFailures != 2 {
+		t.Errorf("target not persisted: %+v", loaded.Targets)
+	}
+	if loaded.CredProblems["0"] == nil || loaded.CredProblems["0"].Kind != "auth" {
+		t.Errorf("credential problem not persisted: %+v", loaded.CredProblems)
+	}
+}
+
+// TestHistoryRoute exercises GET /history through the management handler.
+func TestHistoryRoute(t *testing.T) {
+	rt := newTestRuntime(&fakeHost{})
+	now := time.Now()
+	rt.histMem = []historyRecord{
+		{Kind: "s", Time: now.Add(-time.Hour).Unix(), Group: "0", Window: "5h", Remaining: 80, Reset: now.Add(4 * time.Hour).Unix(), Source: "active"},
+	}
+	setActive(t, rt)
+	req, err := json.Marshal(pluginapi.ManagementRequest{Method: "GET", Path: "/v0/management/phoenix/history", Query: map[string][]string{"range": {"6h"}, "window": {"5h"}}})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	out, err := handleManagement(req)
+	if err != nil {
+		t.Fatalf("handleManagement: %v", err)
+	}
+	resp := decodeManagementResponse(t, out)
+	var body struct {
+		Bucket int64 `json:"bucket_seconds"`
+		Series []any `json:"series"`
+		Events []any `json:"events"`
+	}
+	if err := json.Unmarshal(resp.Body, &body); err != nil {
+		t.Fatalf("history body is not JSON: %v (%s)", err, resp.Body)
+	}
+	if body.Bucket != 60 || len(body.Series) != 1 {
+		t.Errorf("history = %+v, want bucket 60 and 1 series", body)
+	}
 }
