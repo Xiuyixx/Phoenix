@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.3 - 2026-11-22
+
+- 修复 Release 矩阵：移除当前账户无法稳定调度的 macOS runner，避免 Linux/Windows 已成功却无法发布 GitHub Release。
+- 当前 Release 自动构建 Linux amd64、Linux arm64 和 Windows amd64，并生成 SHA256 校验文件。
+
 ## 0.0.2 - 2026-11-22
 
 - 修复 GitHub Actions Release 的 Windows 打包方式，改用 PowerShell 原生压缩和 SHA256 校验。
