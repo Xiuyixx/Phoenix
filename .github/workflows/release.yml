@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without v, for example 0.0.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }} ${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            ext: so
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            ext: so
+          - runner: macos-13
+            goos: darwin
+            goarch: amd64
+            ext: dylib
+          - runner: macos-14
+            goos: darwin
+            goarch: arm64
+            ext: dylib
+          - runner: windows-2025
+            goos: windows
+            goarch: amd64
+            ext: dll
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          test "$version" = "$(cat VERSION)"
+          grep -q '^## '"$version"' ' CHANGELOG.md
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build plugin
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -buildmode=c-shared \
+            -ldflags "-X main.pluginVersion=$VERSION" \
+            -o "dist/package/phoenix.${{ matrix.ext }}" .
+          printf '%s\n' "$VERSION" > dist/package/VERSION
+          (cd dist/package && zip -q -r "../phoenix_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" .)
+          sha256sum "dist/phoenix_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" > "dist/phoenix_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phoenix-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/phoenix_*
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: phoenix-*
+          merge-multiple: true
+          path: dist
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*

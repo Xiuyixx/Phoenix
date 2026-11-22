@@ -17,10 +17,22 @@ Phoenix 是面向 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) �
 
 ```bash
 go test ./...
-go build -buildmode=c-shared -o phoenix.so .
+make build
 ```
 
 将对应平台的共享库放入 CPA 插件目录，并在 CPA 中启用插件。具体插件目录和 `plugins.enabled` 配置请以所使用的 CLIProxyAPI 版本文档为准。
+
+## Release 构建
+
+版本号统一维护在根目录的 `VERSION` 文件中。每次项目更新都递增版本号，并同步 `main.go` 的默认版本、`CHANGELOG.md`，然后创建同名的 `v<version>` tag：
+
+```bash
+make check-version VERSION=0.0.1
+make release VERSION=0.0.1
+git push origin master --tags
+```
+
+推送 `v<version>` tag 后，GitHub Actions 会自动构建 Linux amd64/arm64、macOS amd64/arm64 和 Windows amd64 插件包，并创建对应 GitHub Release。构建产物包含共享库、`checksums.txt` 和版本信息；后续修改不再沿用旧版本号。
 
 ## 配置示例
 
