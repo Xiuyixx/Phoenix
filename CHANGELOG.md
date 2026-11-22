@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.9 - 2026-11-23
+
+- 修复轮询在测试服务器上取不到任何额度的问题：轮询、重置与点火回退用 `Provider == "codex"` 精确匹配过滤凭证，宿主在该环境下返回的条目 `Provider` 为空、只有 `Type` 是 codex，导致全部凭证被静默跳过——无账号、无历史、无报错。现按 Lamplighter 的 `loadCreds` 做法归一化（`Provider` 优先、`Type` 兜底、转小写并去空格），并在有凭证但无一匹配为 Codex 时把原因写进 `listErr`（面板通知横幅展示）与 CPA 日志，不再静默空面板。
+- 增加回归测试 `TestIsCodexEntry`、`TestPollOnceMatchesTypeOnlyCodex`、`TestPollOnceNoCodexCredentialIsLoud`。
+
 ## 0.0.8 - 2026-11-23
 
 - 按 Lamplighter 全面复刻面板与功能（与 Phoenix 的区别只有四处：操作卡片为“立即操作”、点火表每行在立即点火前加一个独立的“立即重置”按钮、设置多一块重置相关设置、设置多一块 Telegram 设置）。

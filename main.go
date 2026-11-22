@@ -46,7 +46,7 @@ import (
 
 const (
 	pluginID       = "phoenix"
-	pluginVersion  = "0.0.8"
+	pluginVersion  = "0.0.9"
 	repository     = "https://github.com/Xiuyixx/Phoenix"
 	managementBase = "/v0/management/phoenix"
 	resourcePath   = "/page"
@@ -623,7 +623,7 @@ func handleUsage(request []byte) ([]byte, error) {
 	acct.UpdatedAt = now
 	if r.Failed {
 		acct.Error = fmt.Sprintf("upstream status %d", r.Failure.StatusCode)
-		if r.Provider == "codex" && r.Failure.StatusCode == 429 && strings.Contains(strings.ToLower(r.Failure.Body), "usage_limit_reached") {
+		if strings.EqualFold(strings.TrimSpace(r.Provider), "codex") && r.Failure.StatusCode == 429 && strings.Contains(strings.ToLower(r.Failure.Body), "usage_limit_reached") {
 			kind, secs := usageLimitWindow(r.Failure.Body)
 			if kind != "" && acct.activeConfirmed(kind) {
 				w := acct.window(kind)
@@ -1310,7 +1310,7 @@ func (rt *runtime) reset(index string) {
 		// the host knows about, instead of silently doing nothing.
 		if entries, err := rt.host.authList(); err == nil {
 			for _, e := range entries {
-				if e.Provider == "codex" {
+				if isCodexEntry(e) {
 					index = e.AuthIndex
 					break
 				}
@@ -1331,6 +1331,24 @@ func (rt *runtime) reset(index string) {
 		rt.resetFor(index, true)
 	}()
 }
+
+// codexProvider normalizes a host auth entry's provider the way Lamplighter
+// does (loadCreds): Provider first, Type as fallback, lowercased and
+// trimmed. The host may leave Provider empty while Type still says codex
+// (and vice versa), so an exact `Provider == "codex"` check silently drops
+// every credential and the poller records nothing at all — no accounts, no
+// history, no error. isCodexEntry is the only provider check poll, reset
+// and ignition fallbacks may use.
+func codexProvider(e pluginapi.HostAuthFileEntry) string {
+	p := strings.ToLower(strings.TrimSpace(e.Provider))
+	if p == "" {
+		p = strings.ToLower(strings.TrimSpace(e.Type))
+	}
+	return p
+}
+
+func isCodexEntry(e pluginapi.HostAuthFileEntry) bool { return codexProvider(e) == "codex" }
+
 func firstCredential(v []string) string {
 	for _, x := range v {
 		if strings.TrimSpace(x) != "" {
@@ -1456,11 +1474,22 @@ func (rt *runtime) pollOnce() {
 	rt.mu.Lock()
 	rt.listErr = ""
 	rt.mu.Unlock()
+	codexCount := 0
 	for _, e := range entries {
-		if e.Provider != "codex" {
+		if !isCodexEntry(e) {
 			continue
 		}
+		codexCount++
 		rt.pollCredential(e.AuthIndex, e)
+	}
+	if codexCount == 0 && len(entries) > 0 {
+		// Loud failure instead of a silent empty panel: the poller ran,
+		// the host listed credentials, but none matched as Codex.
+		msg := fmt.Sprintf("auth list has %d entries but no Codex credential matched (checked Provider, fell back to Type)", len(entries))
+		rt.mu.Lock()
+		rt.listErr = msg
+		rt.mu.Unlock()
+		rt.host.log("warn", "Phoenix quota poll found no Codex credential", map[string]any{"entries": len(entries)})
 	}
 	now := time.Now()
 	rt.mu.Lock()
@@ -1682,7 +1711,7 @@ func (rt *runtime) igniteFor(index string, manual bool) {
 	if index == "" {
 		if entries, err := rt.host.authList(); err == nil {
 			for _, e := range entries {
-				if e.Provider == "codex" {
+				if isCodexEntry(e) {
 					index = e.AuthIndex
 					authID = e.ID
 					break
@@ -1996,7 +2025,7 @@ func (rt *runtime) maybeIgnite() {
 		return
 	}
 	for _, e := range entries {
-		if e.Provider != "codex" {
+		if !isCodexEntry(e) {
 			continue
 		}
 		rt.mu.RLock()

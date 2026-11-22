@@ -1021,3 +1021,71 @@ func TestHistoryRoute(t *testing.T) {
 		t.Errorf("history = %+v, want bucket 60 and 1 series", body)
 	}
 }
+
+// TestIsCodexEntry covers the provider normalization the poller depends on:
+// the host may leave Provider empty while Type still says codex (and may
+// return "Codex" with different casing). An exact `Provider == "codex"`
+// check silently dropped every credential on the test server, so the
+// poller recorded nothing — no accounts, no history, no error.
+func TestIsCodexEntry(t *testing.T) {
+	cases := []struct {
+		entry pluginapi.HostAuthFileEntry
+		want  bool
+	}{
+		{pluginapi.HostAuthFileEntry{Provider: "codex"}, true},
+		{pluginapi.HostAuthFileEntry{Provider: "Codex"}, true},
+		{pluginapi.HostAuthFileEntry{Provider: " codex "}, true},
+		{pluginapi.HostAuthFileEntry{Type: "codex"}, true},
+		{pluginapi.HostAuthFileEntry{Type: "CODEX "}, true},
+		{pluginapi.HostAuthFileEntry{Provider: "claude"}, false},
+		{pluginapi.HostAuthFileEntry{Provider: "codex", Type: "claude"}, true},
+		{pluginapi.HostAuthFileEntry{}, false},
+	}
+	for _, c := range cases {
+		if got := isCodexEntry(c.entry); got != c.want {
+			t.Errorf("isCodexEntry(%+v) = %v, want %v", c.entry, got, c.want)
+		}
+	}
+}
+
+// TestPollOnceMatchesTypeOnlyCodex reproduces the test-server failure: the
+// host listed credentials with an empty Provider and Type "codex", and the
+// old exact-match filter skipped them all, so pollOnce never queried
+// anything and no history was ever written.
+func TestPollOnceMatchesTypeOnlyCodex(t *testing.T) {
+	usage := `{"plan_type":"plus","rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":19,"resets_in_seconds":17000},"secondary_window":{"limit_window_seconds":604800,"used_percent":6,"resets_in_seconds":500000}}}`
+	host := &fakeHost{usageBody: usage, authListEntries: []pluginapi.HostAuthFileEntry{{ID: "id-0", AuthIndex: "0", Name: "codex-a.json", Type: "codex"}}}
+	rt := newTestRuntime(host)
+	rt.pollOnce()
+	if host.usageCalls != 1 {
+		t.Errorf("usage calls = %d, want 1 (Type-only codex entry must be polled)", host.usageCalls)
+	}
+	rt.mu.RLock()
+	acct := rt.accounts["0"]
+	listErr := rt.listErr
+	rt.mu.RUnlock()
+	if acct == nil || acct.Windows["5h"] == nil || acct.Windows["5h"].Remaining != 81 {
+		t.Errorf("account 0 5h window = %+v, want remaining 81", acct)
+	}
+	if listErr != "" {
+		t.Errorf("listErr = %q, want empty", listErr)
+	}
+}
+
+// TestPollOnceNoCodexCredentialIsLoud: when the host lists credentials but
+// none matches as Codex, pollOnce must say so in listErr (surfaced by the
+// panel's notices banner) instead of finishing silently with an empty panel.
+func TestPollOnceNoCodexCredentialIsLoud(t *testing.T) {
+	host := &fakeHost{authListEntries: []pluginapi.HostAuthFileEntry{{ID: "id-1", AuthIndex: "1", Name: "claude-a.json", Provider: "claude"}}}
+	rt := newTestRuntime(host)
+	rt.pollOnce()
+	if host.usageCalls != 0 {
+		t.Errorf("usage calls = %d, want 0", host.usageCalls)
+	}
+	rt.mu.RLock()
+	listErr := rt.listErr
+	rt.mu.RUnlock()
+	if listErr == "" {
+		t.Errorf("listErr is empty, want a message explaining no Codex credential matched")
+	}
+}
