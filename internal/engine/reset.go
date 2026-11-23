@@ -306,7 +306,7 @@ func (e *Engine) resetFor(index string, manual bool) error {
 	if err = e.resetCooldown(index); err != nil {
 		e.logf("warn", "Phoenix reset succeeded but cooldown clear failed: %v", err)
 		e.resetEvent("error", index, fmt.Sprintf("重置已完成但清除冷却失败：凭证 %s", index))
-		e.notifyReset(cfg, index, "⚠️ ⚠️ ⚠️ GPT 重置未完全成功", "已消耗 reset credit，但清除 CPA 本地冷却失败，请检查 CPA 日志。", true)
+		e.notifyReset(cfg, index, "⚠️ GPT 重置未完全成功", "已消耗 reset credit，但清除 CPA 本地冷却失败，请检查 CPA 日志。", true)
 		return fmt.Errorf("清除冷却失败")
 	}
 	e.logf("info", "Phoenix reset completed: auth_index=%s credit_id=%s manual=%v", index, pick.ID, manual)
@@ -320,7 +320,7 @@ func (e *Engine) resetFor(index string, manual bool) error {
 		cred.CooldownUntil = time.Time{}
 	}
 	e.mu.Unlock()
-	e.notifyReset(cfg, index, "✅ ✅ ✅ GPT 已完成重置", "已消耗 reset credit，并清除 CPA 本地冷却。", false)
+	e.notifyReset(cfg, index, "✅ GPT 已完成重置", "已消耗 reset credit，并清除 CPA 本地冷却。", false)
 	// Manual reset and ignition are independent operations: the reset
 	// button must NOT auto-trigger ignition from the manual path. Only
 	// the automatic reset chain ignites after the grace period.
