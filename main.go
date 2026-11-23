@@ -71,8 +71,7 @@ import (
 )
 
 // pluginVersion is set at build time with -ldflags "-X main.pluginVersion=...".
-// The build base is the Lamplighter source tree, renamed to Phoenix.
-var pluginVersion = "0.0.20"
+var pluginVersion = "0.1.0"
 
 var (
 	instanceMu sync.Mutex
