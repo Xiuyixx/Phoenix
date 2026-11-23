@@ -2145,7 +2145,7 @@ func TestDefaultProviderSwitches(t *testing.T) {
 // models key, CPA base URL, providers and thresholds must be declared so
 // the management center offers them (Lamplighter parity).
 func TestConfigFields(t *testing.T) {
-	want := []string{"config_token", "telegram", "alerts", "reset", "reset.credentials", "ignition", "ignition.model", "models_api_key", "cpa_base_url", "notice_threshold", "low_threshold", "critical_threshold", "recovery_notify", "reset_reminder", "providers", "poll_interval_seconds", "history_retention_days", "data_dir"}
+	want := []string{"config_token", "telegram", "alerts", "reset", "reset.credentials", "ignition", "ignition.model", "models_api_key", "cpa_base_url", "notice_threshold", "low_threshold", "critical_threshold", "recovery_notify", "reset_reminder", "providers", "codex_reset_updates", "poll_interval_seconds", "history_retention_days", "data_dir"}
 	got := map[string]bool{}
 	for _, f := range configFields() {
 		got[f.Name] = true

@@ -53,6 +53,7 @@ type persistedState struct {
 	Targets         map[string]*targetState               `json:"targets,omitempty"`   // auth_index -> ignition target
 	CredProblems    map[string]*credProblem               `json:"credential_problems,omitempty"`
 	CooldownNotices map[string]int64                      `json:"cooldown_notices,omitempty"` // auth_index -> cooldown_until Unix
+	CodexReset      *codexResetState                      `json:"codex_reset_updates,omitempty"`
 }
 
 func newPersistedState() *persistedState {

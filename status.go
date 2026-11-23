@@ -62,6 +62,11 @@ func (rt *runtime) maskedConfig() map[string]any {
 				"groups": cfg.Providers.Antigravity.Groups,
 			},
 		},
+		"codex_reset_updates": map[string]any{
+			"enabled":                cfg.CodexResetUpdates.Enabled,
+			"poll_seconds":           cfg.CodexResetUpdates.PollSeconds,
+			"notify_current_pending": cfg.CodexResetUpdates.NotifyCurrentPending,
+		},
 		"telegram": map[string]any{
 			"bot_token":     "",
 			"bot_token_set": strings.TrimSpace(cfg.Telegram.BotToken) != "",

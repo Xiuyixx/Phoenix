@@ -46,7 +46,7 @@ import (
 
 const (
 	pluginID       = "phoenix"
-	pluginVersion  = "0.0.14"
+	pluginVersion  = "0.0.15"
 	repository     = "https://github.com/Xiuyixx/Phoenix"
 	managementBase = "/v0/management/phoenix"
 	resourcePath   = "/page"
@@ -70,9 +70,11 @@ type runtime struct {
 	accounts map[string]*accountState
 	// pollErrs records the last active-poll failure per credential so a
 	// poll failure is surfaced in status instead of silently swallowed.
-	pollErrs  map[string]string
-	lastPoll  time.Time
-	nextPoll  time.Time
+	pollErrs map[string]string
+	lastPoll time.Time
+	nextPoll time.Time
+	// nextFeed is the next Did Codex Reset feed check; zero means due.
+	nextFeed  time.Time
 	listErr   string
 	configErr string
 	// lastNotifyErr / modelsErr feed status.errors.
@@ -147,14 +149,15 @@ type resetGuard struct {
 const resetSuppressWindow = 5 * time.Minute
 
 type Config struct {
-	Enabled              bool            `yaml:"enabled" json:"enabled"`
-	Telegram             TelegramConfig  `yaml:"telegram" json:"telegram"`
-	Alerts               AlertConfig     `yaml:"alerts" json:"alerts"`
-	Reset                ResetConfig     `yaml:"reset" json:"reset"`
-	Ignition             IgnitionConfig  `yaml:"ignition" json:"ignition"`
-	Providers            ProvidersConfig `yaml:"providers" json:"providers"`
-	PollIntervalSeconds  int             `yaml:"poll_interval_seconds" json:"poll_interval_seconds"`
-	HistoryRetentionDays int             `yaml:"history_retention_days" json:"history_retention_days"`
+	Enabled              bool              `yaml:"enabled" json:"enabled"`
+	Telegram             TelegramConfig    `yaml:"telegram" json:"telegram"`
+	Alerts               AlertConfig       `yaml:"alerts" json:"alerts"`
+	Reset                ResetConfig       `yaml:"reset" json:"reset"`
+	Ignition             IgnitionConfig    `yaml:"ignition" json:"ignition"`
+	Providers            ProvidersConfig   `yaml:"providers" json:"providers"`
+	CodexResetUpdates    CodexResetUpdates `yaml:"codex_reset_updates" json:"codex_reset_updates"`
+	PollIntervalSeconds  int               `yaml:"poll_interval_seconds" json:"poll_interval_seconds"`
+	HistoryRetentionDays int               `yaml:"history_retention_days" json:"history_retention_days"`
 	// RememberChartFilters/RememberChartExpanded mirror Lamplighter's
 	// chart-preference switches: whether the panel keeps the chart window,
 	// range and sort (and the expanded groups) in this browser.
@@ -189,6 +192,14 @@ type ProviderOverride struct {
 	Groups []string          `yaml:"groups,omitempty" json:"groups,omitempty"`
 	Models map[string]string `yaml:"models,omitempty" json:"models,omitempty"`
 }
+
+// CodexResetUpdates controls forwarding of Did Codex Reset signals.
+type CodexResetUpdates struct {
+	Enabled              bool `yaml:"enabled" json:"enabled"`
+	PollSeconds          int  `yaml:"poll_seconds" json:"poll_seconds"`
+	NotifyCurrentPending bool `yaml:"notify_current_pending" json:"notify_current_pending"`
+}
+
 type TelegramConfig struct {
 	BotToken string `yaml:"bot_token" json:"bot_token"`
 	ChatIDs  string `yaml:"chat_ids" json:"chat_ids"`
@@ -401,7 +412,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 // ignite off, groups [Gemini] when it is switched on); Codex and Claude
 // default on.
 func defaultConfig() Config {
-	return Config{Enabled: true, Alerts: AlertConfig{Thresholds: []int{50, 20, 10}, NotifyErrors: true, RecoveryNotify: WindowModes{FiveHour: "after_exhausted", SevenDay: "all"}, ResetReminder: WindowModes{FiveHour: "all", SevenDay: "has_remaining"}}, Reset: ResetConfig{Enabled: true, WeeklyOnly: true, MinimumResetSeconds: 86400}, Ignition: IgnitionConfig{Enabled: true, StartHour: 7, EndHour: 22, EndGraceMinutes: 30, GraceSeconds: 3, FailureRetrySeconds: 300, MaxTransientFailures: 3, Model: "gpt-5-codex", CPABaseURL: "http://127.0.0.1:8317"}, Providers: ProvidersConfig{Codex: ProviderOverride{Ignite: true}, Claude: ProviderOverride{Ignite: true}, Antigravity: ProviderOverride{Ignite: false, Groups: []string{"Gemini"}}}, PollIntervalSeconds: 300, HistoryRetentionDays: 40, RememberChartFilters: true, RememberChartExpanded: true}
+	return Config{Enabled: true, Alerts: AlertConfig{Thresholds: []int{50, 20, 10}, NotifyErrors: true, RecoveryNotify: WindowModes{FiveHour: "after_exhausted", SevenDay: "all"}, ResetReminder: WindowModes{FiveHour: "all", SevenDay: "has_remaining"}}, Reset: ResetConfig{Enabled: true, WeeklyOnly: true, MinimumResetSeconds: 86400}, Ignition: IgnitionConfig{Enabled: true, StartHour: 7, EndHour: 22, EndGraceMinutes: 30, GraceSeconds: 3, FailureRetrySeconds: 300, MaxTransientFailures: 3, Model: "gpt-5-codex", CPABaseURL: "http://127.0.0.1:8317"}, Providers: ProvidersConfig{Codex: ProviderOverride{Ignite: true}, Claude: ProviderOverride{Ignite: true}, Antigravity: ProviderOverride{Ignite: false, Groups: []string{"Gemini"}}}, CodexResetUpdates: CodexResetUpdates{Enabled: false, PollSeconds: 300, NotifyCurrentPending: true}, PollIntervalSeconds: 300, HistoryRetentionDays: 40, RememberChartFilters: true, RememberChartExpanded: true}
 }
 func parseYAML(b []byte, c *Config) {
 	lines := strings.Split(string(b), "\n")
@@ -594,6 +605,12 @@ func parseYAML(b []byte, c *Config) {
 		case "providers.antigravity.groups":
 			// Inline form: ["Gemini"] or Gemini, Claude / GPT.
 			c.Providers.Antigravity.Groups = parseStrings(v)
+		case "codex_reset_updates.enabled":
+			c.CodexResetUpdates.Enabled = v == "true"
+		case "codex_reset_updates.poll_seconds":
+			fmt.Sscanf(v, "%d", &c.CodexResetUpdates.PollSeconds)
+		case "codex_reset_updates.notify_current_pending":
+			c.CodexResetUpdates.NotifyCurrentPending = v == "true"
 		}
 	}
 	// Top-level keys win over the legacy ignition.* locations.
@@ -636,6 +653,10 @@ func parseYAML(b []byte, c *Config) {
 	}
 	if c.Ignition.MaxTransientFailures > 10 {
 		c.Ignition.MaxTransientFailures = 10
+	}
+	// Did Codex Reset feed interval, clamped to Lamplighter's 300s floor.
+	if c.CodexResetUpdates.PollSeconds < 300 {
+		c.CodexResetUpdates.PollSeconds = 300
 	}
 	if c.Ignition.CPABaseURL == "" {
 		c.Ignition.CPABaseURL = "http://127.0.0.1:8317"
@@ -714,6 +735,7 @@ func configFields() []pluginapi.ConfigField {
 		{Name: "recovery_notify", Type: pluginapi.ConfigFieldTypeObject, Description: "额度恢复时通知，five_hour 和 seven_day 各取 off、all 或 after_exhausted"},
 		{Name: "reset_reminder", Type: pluginapi.ConfigFieldTypeObject, Description: "重置前提醒，five_hour 和 seven_day 各取 off、all 或 has_remaining"},
 		{Name: "providers", Type: pluginapi.ConfigFieldTypeObject, Description: "每服务自动点火开关、点火模型与 Antigravity 额度组"},
+		{Name: "codex_reset_updates", Type: pluginapi.ConfigFieldTypeObject, Description: "转发 Did Codex Reset 的重置信号"},
 		{Name: "poll_interval_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "额度查询间隔（秒）"},
 		{Name: "history_retention_days", Type: pluginapi.ConfigFieldTypeInteger, Description: "额度历史保留天数"},
 		{Name: "data_dir", Type: pluginapi.ConfigFieldTypeString, Description: "状态和历史目录，默认 plugins/data/phoenix"},
@@ -1619,6 +1641,13 @@ func handleManagement(request []byte) ([]byte, error) {
 				// Merge per provider: a patch with only claude must not
 				// wipe codex/antigravity.
 				rt.mergeProvidersPatch(raw)
+			case "codex_reset_updates":
+				// Unmarshalling into the existing struct keeps fields the
+				// patch does not mention, like telegram/alerts above.
+				_ = json.Unmarshal(raw, &rt.cfg.CodexResetUpdates)
+				if rt.cfg.CodexResetUpdates.PollSeconds < 300 {
+					rt.cfg.CodexResetUpdates.PollSeconds = 300
+				}
 			case "poll_interval_seconds":
 				_ = json.Unmarshal(raw, &rt.cfg.PollIntervalSeconds)
 			case "history_retention_days":
@@ -2020,8 +2049,58 @@ func (rt *runtime) pollOnce() {
 	rt.retryPendingRecoveriesLocked(now)
 	rt.checkStaleCooldownsLocked(now)
 	rt.mu.Unlock()
+	// Did Codex Reset feed, on its own clock: only when the plugin and the
+	// feed are enabled and nextFeed is due. A feed failure never blocks
+	// the quota poll above; nextFeed still advances by the feed interval
+	// so a failing feed is retried on schedule, not in a tight loop.
+	if rt.cfg.Enabled && rt.cfg.CodexResetUpdates.Enabled && !now.Before(rt.nextFeed) {
+		rt.pollResetFeed()
+		rt.nextFeed = now.Add(rt.codexResetPollInterval())
+	}
 	rt.drainPending()
 	rt.saveStateIfDirty()
+}
+
+// codexResetPollInterval returns the Did Codex Reset feed interval,
+// clamped to the Lamplighter minimum of 300s.
+func (rt *runtime) codexResetPollInterval() time.Duration {
+	secs := rt.cfg.CodexResetUpdates.PollSeconds
+	if secs < 300 {
+		secs = 300
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// pollResetFeed fetches the Did Codex Reset feed and queues Telegram
+// notifications for new signals. A fetch failure only logs a warning (the
+// Lamplighter wording) and never blocks quota polling. Notifications are
+// queued into pendingNotifies instead of being sent inline: the pollOnce
+// tail drains them through rt.notify, like every other Phoenix
+// notification, so no Telegram request is ever made while rt.mu is held.
+// The dedup state is committed under rt.mu and marked dirty, so it is
+// persisted by the pollOnce tail's saveStateIfDirty.
+func (rt *runtime) pollResetFeed() {
+	rt.mu.RLock()
+	notifyPending := rt.cfg.CodexResetUpdates.NotifyCurrentPending
+	lang := rt.lang
+	rt.mu.RUnlock()
+	records, err := FetchResetRecords(context.Background(), &http.Client{Timeout: 20 * time.Second}, "phoenix/"+pluginVersion)
+	if err != nil {
+		rt.host.log("warn", fmt.Sprintf("Did Codex Reset 检查失败：%v", err), nil)
+		return
+	}
+	now := time.Now()
+	rt.mu.Lock()
+	rt.initLocked()
+	sent := ProcessResetRecords(rt.state, records, notifyPending, func(title, body string) bool {
+		rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "codex_reset", title: title, body: body})
+		return true
+	}, resetLang(lang), now)
+	rt.stateDirty = true
+	rt.mu.Unlock()
+	if sent > 0 {
+		rt.addEventFor("info", fmt.Sprintf("Did Codex Reset：已发送 %d 条通知", sent), "", "", "codex_reset", map[string]string{"count": strconv.Itoa(sent)})
+	}
 }
 
 func (rt *runtime) pollCredential(index string, entry pluginapi.HostAuthFileEntry) {

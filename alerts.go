@@ -18,7 +18,7 @@ import (
 // bookkeeping that runs after a successful send. group is the quota-group
 // key the notification belongs to (main group key for main windows).
 type pendingNotify struct {
-	kind      string // "threshold" | "recovery" | "reminder" | "stale_cooldown" | "credential" | "circuit"
+	kind      string // "threshold" | "recovery" | "reminder" | "stale_cooldown" | "credential" | "circuit" | "codex_reset"
 	authIndex string
 	group     string
 	window    string

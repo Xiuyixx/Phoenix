@@ -141,7 +141,6 @@
       notify_modes_hint: "“用完后”：窗口用完后，在下一次重置时通知一次。“有余量”：剩余高于告急阈值时才提醒。重置前提醒在 5 小时窗口重置前 1 小时、7 天窗口重置前 1 天发送。恢复通知附带上一周期的剩余额度，取自每次重置前 30 秒的查询。",
       quota_queries: "额度查询",
       models_api_key: "模型列表 API key",
-      models_key_set: "已设置",
       models_api_key_hint: "插件用这个 key 从 CPA 读取模型列表，为自动点火选择模型；不使用自动点火时可以留空。请在 CPA 的 access.api-keys 中新建一个专用 key，不要填管理密钥。",
       poll_interval: "查询间隔（秒）", request_timeout: "请求超时（秒）", history_retention: "历史保留（天）",
       passive_skip: "被动数据跳过窗口（秒）", passive_skip_max: "最多连续跳过（分钟）",
@@ -328,7 +327,6 @@
       notify_modes_hint: "\"After out\": after the window runs out, notify once at its next reset. \"If left\": remind only when more than the Critical threshold is left. Reminders are sent 1 hour before a 5-hour window resets and 1 day before a 7-day window resets. Recovery notifications include what was left of the ended cycle, from the query 30 seconds before every reset.",
       quota_queries: "Quota queries",
       models_api_key: "Model list API key",
-      models_key_set: "Set",
       models_api_key_hint: "The plugin reads CPA's model list with this key to pick ignition models; without ignition it can stay empty. Create a dedicated key in CPA's access.api-keys rather than using the management key.",
       poll_interval: "Query interval (s)", request_timeout: "Request timeout (s)", history_retention: "History retention (days)",
       passive_skip: "Passive data window (s)", passive_skip_max: "Longest skip (min)",
@@ -1002,12 +1000,10 @@
     // settings rather than a notice.
     var telegram = status.config && status.config.telegram;
     $("notify-off").hidden = !!(telegram && telegram.enabled && telegram.bot_token_set);
-    // models_api_key_set is the status flag for a configured key; the masked
-    // models_api_key itself is always "" now. The string fallback covers a
-    // status from before the flag existed ("已设置" while a key was set).
+    // models_api_key_set is the status flag for a configured key; the
+    // models_api_key in the status payload itself is always "" (masked).
+    // The string fallback covers a status from before the flag existed.
     var modelsKeySet = status.config && (status.config.models_api_key_set || !!status.config.models_api_key);
-    var modelsKeyHint = $("models-key-set");
-    if (modelsKeyHint) modelsKeyHint.hidden = !modelsKeySet;
     if (status.config && status.config.ignition && status.config.ignition.enabled && !modelsKeySet) {
       box.appendChild(notice(translate("no_models_key")));
     }
@@ -3640,14 +3636,11 @@
   function topKey(name) { return name.split(".")[0]; }
 
   // Effective values come from the status config (defaults applied); saved
-  // secrets come from the raw plugin config. The models key is never written
-  // back into its input: a saved key stays empty in the box, and the "已设置"
-  // hint next to it shows whether one is stored
-  // (status.config.models_api_key_set).
+  // secrets come from the raw plugin config.
   function effectiveConfig() {
     var effective = JSON.parse(JSON.stringify(status.config || {}));
     effective.bark_url = rawConfig.bark_url || "";
-    effective.models_api_key = "";
+    effective.models_api_key = rawConfig.models_api_key || "";
     var telegram = rawConfig.telegram || {};
     effective.telegram = effective.telegram || {};
     effective.telegram.bot_token = telegram.bot_token || "";

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.15 - 2026-11-23
+
+- 模型列表 API key 输入框按原版显示掩码：已保存的 key 现在回填真实值，密码框渲染成圆点（此前输入框恒为空，只靠“已设置”提示）。同时删掉“已设置”提示及其中英文 i18n 键；无 key 时的横幅提醒不变。保存流程不动（改动才触发校验、留空不改动、管理密钥拒绝、Telegram bot_token 仍留空）。
+- 复刻 Did Codex Reset 并真的能跑：新增 `codex_reset_updates` 配置（默认关闭、轮询 300 秒、首次开启推送当前待生效排期），轮询 https://didcodexreset.com/openapi/v1/records（最新 10 条），按原版逻辑去重（首次运行只发当前待生效排期、已见不重发、被取代的排期不发、排期变更重发，48 小时内有效记录、最多记 100 条），新信号经 Telegram 推送（不用 Bark/webhook），中英文通知文案与时间格式照 Phoenix 现有做法，历史链接附在正文末尾。设置页在模型 key 与额度图表之间新增 Did Codex Reset 设置块。失败只记 warn 日志，不阻塞额度轮询。
+
 ## 0.0.14 - 2026-11-23
 
 - 修复模型列表 API key 填了也显示“未设置”：key 其实早已存进 config.yaml（13:14 的校验与 PATCH 均成功，文件里顶层 models_api_key 已有 20 位值），但插件一直读不到。根因在手写 parseYAML：CPA 下发配置前会用 yaml.Marshal 重排成 2 空格缩进（顶层键在 0 列），而解析器遇到顶层键值行时不重置 section——排在 reset: 之后的顶层 models_api_key 被误认成 reset.models_api_key 悄悄丢掉；config_token 同样丢失，所以保存也永远无法确认已应用。修复：顶层键值行（0 列）先把 section 清空再分发。新增回归测试 TestParseYAMLDeliveredShape（旧解析器复现失败），并用服务器上真实 phoenix 配置块按 CPA 下发形态验证通过（key 20 位、config_token 16 位均读到）。部署后无需重新填 key，文件里已有的 key 会直接生效。
