@@ -132,6 +132,11 @@
       </section>
 
       <section class="card settings-section">
+        <h2 class="card-title"><span data-i18n="notify_channels">通知渠道</span></h2>
+        <div class="bark-row">
+          <label><span data-i18n="bark_url">Bark 推送地址</span><input name="bark_url" type="text" autocomplete="off" placeholder="https://api.day.app/device_key"></label>
+          <label><span data-i18n="bark_group">Bark 分组</span><input name="bark_group" type="text"></label>
+        </div>
         <h2 class="card-title"><span data-i18n="telegram_title">Telegram 推送</span></h2>
         <div class="checks">
           <label class="inline"><input name="telegram.enabled" type="checkbox"><span data-i18n="telegram_enabled">启用 Telegram 推送</span></label>
@@ -144,7 +149,7 @@
           <summary data-i18n="webhook_advanced">高级：请求方法、请求头、请求体和成功条件</summary>
           <div class="webhook-grid">
             <label><span data-i18n="webhook_method">请求方法</span><select name="webhook.method"><option>POST</option><option>PUT</option><option>GET</option></select></label>
-            <label class="span-wide"><span data-i18n="webhook_headers">请求头（每行一个）</span><textarea name="webhook.headers" data-format="headers" rows="4" spellcheck="false" placeholder="Authorization: Bearer <redacted>"></textarea></label>
+            <label class="span-wide"><span data-i18n="webhook_headers">请求头（每行一个）</span><textarea name="webhook.headers" data-format="headers" rows="4" spellcheck="false" placeholder="Authorization: Bearer token"></textarea></label>
             <label class="span-all"><span data-i18n="webhook_body">请求体</span><textarea name="webhook.body" rows="4" spellcheck="false" placeholder="留空时发送内置的 JSON 消息" data-i18n-placeholder="webhook_body_placeholder"></textarea></label>
             <label class="span-all"><span data-i18n="webhook_success">成功条件（可选）</span><input name="webhook.success_json" data-format="json" type="text" spellcheck="false" placeholder='{"code":0}'><span class="hint" data-i18n="webhook_success_hint">JSON 响应必须包含这些字段和值才算发送成功；留空时只检查 HTTP 状态码</span></label>
           </div>
@@ -195,9 +200,6 @@
             <label class="mode-option" title="剩余高于告急阈值时才提醒" data-i18n-title="reminder_has_remaining_title"><input type="radio" name="reset_reminder.seven_day" value="has_remaining"><span data-i18n="reminder_has_remaining">有余量</span></label>
           </div>
         </div>
-        <div class="checks">
-          <label class="inline"><input name="alerts.notify_errors" type="checkbox"><span data-i18n="notify_errors">账号错误时推送</span></label>
-        </div>
         <p class="hint" data-i18n="notify_modes_hint">“用完后”：窗口用完后，在下一次重置时通知一次。“有余量”：剩余高于告急阈值时才提醒。重置前提醒在 5 小时窗口重置前 1 小时、7 天窗口重置前 1 天发送。恢复通知附带上一周期的剩余额度，取自每次重置前 30 秒的查询。</p>
         <p class="hint" id="timezone-note"></p>
         <p class="hint" id="language-note"></p>
@@ -229,6 +231,12 @@
       </section>
 
       <section class="card settings-section">
+        <h2 class="card-title"><span data-i18n="services">服务</span></h2>
+        <div class="checks" id="monitor-rows"></div>
+        <p class="hint" data-i18n="monitor_hint">勾选要监控额度的服务。</p>
+      </section>
+
+      <section class="card settings-section">
         <h2 class="card-title"><span data-i18n="reset_settings">自动重置</span></h2>
         <div class="checks">
           <label class="inline"><input name="reset.enabled" type="checkbox"><span data-i18n="reset_enabled">启用自动重置</span></label>
@@ -247,8 +255,12 @@
           <legend><span data-i18n="quota_queries">额度查询</span></legend>
           <div class="grid-3">
             <label><span data-i18n="poll_interval">查询间隔（秒）</span><input name="poll_interval_seconds" type="number" min="60" step="60"></label>
+            <label><span data-i18n="request_timeout">请求超时（秒）</span><input name="request_timeout_seconds" type="number" min="5" max="120"></label>
             <label><span data-i18n="history_retention">历史保留（天）</span><input name="history_retention_days" type="number" min="1" max="365"></label>
+            <label><span data-i18n="passive_skip">被动数据跳过窗口（秒）</span><input name="passive_skip_seconds" type="number" min="0" step="10"></label>
+            <label><span data-i18n="passive_skip_max">最多连续跳过（分钟）</span><input name="passive_skip_max_minutes" type="number" min="0" step="5"></label>
           </div>
+          <p class="hint" data-i18n="passive_skip_hint">整点前这段时间内已有被动数据的账号跳过本轮主动查询；设为 0 则每轮都主动查询。</p>
         </fieldset>
         <fieldset>
           <legend><span data-i18n="models_api_key">模型列表 API key</span></legend>
@@ -274,6 +286,34 @@
             <label class="inline"><input name="remember_chart_expanded" type="checkbox"><span data-i18n="remember_chart_expanded">记住展开的分组</span></label>
           </div>
           <p class="hint" data-i18n="remember_chart_expanded_hint">在当前浏览器中记住“额度变化”中展开的多账号分组，5 小时和 7 天额度共用一套；关闭后每次打开页面分组都是收起的。</p>
+        </fieldset>
+        <fieldset class="mcp">
+          <legend><span>MCP</span></legend>
+          <p class="hint" data-i18n="mcp_hint">AI 客户端（如 Claude Code）可以通过 MCP 查询额度、历史和事件，并刷新额度。</p>
+          <div class="checks">
+            <label class="inline"><input name="mcp_enabled" type="checkbox"><span data-i18n="mcp_enabled">启用 MCP 接口</span></label>
+          </div>
+          <div class="grid-3">
+            <label><span data-i18n="mcp_listen">监听地址</span><input name="mcp_listen" type="text" spellcheck="false" autocomplete="off" placeholder="127.0.0.1:8318"></label>
+            <div class="field span-2" id="mcp-key-field">
+              <span class="field-label" data-i18n="mcp_key">密钥</span>
+              <div class="key-row">
+                <code id="mcp-key-view" class="key-view"></code>
+                <button id="mcp-key-show" class="btn btn-ghost btn-sm" type="button" data-i18n="mcp_show">显示</button>
+                <button id="mcp-key-copy" class="btn btn-ghost btn-sm" type="button" data-i18n="copy">复制</button>
+                <button id="mcp-key-new" class="btn btn-secondary btn-sm" type="button" data-i18n="mcp_generate">生成新密钥</button>
+              </div>
+            </div>
+          </div>
+          <div class="field">
+            <span class="field-label" data-i18n="mcp_status">状态</span>
+            <div id="mcp-status" class="mcp-status"></div>
+          </div>
+          <label><span data-i18n="mcp_public_url">对外地址（可选）</span><input id="mcp-public-url" type="text" spellcheck="false" autocomplete="off" placeholder="https://mcp.example.com"><span id="mcp-public-url-error" class="error-text" data-i18n="mcp_public_url_invalid" hidden>对外地址须为 http 或 https 地址，不能含空格、? 或 #；下面的配置暂用监听地址。</span><span class="hint" data-i18n="mcp_public_hint">对外开放时请使用反向代理并配置 HTTPS，然后在这里填写对外地址，下面的配置随之更新。这个地址只保存在当前浏览器。</span></label>
+          <div class="field">
+            <span class="field-label" data-i18n="mcp_snippets">客户端配置</span>
+            <div id="mcp-snippets" class="snippets"></div>
+          </div>
         </fieldset>
       </section>
     </form>
