@@ -1,9 +1,9 @@
 // Phoenix notification style (v0.0.18).
 //
-// Quota notifications follow the format the user specified (triple-emoji
+// Quota notifications follow the format the user specified (single-emoji
 // title, one line per field):
 //
-//	🟢 🟢 🟢 GPT 额度状态通知
+//	🟢 GPT 额度状态通知
 //	账号：user@example.com
 //	模型：Codex / GPT
 //	5H：85% ｜ 23:22 恢复（剩余 03h33m）
@@ -212,13 +212,13 @@ func quotaStatusMessage(g Group, trigger, severity string, now time.Time) (title
 	var emoji, kind, status string
 	switch severity {
 	case SeverityExhausted:
-		emoji, kind = "🔴 🔴 🔴", "额度耗尽警报"
+		emoji, kind = "🔴", "额度耗尽警报"
 		status = "Exhausted（" + windowShort(trigger) + " 额度已耗尽）"
 	case SeverityNormal:
-		emoji, kind = "🟢 🟢 🟢", "额度状态通知"
+		emoji, kind = "🟢", "额度状态通知"
 		status = "Normal（额度充足）"
 	default:
-		emoji, kind = "🟡 🟡 🟡", "额度不足预警"
+		emoji, kind = "🟡", "额度不足预警"
 		status = "Warning（" + windowShort(trigger) + " 额度不足）"
 	}
 	title = fmt.Sprintf("%s %s %s", emoji, cleanLabel(g.Label), kind)
@@ -228,7 +228,7 @@ func quotaStatusMessage(g Group, trigger, severity string, now time.Time) (title
 // quotaReminderMessage builds the title/body for a reset reminder: the same
 // layout, with the reset countdown as the 状态.
 func quotaReminderMessage(g Group, trigger string, untilReset time.Duration, now time.Time) (title, body string) {
-	title = fmt.Sprintf("⏰ ⏰ ⏰ %s 重置提醒", cleanLabel(g.Label))
+	title = fmt.Sprintf("⏰ %s 重置提醒", cleanLabel(g.Label))
 	status := fmt.Sprintf("Reminder（%s 窗口将于 %s 后重置）", windowShort(trigger), formatQuotaRemaining(untilReset))
 	return title, phoenixBody(g, status, true, now)
 }
