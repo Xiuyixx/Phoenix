@@ -1,5 +1,4 @@
-// Compatibility tests for Phoenix configs written before the Lamplighter
-// rebase (checklist items 10 and 11, and the account tests of item 7).
+// Compatibility tests for Phoenix configs written before the rebase (checklist items 10 and 11, and the account tests of item 7).
 //
 // The server's phoenix section mixes the old spellings with the new ones:
 // alerts.thresholds[]int, ignition.model (gpt-6-luna), a providers map, and
@@ -14,7 +13,7 @@ import (
 )
 
 // TestDefaultThresholdsPhoenix pins the Phoenix default: 20/10/5, not
-// Lamplighter's 50/20/10. The legacy alerts.thresholds array is kept in
+// the base's 50/20/10. The legacy alerts.thresholds array is kept in
 // sync with the three fields.
 func TestDefaultThresholdsPhoenix(t *testing.T) {
 	cfg := Default()
@@ -212,7 +211,7 @@ remember_chart_expanded: false
 	}
 }
 
-// TestDefaultChartFiltersOff pins the Lamplighter default: the quota chart
+// TestDefaultChartFiltersOff pins the base default: the quota chart
 // is not remembered by default.
 func TestDefaultChartFiltersOff(t *testing.T) {
 	cfg := Default()
