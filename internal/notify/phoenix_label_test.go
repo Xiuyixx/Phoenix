@@ -5,7 +5,7 @@
 //
 // The reported shape: both Codex credentials carry the full email as their
 // note, so the group label is "GPT#user@example.com" and the title used to
-// read "🟢 🟢 🟢 GPT#user@example.com 额度状态通知".
+// read "🟢 GPT#user@example.com 额度状态通知".
 package notify
 
 import (
@@ -52,7 +52,7 @@ func TestSuffixedLabelQuotaTitleAndModelLine(t *testing.T) {
 	now := time.Date(2026, 11, 23, 19, 49, 0, 0, time.Local)
 	g := suffixedGroup()
 	title, body := quotaStatusMessage(g, "5h", "normal", now)
-	if title != "🟢 🟢 🟢 GPT 额度状态通知" {
+	if title != "🟢 GPT 额度状态通知" {
 		t.Errorf("title = %q", title)
 	}
 	if !strings.HasPrefix(body, "账号：user@example.com\n模型：Codex / GPT\n") {
@@ -63,7 +63,7 @@ func TestSuffixedLabelQuotaTitleAndModelLine(t *testing.T) {
 	}
 
 	title, body = quotaReminderMessage(g, "5h", 57*time.Minute, now)
-	if title != "⏰ ⏰ ⏰ GPT 重置提醒" {
+	if title != "⏰ GPT 重置提醒" {
 		t.Errorf("reminder title = %q", title)
 	}
 	if !strings.Contains(body, "模型：Codex / GPT\n") {
@@ -76,7 +76,7 @@ func TestSuffixedLabelOtherPhoenixTitles(t *testing.T) {
 	g := suffixedGroup()
 
 	cooldown := CooldownMessage(LangZH, g, time.Date(2026, 11, 23, 20, 10, 0, 0, time.Local), time.Local, now)
-	if cooldown.Title != "⚠️ ⚠️ ⚠️ GPT 冷却过期提醒" {
+	if cooldown.Title != "⚠️ GPT 冷却过期提醒" {
 		t.Errorf("cooldown title = %q", cooldown.Title)
 	}
 	if !strings.Contains(cooldown.Body, "模型：Codex / GPT\n") {
@@ -84,7 +84,7 @@ func TestSuffixedLabelOtherPhoenixTitles(t *testing.T) {
 	}
 
 	circuit := CircuitMessage(LangZH, g, time.Date(2026, 11, 24, 8, 0, 0, 0, time.Local), "model_execution_failed: invalid model (HTTP 400)", time.Local, now)
-	if circuit.Title != "⏸️ ⏸️ ⏸️ GPT 点火已暂停" {
+	if circuit.Title != "⏸️ GPT 点火已暂停" {
 		t.Errorf("circuit title = %q", circuit.Title)
 	}
 
@@ -92,9 +92,9 @@ func TestSuffixedLabelOtherPhoenixTitles(t *testing.T) {
 		kind  string
 		title string
 	}{
-		{KindCredential, "🔴 🔴 🔴 GPT 账号异常"},
-		{KindSuspended, "🔴 🔴 🔴 GPT 账号已停用"},
-		{KindRateLimited, "⏳ ⏳ ⏳ GPT 被限流"},
+		{KindCredential, "🔴 GPT 账号异常"},
+		{KindSuspended, "🔴 GPT 账号已停用"},
+		{KindRateLimited, "⏳ GPT 被限流"},
 	} {
 		msg := CredentialMessage(LangZH, g, Problem{Kind: tc.kind, Status: "401"}, time.Local, now)
 		if msg.Title != tc.title {
@@ -116,7 +116,7 @@ func TestSuffixedLabelAntigravityGroups(t *testing.T) {
 		},
 	}
 	title, body := quotaStatusMessage(gemini, "7d", "normal", now)
-	if title != "🟢 🟢 🟢 Gemini 额度状态通知" {
+	if title != "🟢 Gemini 额度状态通知" {
 		t.Errorf("gemini title = %q", title)
 	}
 	if !strings.Contains(body, "模型：Antigravity / Gemini\n") {
@@ -131,7 +131,7 @@ func TestSuffixedLabelAntigravityGroups(t *testing.T) {
 		},
 	}
 	title, body = quotaStatusMessage(claudeGPT, "7d", "normal", now)
-	if title != "🟢 🟢 🟢 Claude / GPT 额度状态通知" {
+	if title != "🟢 Claude / GPT 额度状态通知" {
 		t.Errorf("claude/gpt title = %q", title)
 	}
 	if !strings.Contains(body, "模型：Antigravity / Claude / GPT\n") {
