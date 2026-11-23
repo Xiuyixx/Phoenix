@@ -46,7 +46,7 @@ import (
 
 const (
 	pluginID       = "phoenix"
-	pluginVersion  = "0.0.17"
+	pluginVersion  = "0.0.18"
 	repository     = "https://github.com/Xiuyixx/Phoenix"
 	managementBase = "/v0/management/phoenix"
 	resourcePath   = "/page"
@@ -810,11 +810,13 @@ func handleUsage(request []byte) ([]byte, error) {
 		}
 		if kind, detail := classifyAccountFailure(r.Failure.StatusCode, r.Failure.Body); kind != "" {
 			if prob := rt.recordCredentialFailureLocked(acct, kind, detail, now); prob != nil && rt.cfg.Alerts.NotifyErrors {
-				title := "Phoenix 账号异常"
+				label := notifyGroupLabel(acct, mainGroupKey(acct.Provider, index))
+				title := fmt.Sprintf("🔴 🔴 🔴 %s 账号异常", label)
 				if kind == "disabled" {
-					title = "Phoenix 账号已停用"
+					title = fmt.Sprintf("🔴 🔴 🔴 %s 账号已停用", label)
 				}
-				rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "credential", authIndex: index, title: title, body: fmt.Sprintf("凭证 %s（%s）%s，请检查凭证。", index, acct.Title, problemText(kind, r.Failure.StatusCode))})
+				body := notifyBody(acct, mainGroupKey(acct.Provider, index), problemText(kind, r.Failure.StatusCode)+"，请检查凭证。", false, now)
+				rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "credential", authIndex: index, title: title, body: body})
 				rt.pendingEvents = append(rt.pendingEvents, pendingEvent{kind: "error", message: fmt.Sprintf("%s：凭证 %s 返回错误状态码 %d", title, index, r.Failure.StatusCode), authIndex: index, eventType: "error"})
 			}
 		} else if rt.cfg.Alerts.NotifyErrors && (r.Failure.StatusCode == 401 || r.Failure.StatusCode == 403 || r.Failure.StatusCode == 429) {
@@ -822,11 +824,13 @@ func handleUsage(request []byte) ([]byte, error) {
 			// when error notifications are on, as before — but respect
 			// alerts.notify_errors (previously unconditional).
 			disabled := isAccountDisabled(r.Failure.Body)
-			title := "Phoenix 账号异常"
+			label := notifyGroupLabel(acct, mainGroupKey(acct.Provider, index))
+			title := fmt.Sprintf("🔴 🔴 🔴 %s 账号异常", label)
 			if disabled {
-				title = "Phoenix 账号已停用"
+				title = fmt.Sprintf("🔴 🔴 🔴 %s 账号已停用", label)
 			}
-			rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "credential", authIndex: index, title: title, body: fmt.Sprintf("账号 %s 返回错误状态码 %d", r.AuthID, r.Failure.StatusCode)})
+			body := notifyBody(acct, mainGroupKey(acct.Provider, index), fmt.Sprintf("返回错误状态码 %d，请检查凭证。", r.Failure.StatusCode), false, now)
+			rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "credential", authIndex: index, title: title, body: body})
 			rt.pendingEvents = append(rt.pendingEvents, pendingEvent{kind: "error", message: fmt.Sprintf("%s：账号 %s 返回错误状态码 %d", title, r.AuthID, r.Failure.StatusCode), authIndex: index, eventType: "error"})
 		}
 	} else {
@@ -1272,7 +1276,8 @@ func (rt *runtime) resetFor(index string, manual bool) error {
 	if err = rt.host.resetCooldown(index); err != nil {
 		rt.host.log("warn", "Phoenix reset succeeded but cooldown clear failed", map[string]any{"error": err.Error()})
 		rt.addEventFor("error", fmt.Sprintf("重置已完成但清除冷却失败：凭证 %s", index), index, windowSevenDay, "reset", nil)
-		go rt.notify("Phoenix 重置未完全成功", fmt.Sprintf("凭证 %s 已消耗 reset credit，但清除 CPA 本地冷却失败，请检查 CPA 日志。", index))
+		nTitle, nBody := rt.notifyAccountMessage(index, mainGroupKey("codex", index), "⚠️ ⚠️ ⚠️ GPT 重置未完全成功", "已消耗 reset credit，但清除 CPA 本地冷却失败，请检查 CPA 日志。", false)
+		go rt.notify(nTitle, nBody)
 		return fmt.Errorf("清除冷却失败")
 	}
 	rt.host.log("info", "Phoenix reset completed", map[string]any{"auth_index": index, "credit_id": pick.ID, "manual": manual})
@@ -1285,7 +1290,8 @@ func (rt *runtime) resetFor(index string, manual bool) error {
 		rt.clearCredentialProblemLocked(acct)
 	}
 	rt.mu.Unlock()
-	rt.notify("Phoenix 已完成重置", fmt.Sprintf("凭证 %s 已消耗 reset credit，并清除 CPA 本地冷却。", index))
+	nTitle, nBody := rt.notifyAccountMessage(index, mainGroupKey("codex", index), "✅ ✅ ✅ GPT 已完成重置", "已消耗 reset credit，并清除 CPA 本地冷却。", false)
+	rt.notify(nTitle, nBody)
 	// Manual reset and ignition are independent operations: the reset
 	// button must NOT auto-trigger ignition from the manual path. Only
 	// the automatic reset chain ignites after the grace period.
@@ -1919,6 +1925,18 @@ func (rt *runtime) notify(title, body string) bool {
 	}
 	rt.mu.Unlock()
 	return sent
+}
+
+// notifyAccountMessage builds a compact account notification (title plus
+// 账号 / 模型 / [5H/7D] / 状态 / 时间) for an auth index. It snapshots the
+// account under a read lock; callers must not hold rt.mu.
+func (rt *runtime) notifyAccountMessage(index, groupKey, title, status string, withWindows bool) (string, string) {
+	now := time.Now()
+	rt.mu.RLock()
+	acct := rt.accounts[index]
+	body := notifyBody(acct, groupKey, status, withWindows, now)
+	rt.mu.RUnlock()
+	return title, body
 }
 
 // sendTelegram delivers one Telegram message, returning ok and an error
@@ -2858,20 +2876,30 @@ func (rt *runtime) igniteFor(groupKey string, manual bool) {
 		if !manual {
 			outcome := recordTargetFailure(ts, rt.cfg.Ignition, now, lastErr, lastStatus)
 			rt.stateDirty = true
+			acct := rt.accounts[index]
+			label := notifyGroupLabel(acct, groupKey)
+			circuitTitle := fmt.Sprintf("⏸️ ⏸️ ⏸️ %s 点火已暂停", label)
+			circuitBody := notifyBody(acct, groupKey, fmt.Sprintf("点火失败已触发熔断，将暂停到明天 %d 点：%s", rt.cfg.Ignition.StartHour, lastErr.Error()), false, now)
+			failTitle := fmt.Sprintf("❌ ❌ ❌ %s 点火失败", label)
+			failBody := notifyBody(acct, groupKey, fmt.Sprintf("点火失败：%s", lastErr.Error()), false, now)
 			rt.mu.Unlock()
 			rt.addEventFor("error", fmt.Sprintf("点火失败：凭证 %s（%s）", index, lastErr.Error()), index, windowFiveHour, "ignite", map[string]string{"model": usedModel})
 			if outcome.CircuitOpened && outcome.NotifyCircuit {
-				go rt.notify("Phoenix 点火已暂停", fmt.Sprintf("凭证 %s 点火失败已触发熔断，将暂停到明天 %d 点：%s", index, rt.cfg.Ignition.StartHour, lastErr.Error()))
+				go rt.notify(circuitTitle, circuitBody)
 			} else if manual || lastStatus == 401 || lastStatus == 403 || isAccountDisabled(lastErr.Error()) {
-				go rt.notify("Phoenix 点火失败", fmt.Sprintf("凭证 %s 点火失败：%s", index, lastErr.Error()))
+				go rt.notify(failTitle, failBody)
 			}
 			rt.saveStateIfDirty()
 			return
 		}
+		acct := rt.accounts[index]
+		label := notifyGroupLabel(acct, groupKey)
+		failTitle := fmt.Sprintf("❌ ❌ ❌ %s 点火失败", label)
+		failBody := notifyBody(acct, groupKey, fmt.Sprintf("点火失败：%s", lastErr.Error()), false, now)
 		rt.stateDirty = true
 		rt.mu.Unlock()
 		rt.addEventFor("error", fmt.Sprintf("点火失败：凭证 %s（%s）", index, lastErr.Error()), index, windowFiveHour, "ignite", map[string]string{"model": usedModel})
-		go rt.notify("Phoenix 点火失败", fmt.Sprintf("凭证 %s 点火失败：%s", index, lastErr.Error()))
+		go rt.notify(failTitle, failBody)
 		rt.saveStateIfDirty()
 		return
 	}
@@ -2886,10 +2914,14 @@ func (rt *runtime) igniteFor(groupKey string, manual bool) {
 		if !manual {
 			outcome := recordTargetFailure(ts, rt.cfg.Ignition, now, err, 0)
 			rt.stateDirty = true
+			acct := rt.accounts[index]
+			label := notifyGroupLabel(acct, groupKey)
+			circuitTitle := fmt.Sprintf("⏸️ ⏸️ ⏸️ %s 点火已暂停", label)
+			circuitBody := notifyBody(acct, groupKey, fmt.Sprintf("点火未确认，已触发熔断，将暂停到明天 %d 点。", rt.cfg.Ignition.StartHour), false, now)
 			rt.mu.Unlock()
 			rt.addEventFor("error", fmt.Sprintf("点火未确认：凭证 %s（%s）", index, err.Error()), index, windowFiveHour, "ignite", map[string]string{"model": usedModel})
 			if outcome.CircuitOpened && outcome.NotifyCircuit {
-				go rt.notify("Phoenix 点火已暂停", fmt.Sprintf("凭证 %s 点火未确认，已触发熔断，将暂停到明天 %d 点。", index, rt.cfg.Ignition.StartHour))
+				go rt.notify(circuitTitle, circuitBody)
 			}
 			rt.saveStateIfDirty()
 			return

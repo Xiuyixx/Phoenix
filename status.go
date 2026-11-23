@@ -843,7 +843,7 @@ func (rt *runtime) testNotifyResults() []map[string]any {
 		if id == "" {
 			continue
 		}
-		ok, errStr := rt.sendTelegram(id, "Phoenix 测试推送", "Telegram 通知配置测试成功")
+		ok, errStr := rt.sendTelegram(id, "🧪 🧪 🧪 Phoenix 测试推送", "Telegram 通知配置测试成功")
 		row := map[string]any{"channel": "telegram", "ok": ok}
 		if !ok {
 			row["error"] = errStr

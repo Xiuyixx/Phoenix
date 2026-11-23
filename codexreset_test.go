@@ -99,7 +99,7 @@ func TestResetMessage(t *testing.T) {
 	now := codexResetTestNow
 	sched := codexResetTestSchedule("s1", "2026-11-23T10:00:00Z", "2026-11-24T00:00:00Z", "2026-11-24T01:00:00Z")
 	title, body := ResetMessage(sched, "zh")
-	if title != "📅 Codex 全局重置已排期" {
+	if title != "📅 📅 📅 Codex 全局重置已排期" {
 		t.Errorf("zh schedule title = %q", title)
 	}
 	if !strings.Contains(body, "预计：") || !strings.Contains(body, "范围：Plus") {
@@ -110,7 +110,7 @@ func TestResetMessage(t *testing.T) {
 		t.Errorf("zh schedule last body line = %q, want history link %q", lines[len(lines)-1], want)
 	}
 	title, body = ResetMessage(sched, "en")
-	if title != "📅 Codex global reset scheduled" {
+	if title != "📅 📅 📅 Codex global reset scheduled" {
 		t.Errorf("en schedule title = %q", title)
 	}
 	lines = strings.Split(body, "\n")
@@ -122,7 +122,7 @@ func TestResetMessage(t *testing.T) {
 	done := codexResetTestCompleted("d1", "2026-11-23T10:00:00Z")
 	done["resetType"] = "banked"
 	title, body = ResetMessage(done, "zh")
-	if title != "✅ Codex 重置卡已到账" {
+	if title != "✅ ✅ ✅ Codex 重置卡已到账" {
 		t.Errorf("banked done title = %q", title)
 	}
 	if !strings.Contains(body, "时间："+formatResetTime(announced.In(time.Local))) {
@@ -141,7 +141,7 @@ func TestProcessResetRecordsFirstRun(t *testing.T) {
 	if sent := ProcessResetRecords(st, []ResetRecord{old, pending}, true, sender.send, "zh", now); sent != 1 {
 		t.Fatalf("first run (notify pending) sent = %d, want 1", sent)
 	}
-	if len(sender.sent) != 1 || sender.sent[0][0] != "📅 Codex 全局重置已排期" {
+	if len(sender.sent) != 1 || sender.sent[0][0] != "📅 📅 📅 Codex 全局重置已排期" {
 		t.Fatalf("first run sent = %v, want the pending schedule", sender.sent)
 	}
 	if !st.CodexReset.Initialized || len(st.CodexReset.SeenKeys) != 2 {
@@ -245,7 +245,7 @@ func TestProcessResetRecordsScheduleUpdate(t *testing.T) {
 	if sent := ProcessResetRecords(st, []ResetRecord{v2}, true, sender.send, "zh", now); sent != 1 {
 		t.Fatalf("v2 (update) sent = %d, want 1", sent)
 	}
-	if sender.sent[0][0] != "📅 Codex 全局重置排期更新" {
+	if sender.sent[0][0] != "📅 📅 📅 Codex 全局重置排期更新" {
 		t.Errorf("v2 title = %q, want the rescheduled title", sender.sent[0][0])
 	}
 	// A repeat of v2 with nothing changed is not sent again.

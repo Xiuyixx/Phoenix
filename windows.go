@@ -164,6 +164,20 @@ func (a *accountState) groupTitle(groupKey string) string {
 	return a.Title
 }
 
+// groupWindows returns the 5h and 7d window states of a quota group (main
+// group: acct.Windows; extra group: the group's own windows). Either may be
+// nil when the group has no such window. Unlike window(), it never creates
+// a window, so formatting a notification cannot mutate account state.
+func (a *accountState) groupWindows(groupKey string) (five, seven *windowState) {
+	if a == nil {
+		return nil, nil
+	}
+	if g, ok := a.ExtraGroups[groupKey]; ok {
+		return g.Windows[windowFiveHour], g.Windows[windowSevenDay]
+	}
+	return a.Windows[windowFiveHour], a.Windows[windowSevenDay]
+}
+
 // activeConfirmed reports whether kind was confirmed by an active poll. When
 // no active poll has run yet (ActiveWindows == nil) passive data is accepted
 // so the panel is not empty before the first poll.

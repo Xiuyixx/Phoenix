@@ -73,7 +73,6 @@ func normalizeAlertModes(a *AlertConfig) {
 func (rt *runtime) evaluateWindowAlertsLocked(acct *accountState, groupKey, kind string, sample windowState, source string, now time.Time) {
 	base := rt.state.baseline(groupKey, kind)
 	severity := severityFor(sample.Remaining, rt.cfg.Alerts.Thresholds)
-	title := acct.groupTitle(groupKey)
 
 	// --- recovery detection: the reset time moved to a new window, the old
 	// reset time passed, or remaining rose by >= 5 points (Lamplighter
@@ -109,9 +108,7 @@ func (rt *runtime) evaluateWindowAlertsLocked(acct *accountState, groupKey, kind
 	// last notified severity; an improvement resets the notified severity
 	// so a later crossing notifies again.
 	if severityRank(severity) > severityRank(base.NotifiedSeverity) {
-		label, _, _ := windowLabel(kind)
-		notifyTitle := fmt.Sprintf("Phoenix 额度提醒：%s %s", title, label)
-		body := fmt.Sprintf("凭证 %s（%s）剩余额度 %.0f%%，重置时间 %s。", acct.AuthIndex, label, sample.Remaining, formatResetTime(sample.Reset))
+		notifyTitle, body := quotaStatusMessage(acct, groupKey, kind, severity, now)
 		rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "threshold", authIndex: acct.AuthIndex, group: groupKey, window: kind, severity: severity, title: notifyTitle, body: body})
 	} else if severityRank(severity) < severityRank(base.NotifiedSeverity) {
 		base.NotifiedSeverity = severity
@@ -142,9 +139,7 @@ func (rt *runtime) evaluateWindowAlertsLocked(acct *accountState, groupKey, kind
 			allowed := mode == "all" || kind == windowFiveHour ||
 				(mode == "has_remaining" && sample.Remaining > criticalThreshold(rt.cfg.Alerts.Thresholds))
 			if allowed && already != resetKey {
-				label, _, _ := windowLabel(kind)
-				notifyTitle := fmt.Sprintf("Phoenix 重置提醒：%s %s", title, label)
-				body := fmt.Sprintf("凭证 %s（%s）将在 %s 后重置，当前剩余额度 %.0f%%。", acct.AuthIndex, label, formatDuration(untilReset), sample.Remaining)
+				notifyTitle, body := quotaReminderMessage(acct, groupKey, kind, untilReset, now)
 				rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "reminder", authIndex: acct.AuthIndex, group: groupKey, window: kind, title: notifyTitle, body: body})
 			}
 		}
@@ -172,26 +167,193 @@ func formatResetTime(t time.Time) string {
 	return t.Format("2006-01-02 15:04")
 }
 
-func formatDuration(d time.Duration) string {
+// --- Telegram notification style ---
+//
+// Quota notifications follow the format the user specified (triple-emoji
+// title, one line per field):
+//
+//	🟢 🟢 🟢 GPT 额度状态通知
+//	账号：user@example.com
+//	模型：Codex / GPT
+//	5H：85% ｜ 23:22 恢复（剩余 03h33m）
+//	7D：78% ｜ 11/26 04:20 恢复（剩余 2d08h）
+//	状态：Normal（额度充足）
+//	时间：2026-11-23 19:49:00
+//
+// The account is identified by email (falling back to "凭证 <index>" when
+// the host never listed an email for it), never by the raw auth index the
+// old messages used ("凭证 72dd8274c908e512 ..."). Other notification kinds
+// use the same layout (账号 / 模型 / 状态 / 时间, with the 5H/7D lines
+// when they apply).
+
+// notifyAccountLine renders the 账号 line: the account email when known,
+// otherwise the credential index the old messages used.
+func notifyAccountLine(acct *accountState, index string) string {
+	if acct != nil && strings.TrimSpace(acct.Email) != "" {
+		return "账号：" + strings.TrimSpace(acct.Email)
+	}
+	return "账号：凭证 " + index
+}
+
+// notifyGroupLabel returns the display label of a quota group for
+// notification titles: the provider title for a main group ("GPT" for
+// Codex, "Claude", "Antigravity"), the source label for an extra group
+// ("Gemini", "Claude / GPT").
+func notifyGroupLabel(acct *accountState, groupKey string) string {
+	if acct != nil {
+		if g, ok := acct.ExtraGroups[groupKey]; ok && g.SourceLabel != "" {
+			return g.SourceLabel
+		}
+	}
+	return providerTitle(groupProvider(groupKey))
+}
+
+// notifyProviderName returns the provider's plain name ("Codex" for the
+// codex provider, whose registry title is "GPT").
+func notifyProviderName(provider string) string {
+	switch provider {
+	case "codex":
+		return "Codex"
+	case "claude":
+		return "Claude"
+	case "antigravity":
+		return "Antigravity"
+	case "kimi":
+		return "Kimi"
+	case "xai":
+		return "Grok"
+	case "":
+		return ""
+	default:
+		return strings.ToUpper(provider[:1]) + provider[1:]
+	}
+}
+
+// notifyModelLine renders the 模型 line: "Codex / GPT" for the Codex main
+// group, "Antigravity / Gemini" for an Antigravity group, just "Claude"
+// when provider and group share the name.
+func notifyModelLine(provider, groupLabel string) string {
+	name := notifyProviderName(provider)
+	if name == "" || name == groupLabel {
+		return groupLabel
+	}
+	return name + " / " + groupLabel
+}
+
+// windowShortDisplay renders a window kind as the templates do: "5H" /
+// "7D"; other kinds keep their label.
+func windowShortDisplay(kind string) string {
+	switch kind {
+	case windowFiveHour:
+		return "5H"
+	case windowSevenDay:
+		return "7D"
+	default:
+		label, _, _ := windowLabel(kind)
+		return label
+	}
+}
+
+// formatQuotaRemaining renders a duration until reset the way the user's
+// templates do: "2d08h" for days, "03h33m" for hours, "45m" for minutes
+// (truncated, not rounded).
+func formatQuotaRemaining(d time.Duration) string {
+	if d <= 0 {
+		return "0m"
+	}
 	if d >= 24*time.Hour {
-		return fmt.Sprintf("%d 天 %d 小时", int(d.Hours())/24, int(d.Hours())%24)
+		return fmt.Sprintf("%dd%02dh", int(d.Hours())/24, int(d.Hours())%24)
 	}
 	if d >= time.Hour {
-		return fmt.Sprintf("%d 小时 %d 分钟", int(d.Hours()), int(d.Minutes())%60)
+		return fmt.Sprintf("%02dh%02dm", int(d.Hours()), int(d.Minutes())%60)
 	}
-	return fmt.Sprintf("%d 分钟", int(d.Minutes()))
+	return fmt.Sprintf("%02dm", int(d.Minutes()))
+}
+
+// formatQuotaReset renders a reset time: "23:22" when it is today,
+// "11/26 04:20" otherwise.
+func formatQuotaReset(t, now time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	if t.Format("2006-01-02") == now.Format("2006-01-02") {
+		return t.Format("15:04")
+	}
+	return t.Format("01/02 15:04")
+}
+
+// quotaWindowLine renders one quota line: "5H：85% ｜ 23:22 恢复（剩余 03h33m）".
+// Without a reset time it is just "5H：85%". Empty when the window is nil.
+func quotaWindowLine(short string, w *windowState, now time.Time) string {
+	if w == nil {
+		return ""
+	}
+	line := fmt.Sprintf("%s：%.0f%%", short, w.Remaining)
+	if !w.Reset.IsZero() {
+		line += fmt.Sprintf(" ｜ %s 恢复（剩余 %s）", formatQuotaReset(w.Reset, now), formatQuotaRemaining(w.Reset.Sub(now)))
+	}
+	return line
+}
+
+// notifyBody assembles the body of a Telegram notification in the new
+// style: 账号 / 模型, the 5H/7D quota lines when withWindows, 状态, 时间.
+// acct may be nil (account never polled): the account line then falls back
+// to the credential index from the group key.
+func notifyBody(acct *accountState, groupKey, status string, withWindows bool, now time.Time) string {
+	provider := groupProvider(groupKey)
+	label := notifyGroupLabel(acct, groupKey)
+	index := groupAuthIndex(groupKey)
+	if acct != nil {
+		index = acct.AuthIndex
+	}
+	lines := []string{notifyAccountLine(acct, index), "模型：" + notifyModelLine(provider, label)}
+	if withWindows {
+		five, seven := acct.groupWindows(groupKey)
+		if l := quotaWindowLine("5H", five, now); l != "" {
+			lines = append(lines, l)
+		}
+		if l := quotaWindowLine("7D", seven, now); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	lines = append(lines, "状态："+status, "时间："+now.Format("2006-01-02 15:04:05"))
+	return strings.Join(lines, "\n")
+}
+
+// quotaStatusMessage builds the Telegram title/body for a quota-status
+// notification: green Normal (recovery), yellow Warning (threshold) or red
+// Exhausted. trigger is the window kind that fired ("5h"/"7d").
+func quotaStatusMessage(acct *accountState, groupKey, trigger, severity string, now time.Time) (title, body string) {
+	label := notifyGroupLabel(acct, groupKey)
+	var emoji, kind, status string
+	switch severity {
+	case "exhausted":
+		emoji, kind = "🔴 🔴 🔴", "额度耗尽警报"
+		status = "Exhausted（" + windowShortDisplay(trigger) + " 额度已耗尽）"
+	case "normal":
+		emoji, kind = "🟢 🟢 🟢", "额度状态通知"
+		status = "Normal（额度充足）"
+	default:
+		emoji, kind = "🟡 🟡 🟡", "额度不足预警"
+		status = "Warning（" + windowShortDisplay(trigger) + " 额度不足）"
+	}
+	title = fmt.Sprintf("%s %s %s", emoji, label, kind)
+	return title, notifyBody(acct, groupKey, status, true, now)
+}
+
+// quotaReminderMessage builds the Telegram title/body for a reset
+// reminder: the same layout, with the reset countdown as the 状态.
+func quotaReminderMessage(acct *accountState, groupKey, trigger string, untilReset time.Duration, now time.Time) (title, body string) {
+	label := notifyGroupLabel(acct, groupKey)
+	title = fmt.Sprintf("⏰ ⏰ ⏰ %s 重置提醒", label)
+	status := fmt.Sprintf("Reminder（%s 窗口将于 %s 后重置）", windowShortDisplay(trigger), formatQuotaRemaining(untilReset))
+	return title, notifyBody(acct, groupKey, status, true, now)
 }
 
 // queueRecoveryLocked queues the notification for a pending recovery.
 func (rt *runtime) queueRecoveryLocked(acct *accountState, groupKey, kind string, rec *pendingRecovery, now time.Time) {
-	label, _, _ := windowLabel(kind)
-	title := fmt.Sprintf("Phoenix 额度已恢复：%s %s", acct.groupTitle(groupKey), label)
-	prev := "未知"
-	if rec.Previous != nil {
-		prev = fmt.Sprintf("%.0f%%", *rec.Previous)
-	}
-	body := fmt.Sprintf("凭证 %s（%s）额度已恢复，上一周期结束时剩余 %s。", acct.AuthIndex, label, prev)
-	rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "recovery", authIndex: acct.AuthIndex, group: groupKey, window: kind, title: title, body: body})
+	notifyTitle, body := quotaStatusMessage(acct, groupKey, kind, "normal", now)
+	rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "recovery", authIndex: acct.AuthIndex, group: groupKey, window: kind, title: notifyTitle, body: body})
 }
 
 // retryPendingRecoveriesLocked re-queues undelivered recovery notifications
@@ -308,10 +470,12 @@ func (rt *runtime) checkStaleCooldownsLocked(now time.Time) {
 		if rt.state.CooldownNotices[acct.AuthIndex] == acct.CooldownUntil.Unix() {
 			continue
 		}
-		title := "Phoenix 冷却过期提醒"
-		body := fmt.Sprintf("凭证 %s 额度已恢复，但 CPA 仍冷却到 %s，请检查后手动解除冷却。", acct.AuthIndex, formatResetTime(acct.CooldownUntil))
+		groupKey := mainGroupKey(acct.Provider, acct.AuthIndex)
+		label := notifyGroupLabel(acct, groupKey)
+		title := fmt.Sprintf("⚠️ ⚠️ ⚠️ %s 冷却过期提醒", label)
+		body := notifyBody(acct, groupKey, "额度已恢复，但 CPA 仍冷却到 "+formatResetTime(acct.CooldownUntil)+"，请手动解除冷却", true, now)
 		rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "stale_cooldown", authIndex: acct.AuthIndex, title: title, body: body})
-		rt.pendingEvents = append(rt.pendingEvents, pendingEvent{kind: "error", message: body, authIndex: acct.AuthIndex, eventType: "cooldown"})
+		rt.pendingEvents = append(rt.pendingEvents, pendingEvent{kind: "error", message: fmt.Sprintf("凭证 %s 额度已恢复，但 CPA 仍冷却到 %s，请检查后手动解除冷却。", acct.AuthIndex, formatResetTime(acct.CooldownUntil)), authIndex: acct.AuthIndex, eventType: "cooldown"})
 	}
 }
 
