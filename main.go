@@ -46,7 +46,7 @@ import (
 
 const (
 	pluginID       = "phoenix"
-	pluginVersion  = "0.0.15"
+	pluginVersion  = "0.0.16"
 	repository     = "https://github.com/Xiuyixx/Phoenix"
 	managementBase = "/v0/management/phoenix"
 	resourcePath   = "/page"
@@ -1584,6 +1584,14 @@ func handleManagement(request []byte) ([]byte, error) {
 			if r["ok"] == true {
 				ok = true
 			}
+		}
+		if ok {
+			// A successful test proves the channel works: clear a stale
+			// "telegram send failed" banner instead of leaving it until
+			// the next background notification succeeds.
+			rt.mu.Lock()
+			rt.lastNotifyErr = ""
+			rt.mu.Unlock()
 		}
 		return jsonManagementResponse(http.StatusOK, map[string]any{"ok": ok, "results": results, "status": rt.status()})
 	case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/language"):

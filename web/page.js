@@ -3850,9 +3850,11 @@
         if (saved.value === "") return;
         value = Number(saved.value);
       } else value = saved.value.trim();
-      if (top === "models_api_key" && value === "") {
-        // An empty models key means "leave the stored key unchanged":
-        // omit it from the patch instead of sending "".
+      if (value === "" && (input.name === "models_api_key" || input.name === "telegram.bot_token")) {
+        // An empty secret means "leave the stored value unchanged": omit it
+        // from the patch instead of sending "". Otherwise saving any sibling
+        // field (e.g. the Telegram chat IDs) would wipe the stored Bot Token,
+        // since its input is never filled back on load.
         if (intent) intent.submitted.push(input);
         return;
       }
@@ -4089,10 +4091,11 @@
     // Browsers fill the password saved for this site, usually the management
     // key, into password fields. A value the browser fills in while the field
     // is not focused comes from autofill on page load; it is not saved, and
-    // the field shows the saved value again. The management key is refused
-    // with a message. Other new keys are checked by the plugin against
-    // /v1/models before saving; refusals retain the draft and inconclusive
-    // checks allow saving.
+    // the field shows the saved value again. Only the models list key is a
+    // CPA API key: the Telegram Bot Token is not, so it must never be
+    // checked against /v1/models (CPA always refuses it, and the save then
+    // fails with "CPA 不接受这个 key" even though the token is correct) and
+    // the management-key message does not apply to it.
     var checked = Promise.resolve(null);
     if (input.type === "password") {
       var value = input.value.trim();
@@ -4100,11 +4103,13 @@
         fillInput(input, effectiveConfig());
         return;
       }
-      if (key && value === key) {
-        setSaveState(host, "failed", translate("management_key_refused"), input);
-        return;
+      if (input.name === "models_api_key") {
+        if (key && value === key) {
+          setSaveState(host, "failed", translate("management_key_refused"), input);
+          return;
+        }
+        if (value) checked = checkKey(value);
       }
-      if (value) checked = checkKey(value);
     }
     if (input.type === "number") {
       if (!input.checkValidity()) {

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.16 - 2026-11-23
+
+- 修复 Telegram Bot Token 保存失败：保存时页面把 Bot Token 当成模型列表 API key 拿去 CPA 的 /v1/models 校验（check-models-key），Telegram 的 token 永远通不过，保存被拒并显示“ CPA 不接受这个 key”，token 从未存进 config.yaml；测试推送能通过是因为它用的是已加载的旧 token。修复：只有 models_api_key 才走管理密钥拒绝与 /v1/models 校验，Bot Token 直接保存（用测试推送验证）。另修一个同类问题：保存 Telegram 分组内任意字段时，空的 Bot Token 输入框会被当成 "" 一起提交，把已保存的 token 清掉——现在空 Bot Token 与模型 key 一样视为“保持不变”，不再随保存发出。测试推送成功后会清除残留的“telegram send failed”横幅，不必等下一次后台通知。
+
 ## 0.0.15 - 2026-11-23
 
 - 模型列表 API key 输入框按原版显示掩码：已保存的 key 现在回填真实值，密码框渲染成圆点（此前输入框恒为空，只靠“已设置”提示）。同时删掉“已设置”提示及其中英文 i18n 键；无 key 时的横幅提醒不变。保存流程不动（改动才触发校验、留空不改动、管理密钥拒绝、Telegram bot_token 仍留空）。
