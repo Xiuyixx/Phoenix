@@ -62,7 +62,7 @@ func TestThresholdCrossingNotifiesWithResetHint(t *testing.T) {
 	if len(sender.sent) != 1 {
 		t.Fatalf("want one notification, got %+v", sender.sent)
 	}
-	if got := sender.sent[0].Title; got != "🟡 🟡 🟡 GPT 额度不足预警" {
+	if got := sender.sent[0].Title; got != "🟡 GPT 额度不足预警" {
 		t.Fatalf("title %q", got)
 	}
 	if !regexp.MustCompile(`^账号：凭证 1\n模型：Codex / GPT\n5H：15% ｜ \d\d:\d\d 恢复（剩余 05h00m）\n7D：80% ｜ \d\d/\d\d \d\d:\d\d 恢复（剩余 6d00h）\n状态：Warning（5H 额度不足）\n时间：`).MatchString(sender.sent[0].Body) {
@@ -81,7 +81,7 @@ func TestCriticalIsTimeSensitive(t *testing.T) {
 	a := alerts(config.Default(), sender)
 	a.ProcessGroup(context.Background(), st, group(80, 80, now), now)
 	a.ProcessGroup(context.Background(), st, group(4, 80, now), now)
-	if sender.sent[0].Level != LevelTimeSensitive || !strings.HasPrefix(sender.sent[0].Title, "🟡 🟡 🟡") {
+	if sender.sent[0].Level != LevelTimeSensitive || !strings.HasPrefix(sender.sent[0].Title, "🟡") {
 		t.Fatalf("got %+v", sender.sent[0])
 	}
 }
@@ -93,7 +93,7 @@ func TestLowIsWarningButNotTimeSensitive(t *testing.T) {
 	a := alerts(config.Default(), sender)
 	a.ProcessGroup(context.Background(), st, group(80, 80, now), now)
 	a.ProcessGroup(context.Background(), st, group(8, 80, now), now)
-	if sender.sent[0].Level != LevelActive || !strings.HasPrefix(sender.sent[0].Title, "🟡 🟡 🟡") {
+	if sender.sent[0].Level != LevelActive || !strings.HasPrefix(sender.sent[0].Title, "🟡") {
 		t.Fatalf("got %+v", sender.sent[0])
 	}
 }
@@ -147,7 +147,7 @@ func TestResetReminders(t *testing.T) {
 	cfg.ResetReminder.FiveHour = config.ReminderAll
 	alerts(cfg, sender).ProcessGroup(context.Background(), st, soon, now)
 	alerts(cfg, sender).ProcessGroup(context.Background(), st, soon, now)
-	if len(sender.sent) != 1 || sender.sent[0].Title != "⏰ ⏰ ⏰ Claude 重置提醒" {
+	if len(sender.sent) != 1 || sender.sent[0].Title != "⏰ Claude 重置提醒" {
 		t.Fatalf("want one reminder, got %+v", sender.sent)
 	}
 }
@@ -195,11 +195,11 @@ func TestResetReminderModesPerWindow(t *testing.T) {
 		sevenDay  time.Duration
 		want      string
 	}{
-		{"5h only", config.WindowModes{FiveHour: config.ReminderAll, SevenDay: config.ReminderOff}, 50, 20 * time.Hour, "⏰ ⏰ ⏰ Claude 重置提醒"},
-		{"7d one day before", config.WindowModes{FiveHour: config.ReminderOff, SevenDay: config.ReminderAll}, 50, 20 * time.Hour, "⏰ ⏰ ⏰ Claude 重置提醒"},
+		{"5h only", config.WindowModes{FiveHour: config.ReminderAll, SevenDay: config.ReminderOff}, 50, 20 * time.Hour, "⏰ Claude 重置提醒"},
+		{"7d one day before", config.WindowModes{FiveHour: config.ReminderOff, SevenDay: config.ReminderAll}, 50, 20 * time.Hour, "⏰ Claude 重置提醒"},
 		{"7d not earlier", config.WindowModes{FiveHour: config.ReminderOff, SevenDay: config.ReminderAll}, 50, 30 * time.Hour, ""},
-		{"has remaining", config.WindowModes{FiveHour: config.ReminderHasRemaining, SevenDay: config.ReminderHasRemaining}, 11, 20 * time.Hour, "⏰ ⏰ ⏰ Claude 重置提醒"},
-		{"nothing left", config.WindowModes{FiveHour: config.ReminderHasRemaining, SevenDay: config.ReminderAll}, 5, 20 * time.Hour, "⏰ ⏰ ⏰ Claude 重置提醒"},
+		{"has remaining", config.WindowModes{FiveHour: config.ReminderHasRemaining, SevenDay: config.ReminderHasRemaining}, 11, 20 * time.Hour, "⏰ Claude 重置提醒"},
+		{"nothing left", config.WindowModes{FiveHour: config.ReminderHasRemaining, SevenDay: config.ReminderAll}, 5, 20 * time.Hour, "⏰ Claude 重置提醒"},
 	}
 	for _, tc := range cases {
 		cfg := config.Default()
@@ -312,7 +312,7 @@ func TestResetFeedFirstRunOnlyNotifiesPending(t *testing.T) {
 	sender := &fakeSender{}
 	st := store.NewState()
 	sent := ProcessResetRecords(context.Background(), st, records(), true, sender, time.UTC, LangZH, resetNow)
-	if sent != 1 || sender.sent[0].Title != "📅 📅 📅 Codex 全局重置已排期" {
+	if sent != 1 || sender.sent[0].Title != "📅 Codex 全局重置已排期" {
 		t.Fatalf("got %d %+v", sent, sender.sent)
 	}
 	if sender.sent[0].JumpURL != "https://didcodexreset.com/zh/history/1791028800000.html" {
@@ -337,7 +337,7 @@ func TestResetFeedNewRecordAndManualIDRotation(t *testing.T) {
 	if sent := ProcessResetRecords(context.Background(), st, next, false, sender, time.UTC, LangZH, resetNow); sent != 1 {
 		t.Fatalf("only the new record is sent, got %d: %+v", sent, sender.sent)
 	}
-	if sender.sent[0].Title != "✅ ✅ ✅ Codex 全局重置已完成" {
+	if sender.sent[0].Title != "✅ Codex 全局重置已完成" {
 		t.Fatalf("title %q", sender.sent[0].Title)
 	}
 }
@@ -378,7 +378,7 @@ func TestResetFeedSendsLatestPostPerSchedule(t *testing.T) {
 	update := bankedSchedule("update", "pending", "2026-10-07T20:00:00Z", start, end, 0.95)
 	again := append([]ResetRecord{late, update}, next...)
 	if sent := ProcessResetRecords(context.Background(), st, again, false, sender, shanghai, LangZH, now.Add(time.Hour)); sent != 1 ||
-		sender.sent[1].Title != "📅 📅 📅 Codex 重置卡排期更新" || !strings.Contains(sender.sent[1].Body, "95%") {
+		sender.sent[1].Title != "📅 Codex 重置卡排期更新" || !strings.Contains(sender.sent[1].Body, "95%") {
 		t.Fatalf("a later post is sent as an update and an earlier one is not, got %+v", sender.sent)
 	}
 }
@@ -608,7 +608,7 @@ func TestRecoveryAllNotifiesEveryResetWithPreviousCycle(t *testing.T) {
 		t.Fatalf("want one recovery, got %+v", sender.sent)
 	}
 	msg := sender.sent[0]
-	if msg.Title != "🟢 🟢 🟢 Claude 额度状态通知" || !strings.Contains(msg.Body, "5H：100%") || !strings.Contains(msg.Body, "状态：Normal（额度充足）") {
+	if msg.Title != "🟢 Claude 额度状态通知" || !strings.Contains(msg.Body, "5H：100%") || !strings.Contains(msg.Body, "状态：Normal（额度充足）") {
 		t.Fatalf("recovery %+v", msg)
 	}
 }
@@ -695,7 +695,7 @@ func TestRecoveryModesArePerWindow(t *testing.T) {
 	g.Windows[0].Remaining, g.Windows[0].Reset = 100, after.Add(5*time.Hour)
 	g.Windows[1].Remaining, g.Windows[1].Reset = 100, after.Add(7*24*time.Hour)
 	a.ProcessGroup(context.Background(), st, g, after)
-	if len(sender.sent) != 1 || sender.sent[0].Title != "🟢 🟢 🟢 Claude 额度状态通知" {
+	if len(sender.sent) != 1 || sender.sent[0].Title != "🟢 Claude 额度状态通知" {
 		t.Fatalf("only the 7-day window is notified: %+v", sender.sent)
 	}
 }
@@ -719,7 +719,7 @@ func TestRecoveryIsSentApartFromAlertAndRetried(t *testing.T) {
 	a.ProcessGroup(context.Background(), st, g, after)
 	sender.fail = false
 	a.ProcessGroup(context.Background(), st, g, after.Add(5*time.Minute))
-	if len(sender.sent) != 2 || !strings.HasPrefix(sender.sent[0].Title, "🟡") || sender.sent[1].Title != "🟢 🟢 🟢 Claude 额度状态通知" {
+	if len(sender.sent) != 2 || !strings.HasPrefix(sender.sent[0].Title, "🟡") || sender.sent[1].Title != "🟢 Claude 额度状态通知" {
 		t.Fatalf("want the alert and the retried recovery, got %+v", sender.sent)
 	}
 	a.ProcessGroup(context.Background(), st, g, after.Add(10*time.Minute))
