@@ -1394,6 +1394,43 @@ func TestStatusLamplighterShape(t *testing.T) {
 	}
 }
 
+// TestStatusSkipsTargetsWithoutFiveHourWindow reproduces the refresh-loses-
+// config bug: an Antigravity account has only 7d windows, so targetEntry
+// returns nil for its groups. The status must not contain null targets —
+// one null crashed the page (t.blocked_window), aborted the startup load,
+// and left every setting blank, looking like the saved config was lost.
+func TestStatusSkipsTargetsWithoutFiveHourWindow(t *testing.T) {
+	now := time.Now()
+	rt := newTestRuntime(&fakeHost{})
+	rt.accounts["0"] = &accountState{
+		AuthIndex: "0", Provider: "antigravity", Title: "Antigravity",
+		Windows: map[string]*windowState{},
+		ExtraGroups: map[string]*extraGroup{
+			"antigravity:0:gemini-models": {
+				Key: "antigravity:0:gemini-models", SourceLabel: "Gemini",
+				Windows: map[string]*windowState{"7d": {Remaining: 100, Reset: now.Add(7 * 24 * time.Hour), Source: "active", ObservedAt: now}},
+			},
+			"antigravity:0:claude-and-gpt-models": {
+				Key: "antigravity:0:claude-and-gpt-models", SourceLabel: "Claude / GPT",
+				Windows: map[string]*windowState{"7d": {Remaining: 100, Reset: now.Add(7 * 24 * time.Hour), Source: "active", ObservedAt: now}},
+			},
+		},
+	}
+	st := rt.status().(map[string]any)
+	targets, ok := st["targets"].([]map[string]any)
+	if !ok {
+		t.Fatalf("targets = %T, want []map[string]any", st["targets"])
+	}
+	for i, tg := range targets {
+		if tg == nil {
+			t.Errorf("targets[%d] is nil; a null target crashes the page and blocks fillSettings", i)
+		}
+	}
+	if len(targets) != 0 {
+		t.Errorf("targets = %d entries, want 0: groups without a 5h window are not ignition targets", len(targets))
+	}
+}
+
 // TestActionResponses covers the Lamplighter action convention {ok, status}
 // on the routes the copied panel calls, including the fast failure paths.
 func TestActionResponses(t *testing.T) {

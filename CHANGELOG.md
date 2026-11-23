@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.13 - 2026-11-23
+
+- 修复刷新页面后全部已保存配置“丢失”：根因是 `status()` 把 `targetEntry()` 的 `nil` 结果直接追加进 targets——没有 5h 窗口的组（测试服务器上 Antigravity 的两个组只有 7d 窗口）会返回 nil，于是 status 里出现 `null` 目标；页面 `targetStatus(t)` 在 `t.blocked_window` 上抛错，启动时的 `Promise.all` 被拒，`fillSettings()` 从未执行，所有设置项都停在空白默认值上，看起来像配置丢了。config.yaml 里的配置其实一直在，从未丢失。修复：后端跳过 nil 的 target（只有带 5h 窗口的组才进目标列表）；页面跳过 null 目标且 `targetStatus` 做空值保护；启动时先填设置再渲染，今后即使渲染再出问题也不会把表单清空。新增回归测试 `TestStatusSkipsTargetsWithoutFiveHourWindow`（共 58 个测试，旧代码上复现失败、新代码通过）。
+
 ## 0.0.12 - 2026-11-23
 
 - 修复模型列表 API key 在手机上始终保存失败：服务器日志证明失败发生在浏览器本地、没有任何校验或保存请求发到 CPA——保存时输入框里的值是浏览器自动填入的 CPA 管理密钥（与管理中心同源，iOS Safari 会把已保存的管理密钥填进密码框，粘贴后失焦时还可能被还原），页面按设计直接拒绝管理密钥。`autocomplete="one-time-code"` 拦不住这种自动填充，改用 `autocomplete="new-password"`（模型列表 API key 与 Telegram Bot Token 两个密码框均改），并加 `autocapitalize/autocorrect/spellcheck` 关闭。另修一个连带问题：窄屏下保存失败只显示紧凑文案“✕ 保存失败”，具体的拒绝原因被 CSS 藏起来了，用户看不到到底为什么失败；现把原因拼进紧凑文案，手机上也能看到（例如“✕ 保存失败：这是 CPA 管理密钥，未保存。请填写 access.api-keys 中的 key”）。

@@ -243,14 +243,22 @@ func (rt *runtime) statusLocked() map[string]any {
 		// Ignition targets, one per group with a 5h window, in Lamplighter's
 		// TargetView shape. next_due stays empty while ignition is disabled,
 		// the group is not ignitable, the credential has a confirmed
-		// problem, or a non-5h window is exhausted; the row itself is always
-		// listed so the manual reset button stays available (Phoenix delta).
+		// problem, or a non-5h window is exhausted. Groups without a 5h
+		// window (Antigravity's 7d-only groups) have no target row:
+		// targetEntry returns nil for them and a nil must never reach the
+		// targets array — a null there crashes the page
+		// (t.blocked_window) and aborts the whole load, so the settings
+		// are never filled and the saved config looks lost.
 		if provider == "codex" || provider == "claude" {
-			targets = append(targets, rt.targetEntry(idx, provider, mainGroupKey(provider, idx), idx, title, acct.Windows, providerTitle(provider), now))
+			if e := rt.targetEntry(idx, provider, mainGroupKey(provider, idx), idx, title, acct.Windows, providerTitle(provider), now); e != nil {
+				targets = append(targets, e)
+			}
 		}
 		for _, key := range extraKeys {
 			eg := acct.ExtraGroups[key]
-			targets = append(targets, rt.targetEntry(idx, provider, key, key, title+" · "+eg.SourceLabel, eg.Windows, eg.SourceLabel, now))
+			if e := rt.targetEntry(idx, provider, key, key, title+" · "+eg.SourceLabel, eg.Windows, eg.SourceLabel, now); e != nil {
+				targets = append(targets, e)
+			}
 		}
 	}
 	events := make([]map[string]any, 0, len(rt.events))

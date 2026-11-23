@@ -1340,6 +1340,9 @@
 
   function targetStatus(t) {
     var tr = translate;
+    // A null entry must never crash the load: skip it upstream, but stay
+    // safe here too so one bad target cannot blank the settings again.
+    if (!t) return { kind: "muted", text: tr("normal") };
     if (t.blocked_window) {
       var until = parseTime(t.blocked_until);
       var blocked = t.blocked_window === "5h" || t.blocked_window === "7d" ? tr("blocked_" + t.blocked_window) : tr("blocked_other", t.blocked_window);
@@ -1366,6 +1369,7 @@
       return;
     }
     status.targets.forEach(function (t) {
+      if (!t) return;
       var st = targetStatus(t);
       var actions = [];
       // Reset is Codex-only: the reset button stays on Codex rows, before
@@ -4524,8 +4528,11 @@
     Promise.all([loadStatus(), loadConfig()]).then(function () {
       // The status may have arrived before the config with the saved order.
       sortAccounts();
-      renderAccounts();
+      // Fill the settings before rendering: a render failure below must
+      // not leave the form blank, which looks like the saved config was
+      // lost on refresh.
       fillSettings();
+      renderAccounts();
       restoreChartFilters();
       return loadHistory();
     }).then(function (loaded) { if (loaded) prefetchHistory(); }).catch(function (err) {
