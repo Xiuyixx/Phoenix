@@ -268,7 +268,7 @@ func TestResetForAutoChain(t *testing.T) {
 	if !cooldown.IsZero() {
 		t.Errorf("CooldownUntil = %v, want cleared", cooldown)
 	}
-	if titles := s.sentTitles(); len(titles) != 1 || titles[0] != "✅ ✅ ✅ GPT 已完成重置" {
+	if titles := s.sentTitles(); len(titles) != 1 || titles[0] != "✅ GPT 已完成重置" {
 		t.Errorf("notifications = %v, want one reset-completed message", titles)
 	}
 	// Grace is 0 with stubbed sleeps, so the auto-ignition fires right away.
@@ -388,7 +388,7 @@ func TestResetForCooldownFailureReportsIncomplete(t *testing.T) {
 	if _, consume := script.counts(); consume != 1 {
 		t.Errorf("consume calls = %d, want exactly 1", consume)
 	}
-	if titles := s.sentTitles(); len(titles) != 1 || titles[0] != "⚠️ ⚠️ ⚠️ GPT 重置未完全成功" {
+	if titles := s.sentTitles(); len(titles) != 1 || titles[0] != "⚠️ GPT 重置未完全成功" {
 		t.Errorf("notifications = %v, want one incomplete-reset message", titles)
 	}
 }
