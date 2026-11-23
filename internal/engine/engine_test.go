@@ -1326,7 +1326,7 @@ func TestPlanChangeIsNotifiedInsteadOfQuotaAlerts(t *testing.T) {
 	// fresh weekly quota of the new plan is no recovery.
 	world.paid = false
 	poll()
-	if got := sender.titles(); agPlan(e) != "Free" || len(got) != 1 || got[0] != "🎫 🎫 🎫 Antigravity · 套餐 Pro → Free" {
+	if got := sender.titles(); agPlan(e) != "Free" || len(got) != 1 || got[0] != "🎫 Antigravity · 套餐 Pro → Free" {
 		t.Fatalf("after the expiry: plan %q, sent %v", agPlan(e), got)
 	}
 	var found bool
@@ -1364,7 +1364,7 @@ func TestPlanChangeIsNotifiedInsteadOfQuotaAlerts(t *testing.T) {
 		t.Fatalf("after the renewal: plan %q, sent %v", agPlan(e), got)
 	}
 	poll()
-	if got := sender.titles(); len(got) != 1 || got[0] != "🎫 🎫 🎫 Antigravity · 套餐 Free → Pro" {
+	if got := sender.titles(); len(got) != 1 || got[0] != "🎫 Antigravity · 套餐 Free → Pro" {
 		t.Fatalf("retry: sent %v", got)
 	}
 
@@ -1401,7 +1401,7 @@ func TestPlanIsRecheckedAfterARestartAndAFailedRead(t *testing.T) {
 	world.profileStatus = 0
 	c.add(5 * time.Minute)
 	e.poll(context.Background(), e.config(), c.t, "", false)
-	if got := sender.titles(); agPlan(e) != "Free" || len(got) != 1 || got[0] != "🎫 🎫 🎫 Antigravity · 套餐 Pro → Free" {
+	if got := sender.titles(); agPlan(e) != "Free" || len(got) != 1 || got[0] != "🎫 Antigravity · 套餐 Pro → Free" {
 		t.Fatalf("plan %q, sent %v", agPlan(e), got)
 	}
 	c.add(5 * time.Minute)
@@ -1464,7 +1464,7 @@ func TestQuotaAlertsResumeWhenThePlanCannotBeRead(t *testing.T) {
 	poll()
 	world.paid = false
 	poll()
-	if got := sender.titles(); agPlan(e) != "" || len(got) != 1 || got[0] != "🟢 🟢 🟢 Gemini 额度状态通知" {
+	if got := sender.titles(); agPlan(e) != "" || len(got) != 1 || got[0] != "🟢 Gemini 额度状态通知" {
 		t.Fatalf("without a plan: plan %q, sent %v", agPlan(e), got)
 	}
 }
@@ -1494,7 +1494,7 @@ func TestPlanIsReadSoonAfterARecheckThatKeptFailing(t *testing.T) {
 		}
 	}
 	poll()
-	if got := sender.titles(); agPlan(e) != "Pro" || len(got) != 1 || got[0] != "🟢 🟢 🟢 Gemini 额度状态通知" {
+	if got := sender.titles(); agPlan(e) != "Pro" || len(got) != 1 || got[0] != "🟢 Gemini 额度状态通知" {
 		t.Fatalf("after the recheck: plan %q, sent %v", agPlan(e), got)
 	}
 
@@ -1504,7 +1504,7 @@ func TestPlanIsReadSoonAfterARecheckThatKeptFailing(t *testing.T) {
 	for i := 0; i < 3 && agPlan(e) == "Pro"; i++ {
 		poll()
 	}
-	if got := sender.titles(); agPlan(e) != "Free" || h.requestsTo(providers.AntigravityLoadCodeAssistURL) != reads+1 || len(got) != 1 || got[0] != "🎫 🎫 🎫 Antigravity · 套餐 Pro → Free" {
+	if got := sender.titles(); agPlan(e) != "Free" || h.requestsTo(providers.AntigravityLoadCodeAssistURL) != reads+1 || len(got) != 1 || got[0] != "🎫 Antigravity · 套餐 Pro → Free" {
 		t.Fatalf("after the retry: plan %q, sent %v", agPlan(e), got)
 	}
 }
