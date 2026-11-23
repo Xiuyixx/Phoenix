@@ -3,7 +3,7 @@
 
   var API = "/v0/management/phoenix";
   var CONFIG_API = "/v0/management/plugins/phoenix/config";
-  var KEY_STORE = "phoenix-mgmt-key";
+  var KEY_STORE = "phoenix-management-key";
 
   var key = "";
   var status = null;
@@ -1234,7 +1234,6 @@
   }
 
   function renderAccountSettings() {
-    if (!$("account-rows")) return;
     if (accountDrag) { accountsBehind = true; return; }
     var box = $("account-rows"), counts = {}, existing = new Map();
     var active = box.contains(document.activeElement) ? document.activeElement : null;
@@ -1353,6 +1352,7 @@
     return { kind: "success", text: tr("normal") };
   }
 
+  // The ignition card shows only while ignition is on.
   // The manual actions card is always shown once the status loads: manual
   // reset must stay available even when automatic ignition is off.
   function renderTargets() {
@@ -1784,19 +1784,23 @@
     more.textContent = eventsExpanded ? translate("collapse") : translate("show_more", total);
   }
 
-  // The provider settings, built when the provider list changes: an ignite
-  // checkbox and a model field per provider in the ignition table.
-  // Providers that cannot be ignited show no ignition switch or model;
-  // those with quota groups to choose get a row of group checkboxes.
+  // The provider settings, built when the provider list changes: a monitor
+  // switch per provider under Services, and a row per provider in the
+  // ignition table. Providers that cannot be ignited show no ignition switch
+  // or model; those with quota groups to choose get a row of group
+  // checkboxes.
   function renderServiceRows() {
-    var body = $("ignition-rows");
+    var body = $("ignition-rows"), monitors = $("monitor-rows");
     var list = providerList();
-    // The key covers what the rows show, not just the ids, so a provider
-    // that gains or loses ignition or quota groups rebuilds its rows.
-    var ids = list.map(function (p) { return p.id + ":" + (p.ignite ? "1" : "0") + ":" + (p.groups || []).join("|"); }).join(",");
+    var ids = list.map(function (p) { return p.id; }).join(",");
     if (body.getAttribute("data-ids") === ids) return false;
     clear(body);
+    clear(monitors);
     list.forEach(function (p) {
+      monitors.appendChild(el("label", { class: "inline" }, [
+        el("input", { name: "providers." + p.id + ".monitor", type: "checkbox", "data-service": p.id, "data-label": "monitor_service" }),
+        el("span", { text: p.title })
+      ]));
       var cells = [el("td", { class: "strong", text: p.title })];
       if (p.ignite) {
         cells.push(el("td", {}, [el("input", { name: "providers." + p.id + ".ignite", type: "checkbox", "data-service": p.id, "data-label": "ignite_service" })]));
@@ -1854,6 +1858,7 @@
     renderTargets();
     renderEvents();
     renderLanguageNote();
+    renderMcp();
   }
 
   function loadStatus(timeout) {
@@ -3725,6 +3730,7 @@
     settingsFilled = true;
     $("timezone-note").textContent = timezoneText();
     renderIgnitionOff();
+    renderMcp();
   }
 
   // Segmented controls (.segmented button groups and .mode-switch radio
@@ -4098,7 +4104,8 @@
     // Browsers fill the password saved for this site, usually the management
     // key, into password fields. A value the browser fills in while the field
     // is not focused comes from autofill on page load; it is not saved, and
-    // the field shows the saved value again. Only the models list key is a
+    // the field shows the saved value again. The management key is refused
+    // with a message. Only the models list key is a
     // CPA API key: the Telegram Bot Token is not, so it must never be
     // checked against /v1/models (CPA always refuses it, and the save then
     // fails with "CPA 不接受这个 key" even though the token is correct) and
@@ -4320,13 +4327,13 @@
   var MCP_URL_STORE = "phoenix-mcp-url";
   var mcpKeyShown = false;
 
-  // 32 random bytes in base64url after the llmcp_ prefix.
+  // 32 random bytes in base64url after the phxmcp_ prefix.
   function newMcpKey() {
     var bytes = new Uint8Array(32);
     crypto.getRandomValues(bytes);
     var text = "";
     for (var i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
-    return "llmcp_" + btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    return "phxmcp_" + btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
 
   function mcpKey() { return typeof rawConfig.mcp_key === "string" ? rawConfig.mcp_key : ""; }
@@ -4513,6 +4520,7 @@
     return api("GET", CONFIG_API).then(function (data) {
       rawConfig = data || {};
       if (pendingOrder) rawConfig.account_order = pendingOrder.slice();
+      renderMcp();
     });
   }
 
@@ -4604,8 +4612,19 @@
     if (top) noteEdit(e.target);
     var host = accountField ? accountFieldHost(e.target) : top ? saveHost(e.target) : null;
     if (host) editSaveState(host, e.target);
+    if (e.target.name === "mcp_listen") renderMcp();
   });
   $("mask-toggle").addEventListener("click", toggleMask);
+  $("mcp-key-new").addEventListener("click", generateMcpKey);
+  $("mcp-key-show").addEventListener("click", function () { mcpKeyShown = !mcpKeyShown; renderMcp(); });
+  $("mcp-key-copy").addEventListener("click", function (e) { copyText(mcpKey(), e.currentTarget); });
+  // The public address stays in this browser; the configs follow it, also
+  // when another tab changes it.
+  $("mcp-public-url").addEventListener("input", function (e) {
+    savePublicUrl(e.target.value);
+    renderMcp();
+  });
+  try { $("mcp-public-url").value = localStorage.getItem(MCP_URL_STORE) || ""; } catch (err) {}
 
   // The quota and settings views; the last one shown is kept in this
   // browser. The chart is drawn when its view shows, since it measures its
