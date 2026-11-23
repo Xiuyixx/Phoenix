@@ -17,7 +17,7 @@
 // (账号 / 模型 / 状态 / 时间, with the 5H/7D lines when they apply).
 //
 // This style applies to Chinese notifications. English keeps the
-// Lamplighter wording, which the English tests pin.
+// the base wording, which the English tests pin.
 package notify
 
 import (
