@@ -1,0 +1,28 @@
+{
+  "plugins": [
+    {
+      "author": "Xiuyixx",
+      "description": "Monitor Codex, Claude and Antigravity subscription quotas, push alerts via Telegram, Bark and Webhook, auto-ignite new 5-hour windows and auto-consume reset credits.",
+      "homepage": "https://github.com/Xiuyixx/Phoenix",
+      "id": "phoenix",
+      "license": "AGPL-3.0-or-later",
+      "locales": {
+        "zh-CN": {
+          "description": "Phoenix 是 CLIProxyAPI 的原生插件：监控 Codex / Claude / Antigravity 订阅额度，额度不足与账号异常时经 Telegram / Bark / Webhook 推送，支持自动点火与 reset credit 自动重置。"
+        }
+      },
+      "name": "Phoenix",
+      "repository": "https://github.com/Xiuyixx/Phoenix",
+      "tags": [
+        "Management",
+        "Quota",
+        "Notification",
+        "Codex",
+        "Claude",
+        "Antigravity"
+      ],
+      "version": "0.1.4"
+    }
+  ],
+  "schema_version": 1
+}
