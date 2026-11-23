@@ -1708,13 +1708,17 @@ func TestActionResponses(t *testing.T) {
 	}
 }
 
-// TestServedPageEmbedsLogo covers the logo embedding: the served page must
-// carry the logo as a data URI (no /*LOGO*/ placeholder left, no remote
-// fetch) and the Phoenix deltas (立即操作 card, per-row 立即重置).
-func TestServedPageEmbedsLogo(t *testing.T) {
+// TestServedPageHasNoLogo covers the logo removal (v0.0.19): the served page
+// must carry no logo image and no embedded logo data URI, and no /*LOGO*/
+// placeholder may be left behind. The Phoenix deltas (立即操作 card,
+// per-row 立即重置) still apply.
+func TestServedPageHasNoLogo(t *testing.T) {
 	page := string(pluginPage())
-	if !strings.Contains(page, "data:image/jpeg;base64,") {
-		t.Errorf("served page has no embedded logo data URI")
+	if strings.Contains(page, "data:image/jpeg;base64,") {
+		t.Errorf("served page still embeds a logo data URI")
+	}
+	if strings.Contains(page, "<img class=\"logo\"") || strings.Contains(page, "class=\"logo\"") {
+		t.Errorf("served page still contains a logo element")
 	}
 	for _, placeholder := range []string{"/*LOGO*/", "/*CSS*/", "/*JS*/"} {
 		if strings.Contains(page, placeholder) {
