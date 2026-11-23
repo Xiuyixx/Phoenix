@@ -97,6 +97,13 @@ jobs:
           pattern: phoenix-*
           merge-multiple: true
           path: dist
+      - name: Generate checksums.txt
+        shell: bash
+        run: |
+          # The plugin store installs from the release assets and verifies
+          # the zip against checksums.txt (bare file names, sha256sum format).
+          (cd dist && sha256sum phoenix_*.zip > checksums.txt)
+          cat dist/checksums.txt
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
