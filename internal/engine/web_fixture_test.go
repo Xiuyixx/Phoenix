@@ -15,7 +15,7 @@ import (
 )
 
 // TestWebPreviewFixture exercises management DTOs using real history storage.
-// LAMPLIGHTER_WEB_FIXTURE_DIR optionally exports snapshots for browser tests.
+// PHOENIX_WEB_FIXTURE_DIR optionally exports snapshots for browser tests.
 func TestWebPreviewFixture(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	c := &clock{t: now.Add(-6 * time.Hour)}
@@ -95,7 +95,7 @@ func TestWebPreviewFixture(t *testing.T) {
 		snapshots[name] = map[string]any{"raw": saved, "status": status}
 	}
 	capture("default")
-	raw["mcp_enabled"], raw["mcp_key"] = true, "llmcp_preview_fixture"
+	raw["mcp_enabled"], raw["mcp_key"] = true, "phxmcp_preview_fixture"
 	capture("enabled")
 	if !listener.State().Running {
 		t.Fatalf("MCP fixture failed to start: %+v", listener.State())
@@ -128,7 +128,7 @@ func TestWebPreviewFixture(t *testing.T) {
 	if !retired {
 		t.Fatal("history must keep the inactive Codex window")
 	}
-	if dir := os.Getenv("LAMPLIGHTER_WEB_FIXTURE_DIR"); dir != "" {
+	if dir := os.Getenv("PHOENIX_WEB_FIXTURE_DIR"); dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			t.Fatal(err)
 		}
