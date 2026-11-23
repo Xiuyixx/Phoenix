@@ -1188,6 +1188,37 @@ ignition:
 	}
 }
 
+// TestParseYAMLDeliveredShape reproduces the models-key bug: CPA re-marshals
+// the plugin config with 2-space indents before delivering it, so a
+// top-level key that follows a section was misread as belonging to that
+// section and silently dropped. The key sat in config.yaml while the plugin
+// kept reporting it unset (and config_token was lost the same way, so saves
+// could never confirm as applied).
+func TestParseYAMLDeliveredShape(t *testing.T) {
+	cfg := defaultConfig()
+	parseYAML([]byte(`poll_interval_seconds: 300
+ignition:
+  models_api_key: ""
+  cpa_base_url: "http://127.0.0.1:6699"
+reset:
+  enabled: true
+models_api_key: "delivered-key"
+config_token: abcdef0123456789
+`), &cfg)
+	if cfg.Ignition.ModelsAPIKey != "delivered-key" {
+		t.Errorf("models_api_key = %q, want delivered-key (top-level key after a section)", cfg.Ignition.ModelsAPIKey)
+	}
+	if cfg.ConfigToken != "abcdef0123456789" {
+		t.Errorf("config_token = %q, want abcdef0123456789 (top-level key after a section)", cfg.ConfigToken)
+	}
+	if cfg.Ignition.CPABaseURL != "http://127.0.0.1:6699" {
+		t.Errorf("cpa_base_url = %q, want http://127.0.0.1:6699", cfg.Ignition.CPABaseURL)
+	}
+	if !cfg.Reset.Enabled {
+		t.Errorf("reset.enabled = false, want true")
+	}
+}
+
 // TestTargetAuthIndex covers the /ignite address resolution: the page sends
 // the Lamplighter group key (codex:<auth_index>:codex:main) while the
 // Phoenix route also accepts a bare auth_index.

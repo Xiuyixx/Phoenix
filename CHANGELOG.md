@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.14 - 2026-11-23
+
+- 修复模型列表 API key 填了也显示“未设置”：key 其实早已存进 config.yaml（13:14 的校验与 PATCH 均成功，文件里顶层 models_api_key 已有 20 位值），但插件一直读不到。根因在手写 parseYAML：CPA 下发配置前会用 yaml.Marshal 重排成 2 空格缩进（顶层键在 0 列），而解析器遇到顶层键值行时不重置 section——排在 reset: 之后的顶层 models_api_key 被误认成 reset.models_api_key 悄悄丢掉；config_token 同样丢失，所以保存也永远无法确认已应用。修复：顶层键值行（0 列）先把 section 清空再分发。新增回归测试 TestParseYAMLDeliveredShape（旧解析器复现失败），并用服务器上真实 phoenix 配置块按 CPA 下发形态验证通过（key 20 位、config_token 16 位均读到）。部署后无需重新填 key，文件里已有的 key 会直接生效。
+
 ## 0.0.13 - 2026-11-23
 
 - 修复刷新页面后全部已保存配置“丢失”：根因是 `status()` 把 `targetEntry()` 的 `nil` 结果直接追加进 targets——没有 5h 窗口的组（测试服务器上 Antigravity 的两个组只有 7d 窗口）会返回 nil，于是 status 里出现 `null` 目标；页面 `targetStatus(t)` 在 `t.blocked_window` 上抛错，启动时的 `Promise.all` 被拒，`fillSettings()` 从未执行，所有设置项都停在空白默认值上，看起来像配置丢了。config.yaml 里的配置其实一直在，从未丢失。修复：后端跳过 nil 的 target（只有带 5h 窗口的组才进目标列表）；页面跳过 null 目标且 `targetStatus` 做空值保护；启动时先填设置再渲染，今后即使渲染再出问题也不会把表单清空。新增回归测试 `TestStatusSkipsTargetsWithoutFiveHourWindow`（共 58 个测试，旧代码上复现失败、新代码通过）。

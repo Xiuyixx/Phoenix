@@ -46,7 +46,7 @@ import (
 
 const (
 	pluginID       = "phoenix"
-	pluginVersion  = "0.0.13"
+	pluginVersion  = "0.0.14"
 	repository     = "https://github.com/Xiuyixx/Phoenix"
 	managementBase = "/v0/management/phoenix"
 	resourcePath   = "/page"
@@ -468,7 +468,16 @@ func parseYAML(b []byte, c *Config) {
 			continue
 		}
 		k, v := strings.TrimSpace(parts[0]), strings.Trim(strings.TrimSpace(parts[1]), "\"'")
-		if indent <= 2 {
+		if indent == 0 {
+			// A top-level key ends any open section. CPA re-marshals the
+			// plugin config with 2-space indents before delivering it, so
+			// a top-level key that follows a section (models_api_key after
+			// reset:) was misread as belonging to that section and silently
+			// dropped — the key sat in config.yaml while the plugin kept
+			// reporting it unset. Nested keys (indent 2) keep their section.
+			section = ""
+			sub = ""
+		} else if indent <= 2 {
 			// A section-level key ends any nested block.
 			sub = ""
 		}
