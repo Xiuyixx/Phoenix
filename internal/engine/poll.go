@@ -847,7 +847,7 @@ func absInt64(v int64) int64 {
 }
 
 func (e *Engine) pollResetFeed(ctx context.Context, cfg config.Config) {
-	records, err := notify.FetchResetRecords(ctx, &http.Client{Timeout: cfg.RequestTimeout()}, "phoenix/"+e.version)
+	records, err := notify.FetchResetRecords(ctx, &http.Client{Timeout: cfg.RequestTimeout()}, "Phoenix/"+e.version)
 	if err != nil {
 		e.logf("warn", "Did Codex Reset 检查失败：%v", err)
 		return
