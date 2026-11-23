@@ -42,7 +42,7 @@ func TestComparable(t *testing.T) {
 func serve(t *testing.T, status int, body string) {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("User-Agent") != "phoenix/0.4.0" {
+		if r.Header.Get("User-Agent") != "Phoenix/0.4.0" {
 			t.Errorf("User-Agent = %q", r.Header.Get("User-Agent"))
 		}
 		w.WriteHeader(status)
@@ -56,7 +56,7 @@ func serve(t *testing.T, status int, body string) {
 
 func TestLatest(t *testing.T) {
 	serve(t, http.StatusOK, `{"tag_name":"v0.5.0","html_url":"https://github.com/Xiuyixx/Phoenix/releases/tag/v0.5.0"}`)
-	got, err := Latest(context.Background(), http.DefaultClient, "phoenix/0.4.0")
+	got, err := Latest(context.Background(), http.DefaultClient, "Phoenix/0.4.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestLatestFailures(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			serve(t, c.status, c.body)
-			if got, err := Latest(context.Background(), http.DefaultClient, "phoenix/0.4.0"); err == nil {
+			if got, err := Latest(context.Background(), http.DefaultClient, "Phoenix/0.4.0"); err == nil {
 				t.Fatalf("Latest = %+v, want an error", got)
 			}
 		})
@@ -87,7 +87,7 @@ func TestLatestFailures(t *testing.T) {
 
 func TestLatestWithNonNumericTagIsNeverNewer(t *testing.T) {
 	serve(t, http.StatusOK, `{"tag_name":"v0.6.0-beta","html_url":"https://github.com/Xiuyixx/Phoenix/releases/tag/v0.6.0-beta"}`)
-	got, err := Latest(context.Background(), http.DefaultClient, "phoenix/0.4.0")
+	got, err := Latest(context.Background(), http.DefaultClient, "Phoenix/0.4.0")
 	if err != nil {
 		t.Fatal(err)
 	}
