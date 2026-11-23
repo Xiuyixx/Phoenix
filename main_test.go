@@ -23,6 +23,7 @@ type fakeHost struct {
 	usageStatus     int
 	modelStatus     int
 	modelErr        error
+	modelErrs       []error // per-call errors, consumed in order; nil means success
 	modelCalls      []string
 	usageCalls      int
 }
@@ -47,6 +48,13 @@ func (f *fakeHost) httpDo(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, er
 }
 func (f *fakeHost) modelExecute(req pluginapi.HostModelExecutionRequest) (pluginapi.HostModelExecutionResponse, error) {
 	f.modelCalls = append(f.modelCalls, req.Model)
+	if len(f.modelErrs) > 0 {
+		err := f.modelErrs[0]
+		f.modelErrs = f.modelErrs[1:]
+		if err != nil {
+			return pluginapi.HostModelExecutionResponse{}, err
+		}
+	}
 	if f.modelErr != nil {
 		return pluginapi.HostModelExecutionResponse{}, f.modelErr
 	}
@@ -801,6 +809,77 @@ func TestClassifyIgniteError(t *testing.T) {
 	}
 }
 
+// TestParseHostEnvelope checks the host callback envelope decoding: the
+// error object (code/message/http_status) must survive into a *hostError,
+// because the old code threw it away and every ignition failure surfaced
+// as the useless "host callback host.model.execute returned error".
+func TestParseHostEnvelope(t *testing.T) {
+	var out struct {
+		A int `json:"a"`
+	}
+	if err := parseHostEnvelope("m", []byte(`{"ok":true,"result":{"a":1}}`), &out); err != nil || out.A != 1 {
+		t.Fatalf("ok envelope = %v, out = %+v", err, out)
+	}
+	err := parseHostEnvelope("host.model.execute", []byte(`{"ok":false,"error":{"code":"model_execution_failed","message":"invalid model","http_status":400}}`), &out)
+	hostErr, ok := err.(*hostError)
+	if !ok {
+		t.Fatalf("error envelope = %T %v, want *hostError", err, err)
+	}
+	if hostErr.Code != "model_execution_failed" || hostErr.Message != "invalid model" || hostErr.Status != 400 {
+		t.Errorf("hostError = %+v, want code/message/status filled", hostErr)
+	}
+	if got := err.Error(); got != "model_execution_failed: invalid model (HTTP 400)" {
+		t.Errorf("hostError text = %q", got)
+	}
+	if hostErrorStatus(err) != 400 {
+		t.Errorf("hostErrorStatus = %d, want 400", hostErrorStatus(err))
+	}
+	err = parseHostEnvelope("m", []byte(`{"ok":false,"error":"boom"}`), &out)
+	if _, ok := err.(*hostError); !ok || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("string error = %v, want hostError carrying boom", err)
+	}
+	err = parseHostEnvelope("m", []byte(`{"ok":false}`), &out)
+	if _, ok := err.(*hostError); !ok {
+		t.Errorf("bare error = %v, want *hostError", err)
+	}
+	if err := parseHostEnvelope("m", []byte(`not json`), &out); err == nil {
+		t.Errorf("malformed envelope must error")
+	}
+}
+
+// TestModelRejectedHostError checks that a structured host error (as the
+// live 2026-11-23 ignition failure produced) classifies as a model
+// rejection, where the old generic text could not.
+func TestModelRejectedHostError(t *testing.T) {
+	rejected := &hostError{Method: "host.model.execute", Code: "model_execution_failed", Message: "invalid model", Status: 400}
+	if !modelRejected(rejected, hostErrorStatus(rejected)) {
+		t.Errorf("400 host error must be a model rejection")
+	}
+	auth := &hostError{Method: "host.model.execute", Code: "model_execution_failed", Message: "unauthorized", Status: 401}
+	if modelRejected(auth, hostErrorStatus(auth)) {
+		t.Errorf("401 host error must not be a model rejection")
+	}
+}
+
+func TestIgnitionCandidateModels(t *testing.T) {
+	got := ignitionCandidateModels("gpt-6-luna", []string{"gpt-6-luna", "gpt-6.2-sol", "gpt-6-astra"}, "codex")
+	want := []string{"gpt-6-luna", "gpt-6.2-sol", "gpt-6-astra", "gpt-5-codex"}
+	if len(got) != len(want) {
+		t.Fatalf("candidates = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("candidates = %v, want %v", got, want)
+		}
+	}
+	if got := ignitionCandidateModels("", nil, "codex"); len(got) != 1 || got[0] != "gpt-5-codex" {
+		t.Errorf("empty codex candidates = %v, want [gpt-5-codex]", got)
+	}
+	if got := ignitionCandidateModels("", []string{"gpt-6-luna"}, "claude"); len(got) != 1 || got[0] != "gpt-6-luna" {
+		t.Errorf("claude candidates = %v, want [gpt-6-luna]", got)
+	}
+}
+
 func TestPickIgnitionCandidates(t *testing.T) {
 	got := pickIgnitionCandidates([]string{"gpt-5-codex", "gpt-6-luna", "gpt-6-luna-image", "gpt-5.1-oss", "gpt-4-luna", "codex-mini"})
 	want := []string{"gpt-6-luna", "gpt-4-luna", "gpt-5-codex"}
@@ -868,6 +947,90 @@ func TestIgniteForSuccess(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("no ignite event with auth_index/window/params in %v", events)
+	}
+}
+
+// serverModels is the /v1/models list the test server returned on
+// 2026-11-23: 11 models, none of them a Codex model.
+var serverModels = []string{"gpt-6.2-sol", "gpt-image-2.6-flare", "gpt-6.2-astra", "gemini-4-argon", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-image-2.6-sunburst", "gpt-image-2.6", "gemini-3.8-flash", "grok-4.7"}
+
+func newIgniteFallbackRuntime(t *testing.T, host *fakeHost) *runtime {
+	t.Helper()
+	fixed := time.Now().Add(5 * time.Hour).Format(time.RFC3339)
+	host.usageBody = `{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":2,"reset_at":"` + fixed + `"},"secondary_window":{"limit_window_seconds":604800,"used_percent":10}}}`
+	rt := newTestRuntime(host)
+	rt.cfg.Ignition.Model = "gpt-6-luna"
+	rt.cfg.Ignition.ModelsAPIKey = "test-key"
+	rt.modelsKey = "test-key"
+	rt.modelsCache = append([]string(nil), serverModels...)
+	rt.modelsFetched = time.Now()
+	rt.confirmDelays = []time.Duration{0}
+	rt.sleepFunc = func(time.Duration) {}
+	return rt
+}
+
+// TestIgniteFallsThroughToNextCandidate reproduces the 2026-11-23 live
+// failure: the configured gpt-6-luna was rejected by the host, and the
+// ignition died because the old code tried the configured model alone.
+// Now it falls through to the next listed candidate and succeeds.
+func TestIgniteFallsThroughToNextCandidate(t *testing.T) {
+	host := &fakeHost{modelErrs: []error{
+		&hostError{Method: "host.model.execute", Code: "model_execution_failed", Message: "invalid model", Status: 400},
+		nil,
+	}}
+	rt := newIgniteFallbackRuntime(t, host)
+	rt.igniteFor("0", true)
+	if len(host.modelCalls) != 2 || host.modelCalls[0] != "gpt-6-luna" {
+		t.Fatalf("model calls = %v, want [gpt-6-luna <fallback>]", host.modelCalls)
+	}
+	rt.mu.RLock()
+	ts := rt.state.Targets["codex:0:codex:main"]
+	rt.mu.RUnlock()
+	if ts == nil || ts.LastSuccess.IsZero() || ts.LastModel != host.modelCalls[1] {
+		t.Errorf("target after fallback success = %+v, want success with %q", ts, host.modelCalls[1])
+	}
+}
+
+// TestIgniteStopsAfterSecondRefusal checks the Lamplighter rule: a second
+// model refusal points at the request or the account, so the attempt ends
+// instead of burning through every candidate.
+func TestIgniteStopsAfterSecondRefusal(t *testing.T) {
+	host := &fakeHost{modelErrs: []error{
+		&hostError{Method: "host.model.execute", Code: "model_execution_failed", Message: "invalid model", Status: 400},
+		&hostError{Method: "host.model.execute", Code: "model_execution_failed", Message: "invalid model", Status: 400},
+		nil,
+	}}
+	rt := newIgniteFallbackRuntime(t, host)
+	rt.igniteFor("0", true)
+	if len(host.modelCalls) != 2 {
+		t.Fatalf("model calls = %v, want exactly 2 (stop after second refusal)", host.modelCalls)
+	}
+	rt.mu.RLock()
+	ts := rt.state.Targets["codex:0:codex:main"]
+	rt.mu.RUnlock()
+	if ts == nil || !ts.LastSuccess.IsZero() || !strings.Contains(ts.LastError, "invalid model") {
+		t.Errorf("target after refusals = %+v, want failure carrying the real reason", ts)
+	}
+}
+
+// TestIgniteContinuesOnUnsupported checks that a host error saying the
+// model cannot be routed to this credential (auth_not_found) tries the
+// next candidate instead of stopping.
+func TestIgniteContinuesOnUnsupported(t *testing.T) {
+	host := &fakeHost{modelErrs: []error{
+		&hostError{Method: "host.model.execute", Code: "auth_not_found", Message: "auth not found for model", Status: 0},
+		nil,
+	}}
+	rt := newIgniteFallbackRuntime(t, host)
+	rt.igniteFor("0", true)
+	if len(host.modelCalls) != 2 || host.modelCalls[0] != "gpt-6-luna" {
+		t.Fatalf("model calls = %v, want [gpt-6-luna <fallback>]", host.modelCalls)
+	}
+	rt.mu.RLock()
+	ts := rt.state.Targets["codex:0:codex:main"]
+	rt.mu.RUnlock()
+	if ts == nil || ts.LastSuccess.IsZero() {
+		t.Errorf("target after unsupported fallback = %+v, want success", ts)
 	}
 }
 

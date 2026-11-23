@@ -399,6 +399,34 @@ func pickIgnitionCandidates(available []string) []string {
 	return uniq
 }
 
+// ignitionCandidateModels orders the models one ignition attempt tries: the
+// configured model first, then CPA's listed candidates for the provider
+// (deduplicated, at most four of them), then gpt-5-codex as a last resort
+// for Codex when the list offers nothing usable.
+func ignitionCandidateModels(configured string, listed []string, provider string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(m string) {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			return
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	add(configured)
+	for _, m := range listed {
+		if len(out) >= 5 {
+			break
+		}
+		add(m)
+	}
+	if provider == "codex" {
+		add("gpt-5-codex")
+	}
+	return out
+}
+
 // isFixedReset reports whether reset is a fixed future reset (not zero, not
 // in the past, and not a rolling placeholder that moves with time).
 func isFixedReset(reset time.Time, now time.Time) bool {

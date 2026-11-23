@@ -46,7 +46,7 @@ import (
 
 const (
 	pluginID       = "phoenix"
-	pluginVersion  = "0.0.16"
+	pluginVersion  = "0.0.17"
 	repository     = "https://github.com/Xiuyixx/Phoenix"
 	managementBase = "/v0/management/phoenix"
 	resourcePath   = "/page"
@@ -2806,17 +2806,17 @@ func (rt *runtime) igniteFor(groupKey string, manual bool) {
 	}
 	rt.mu.Unlock()
 
-	models := []string{rt.configuredModel(provider, groupLabel)}
-	if models[0] == "" {
-		models = rt.ignitionCandidatesFor(provider, groupLabel)
-	}
-	if len(models) == 0 && provider == "codex" {
-		models = []string{"gpt-5-codex"}
-	}
+	// The configured model goes first, then the models CPA lists for this
+	// provider, then gpt-5-codex as a last resort for Codex. A configured
+	// model used to be tried alone: when CPA rejected it (for example the
+	// model is not served by this credential), the ignition died with no
+	// fallback and no usable error.
+	models := ignitionCandidateModels(rt.configuredModel(provider, groupLabel), rt.ignitionCandidatesFor(provider, groupLabel), provider)
 	var lastErr error
 	var lastStatus int
 	succeeded := false
 	usedModel := ""
+	refusals := 0
 	for _, model := range models {
 		if model == "" {
 			continue
@@ -2828,9 +2828,20 @@ func (rt *runtime) igniteFor(groupKey string, manual bool) {
 			succeeded = true
 			break
 		}
+		// The host could not route this model to the credential at all
+		// (auth_not_found / unknown provider for model): try the next
+		// candidate, like Lamplighter does for Unsupported errors.
+		if classifyIgniteError(err, status) == "unsupported" {
+			continue
+		}
 		// A rejected model falls through to the next candidate; any
-		// other error stops the attempt loop.
+		// other error stops the attempt loop. A second refusal points
+		// at the request or the account, so it ends the attempt.
 		if !modelRejected(err, status) {
+			break
+		}
+		refusals++
+		if refusals >= 2 {
 			break
 		}
 	}
@@ -2943,7 +2954,9 @@ func (rt *runtime) executeIgnitionFor(provider, forcedProvider, authID, model st
 		AuthID:         authID,
 	})
 	if err != nil {
-		return 0, err
+		// A host callback error carries its HTTP status in the error
+		// itself; surface it so modelRejected can classify the failure.
+		return hostErrorStatus(err), err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return resp.StatusCode, fmt.Errorf("upstream status %d", resp.StatusCode)
@@ -3019,7 +3032,9 @@ func (rt *runtime) executeIgnition(index, authID, model string) (int, error) {
 		AuthID:         authID,
 	})
 	if err != nil {
-		return 0, err
+		// A host callback error carries its HTTP status in the error
+		// itself; surface it so modelRejected can classify the failure.
+		return hostErrorStatus(err), err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return resp.StatusCode, fmt.Errorf("upstream status %d", resp.StatusCode)
@@ -3391,23 +3406,91 @@ func hostCall(method string, payload []byte) ([]byte, error) {
 	}
 	return b, nil
 }
+
+// hostError is a failed host callback, carrying the code, message and HTTP
+// status CPA attached to the failure (Lamplighter's internal/host.Error
+// shape). It replaces the old generic "host callback %s returned error"
+// string, which hid the real reason from the panel and from the ignition
+// error classification: with only the method name, a rejected model looked
+// like any other failure and no fallback could ever trigger.
+type hostError struct {
+	Method  string
+	Code    string
+	Message string
+	Status  int
+}
+
+func (e *hostError) Error() string {
+	if e.Status > 0 {
+		return fmt.Sprintf("%s: %s (HTTP %d)", e.Code, e.Message, e.Status)
+	}
+	return fmt.Sprintf("%s: %s", e.Code, e.Message)
+}
+
+// hostErrorStatus returns the HTTP status carried by err, or 0.
+func hostErrorStatus(err error) int {
+	var hostErr *hostError
+	if errors.As(err, &hostErr) {
+		return hostErr.Status
+	}
+	return 0
+}
+
+// parseHostEnvelope decodes one host callback envelope into out. On
+// ok=false it returns a *hostError built from the envelope's error field,
+// which may be an object {code, message, http_status}, a plain string, or
+// absent.
+func parseHostEnvelope(method string, b []byte, out any) error {
+	var env struct {
+		OK     bool            `json:"ok"`
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(b, &env); err != nil {
+		return err
+	}
+	if env.OK {
+		if out == nil || len(env.Result) == 0 {
+			return nil
+		}
+		return json.Unmarshal(env.Result, out)
+	}
+	hostErr := &hostError{Method: method, Code: "host_call_failed", Message: "host callback failed"}
+	if len(env.Error) > 0 {
+		var obj struct {
+			Code       string `json:"code"`
+			Message    string `json:"message"`
+			HTTPStatus int    `json:"http_status"`
+			Status     int    `json:"status"`
+		}
+		if err := json.Unmarshal(env.Error, &obj); err == nil && (obj.Code != "" || obj.Message != "") {
+			if obj.Code != "" {
+				hostErr.Code = obj.Code
+			}
+			if obj.Message != "" {
+				hostErr.Message = obj.Message
+			}
+			if obj.HTTPStatus != 0 {
+				hostErr.Status = obj.HTTPStatus
+			} else if obj.Status != 0 {
+				hostErr.Status = obj.Status
+			}
+		} else {
+			var text string
+			if err := json.Unmarshal(env.Error, &text); err == nil && text != "" {
+				hostErr.Message = text
+			}
+		}
+	}
+	return hostErr
+}
+
 func hostCallInto(method string, payload []byte, out any) error {
 	b, err := hostCall(method, payload)
 	if err != nil {
 		return err
 	}
-	var env struct {
-		OK     bool            `json:"ok"`
-		Result json.RawMessage `json:"result"`
-		Error  any             `json:"error"`
-	}
-	if err = json.Unmarshal(b, &env); err != nil {
-		return err
-	}
-	if !env.OK {
-		return fmt.Errorf("host callback %s returned error", method)
-	}
-	return json.Unmarshal(env.Result, out)
+	return parseHostEnvelope(method, b, out)
 }
 
 var _ = (*runtime).statusBody

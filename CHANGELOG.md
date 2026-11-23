@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.17 - 2026-11-23
+
+- 修复 Codex 点火失败：新加的 Codex 账号点“立即点火”后，面板只显示一句没用的“host callback host.model.execute returned error”，点火一次就停。两个根因都在插件这边：① 宿主回调的信封里本来就带了错误详情（code/message/http_status），但 `hostCallInto` 解析后直接丢掉，只返回方法名——面板看不到真正原因，点火的错误分类（模型被拒/无法路由/账号问题）也全都失灵。现按 Lamplighter 的 `host.Error` 做法，把 code/message/http_status 原样带进错误，点火失败时面板显示真实原因（例如 `model_execution_failed: invalid model (HTTP 400)`），执行失败的 HTTP 状态也一并回传给分类逻辑。② 点火只试已配置的模型：`gpt-6-luna` 被拒后没有候选可试。现在点火按“已配置模型 → CPA 模型列表候选（去重、最多 4 个）→ gpt-5-codex 兜底”的顺序尝试；宿主说模型无法路由到该凭证（auth_not_found / unknown provider for model）时换下一个候选；模型被拒（400/404）时换下一个，但第二次被拒就停手（按 Lamplighter 的规则，第二次被拒说明问题在请求或账号本身）；其他错误（鉴权、限流、冷却）仍立即停。新增回归测试 6 个（共 79 个）：信封解析（对象/字符串/缺失/非法）、hostError 文本与状态、400 归类为模型被拒而 401 不是、候选排序与兜底、被拒后换候选成功、第二次被拒停手、无法路由时换候选成功。
+
 ## 0.0.16 - 2026-11-23
 
 - 修复 Telegram Bot Token 保存失败：保存时页面把 Bot Token 当成模型列表 API key 拿去 CPA 的 /v1/models 校验（check-models-key），Telegram 的 token 永远通不过，保存被拒并显示“ CPA 不接受这个 key”，token 从未存进 config.yaml；测试推送能通过是因为它用的是已加载的旧 token。修复：只有 models_api_key 才走管理密钥拒绝与 /v1/models 校验，Bot Token 直接保存（用测试推送验证）。另修一个同类问题：保存 Telegram 分组内任意字段时，空的 Bot Token 输入框会被当成 "" 一起提交，把已保存的 token 清掉——现在空 Bot Token 与模型 key 一样视为“保持不变”，不再随保存发出。测试推送成功后会清除残留的“telegram send failed”横幅，不必等下一次后台通知。
