@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/Xiuyixx/Phoenix/internal/config"
 )
@@ -27,6 +29,42 @@ type Telegram struct {
 	// BaseURL overrides https://api.telegram.org for tests. Empty uses the
 	// real Bot API.
 	BaseURL string
+}
+
+// messageEntity is one Telegram message entity. Offset and Length are in
+// UTF-16 code units, as the Bot API requires; byte and rune offsets are
+// wrong once the text carries emoji or CJK characters.
+type messageEntity struct {
+	Type   string `json:"type"`
+	Offset int    `json:"offset"`
+	Length int    `json:"length"`
+}
+
+// emailPattern finds email addresses in notification text. It stops at
+// characters that cannot be part of an address, so trailing punctuation
+// (a Chinese full stop, a closing bracket, an ASCII period) is never
+// included in the link.
+var emailPattern = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
+
+// emailEntities returns one "email" entity per address in text, with
+// offsets and lengths in UTF-16 code units. It returns nil when the text
+// carries no address, so the request sends no entities field at all.
+func emailEntities(text string) []messageEntity {
+	var out []messageEntity
+	for _, loc := range emailPattern.FindAllStringIndex(text, -1) {
+		out = append(out, messageEntity{
+			Type:   "email",
+			Offset: utf16Len(text[:loc[0]]),
+			Length: utf16Len(text[loc[0]:loc[1]]),
+		})
+	}
+	return out
+}
+
+// utf16Len counts the UTF-16 code units in s: characters outside the BMP
+// (emoji) count two, BMP characters one.
+func utf16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
 }
 
 // SplitChatIDs splits a semicolon-separated chat ID list, dropping blanks.
@@ -83,7 +121,15 @@ func (t *Telegram) Send(ctx context.Context, msg Message) error {
 }
 
 func (t *Telegram) sendOne(ctx context.Context, chatID, text string) error {
-	raw, err := json.Marshal(map[string]string{"chat_id": chatID, "text": text})
+	// Explicit email entities tell the client exactly what is a link.
+	// Without them a client that auto-detects links can swallow the
+	// "账号：" prefix into the link along with the address.
+	reqBody := struct {
+		ChatID   string          `json:"chat_id"`
+		Text     string          `json:"text"`
+		Entities []messageEntity `json:"entities,omitempty"`
+	}{ChatID: chatID, Text: text, Entities: emailEntities(text)}
+	raw, err := json.Marshal(reqBody)
 	if err != nil {
 		return err
 	}
