@@ -62,10 +62,10 @@ func TestThresholdCrossingNotifiesWithResetHint(t *testing.T) {
 	if len(sender.sent) != 1 {
 		t.Fatalf("want one notification, got %+v", sender.sent)
 	}
-	if got := sender.sent[0].Title; got != "🟡 🟡 🟡 GPT#eg 额度不足预警" {
+	if got := sender.sent[0].Title; got != "🟡 🟡 🟡 GPT 额度不足预警" {
 		t.Fatalf("title %q", got)
 	}
-	if !regexp.MustCompile(`^账号：凭证 1\n模型：Codex / GPT#eg\n5H：15% ｜ \d\d:\d\d 恢复（剩余 05h00m）\n7D：80% ｜ \d\d/\d\d \d\d:\d\d 恢复（剩余 6d00h）\n状态：Warning（5H 额度不足）\n时间：`).MatchString(sender.sent[0].Body) {
+	if !regexp.MustCompile(`^账号：凭证 1\n模型：Codex / GPT\n5H：15% ｜ \d\d:\d\d 恢复（剩余 05h00m）\n7D：80% ｜ \d\d/\d\d \d\d:\d\d 恢复（剩余 6d00h）\n状态：Warning（5H 额度不足）\n时间：`).MatchString(sender.sent[0].Body) {
 		t.Fatalf("body %q", sender.sent[0].Body)
 	}
 	a.ProcessGroup(context.Background(), st, group(12, 80, now), now)
