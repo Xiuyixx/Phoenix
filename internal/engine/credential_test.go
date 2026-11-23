@@ -97,7 +97,7 @@ func TestSuspendedAccountPausesIgnitionUntilTheCredentialChanges(t *testing.T) {
 		t.Fatalf("want one suspension notification, got %+v", sender.sent)
 	}
 	msg := suspended[0]
-	if msg.Title != "🔴 🔴 🔴 Claude 账号已停用" || !strings.Contains(msg.Body, "账号已被停用，请检查凭证。申诉：https://forms.gle/hGzM9MEUv2azZsrb9") ||
+	if msg.Title != "🔴 Claude 账号已停用" || !strings.Contains(msg.Body, "账号已被停用，请检查凭证。申诉：https://forms.gle/hGzM9MEUv2azZsrb9") ||
 		strings.Contains(msg.Body, "{") {
 		t.Fatalf("message %+v", msg)
 	}
@@ -157,7 +157,7 @@ func TestSuspendedAccountPausesIgnitionUntilTheCredentialChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored := messagesOf(sender, notify.KindCredentialOK)
-	if len(restored) != 1 || restored[0].Title != "✅ ✅ ✅ Claude 凭证已恢复" || e.credentialBlocked("3") {
+	if len(restored) != 1 || restored[0].Title != "✅ Claude 凭证已恢复" || e.credentialBlocked("3") {
 		t.Fatalf("restored %+v", sender.sent)
 	}
 	if ev := eventsOf(e, "credential_restored"); len(ev) != 1 || ev[0].Params["source"] != "ignite" || ev[0].Level != "info" {
@@ -194,7 +194,7 @@ func TestRejectedQueryNotifiesOnceAfterItLasts(t *testing.T) {
 		c.add(5 * time.Minute)
 	}
 	credential := messagesOf(sender, notify.KindCredential)
-	if len(sender.sent) != 1 || len(credential) != 1 || credential[0].Title != "🔴 🔴 🔴 Claude 账号异常" ||
+	if len(sender.sent) != 1 || len(credential) != 1 || credential[0].Title != "🔴 Claude 账号异常" ||
 		!strings.Contains(credential[0].Body, "认证失败（HTTP 401），请检查凭证。") {
 		t.Fatalf("want one credential notification, got %+v", sender.sent)
 	}
@@ -265,7 +265,7 @@ func TestRateLimitedIgnitionNotifiesWithPauseEnd(t *testing.T) {
 	e.performDue(ctx, cfg)
 	e.performDue(ctx, cfg)
 	limited := messagesOf(sender, notify.KindRateLimited)
-	if len(h.executed) != 1 || len(sender.sent) != 1 || len(limited) != 1 || limited[0].Title != "⏳ ⏳ ⏳ Claude 被限流" ||
+	if len(h.executed) != 1 || len(sender.sent) != 1 || len(limited) != 1 || limited[0].Title != "⏳ Claude 被限流" ||
 		!strings.Contains(limited[0].Body, "2026-11-17 07:00") || !strings.Contains(limited[0].Body, "Number of requests has exceeded your rate limit.") {
 		t.Fatalf("rate limit notification %+v", sender.sent)
 	}
@@ -375,7 +375,7 @@ func TestDeactivatedAccountQueryWithoutGroups(t *testing.T) {
 	e.Configure(cfg, nil)
 	e.poll(ctx, cfg, c.t, "", true)
 	suspended := messagesOf(sender, notify.KindSuspended)
-	if len(sender.sent) != 1 || len(suspended) != 1 || suspended[0].Title != "🔴 🔴 🔴 Claude 账号已停用" || !strings.Contains(suspended[0].Body, "账号已被停用，请检查凭证。") {
+	if len(sender.sent) != 1 || len(suspended) != 1 || suspended[0].Title != "🔴 Claude 账号已停用" || !strings.Contains(suspended[0].Body, "账号已被停用，请检查凭证。") {
 		t.Fatalf("want one suspension notification, got %+v", sender.sent)
 	}
 	invalid := eventsOf(e, "credential_invalid")
