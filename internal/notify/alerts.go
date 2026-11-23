@@ -178,7 +178,7 @@ func (a *Alerts) buildChangeMessage(g Group, changes []change, now time.Time) Me
 		}
 	}
 	if a.Lang != LangEN {
-		// Phoenix style (v0.0.18): triple-emoji title and the
+		// Phoenix style (v0.0.18): single-emoji title and the
 		// 账号 / 模型 / 5H / 7D / 状态 / 时间 body.
 		now = now.In(a.Cfg.Location())
 		title, body := quotaStatusMessage(g, quota.Kind(worst.window), worst.to, now)
@@ -273,14 +273,14 @@ func (a *Alerts) buildRecoveryMessage(g Group, recoveries []recovery, now time.T
 
 func (a *Alerts) buildReminderMessage(g Group, reminders []reminder, now time.Time) Message {
 	if a.Lang != LangEN {
-		// Phoenix style (v0.0.18): triple-⏰ title and the 账号 / 模型 /
+		// Phoenix style (v0.0.18): single-⏰ title and the 账号 / 模型 /
 		// 5H / 7D / 状态 / 时间 body, one countdown per reminding window.
 		now = now.In(a.Cfg.Location())
 		var parts []string
 		for _, r := range reminders {
 			parts = append(parts, fmt.Sprintf("%s 窗口将于 %s 后重置", windowShort(quota.Kind(r.window)), formatQuotaRemaining(r.window.Reset.Sub(now))))
 		}
-		title := fmt.Sprintf("⏰ ⏰ ⏰ %s 重置提醒", cleanLabel(g.Label))
+		title := fmt.Sprintf("⏰ %s 重置提醒", cleanLabel(g.Label))
 		body := phoenixBody(g, "Reminder（"+strings.Join(parts, "；")+"）", true, now)
 		return Message{
 			Kind:  KindReminder,
@@ -621,11 +621,11 @@ func (a *Alerts) ProcessGroup(ctx context.Context, st *store.State, g Group, now
 // although its quota has recovered.
 func CooldownMessage(lang string, g Group, until time.Time, loc *time.Location, now time.Time) Message {
 	if lang != LangEN {
-		// Phoenix style (v0.0.18): triple-⚠️ title and the 账号 / 模型 /
+		// Phoenix style (v0.0.18): single-⚠️ title and the 账号 / 模型 /
 		// 5H / 7D / 状态 / 时间 body.
 		return Message{
 			Kind:  KindCooldown,
-			Title: fmt.Sprintf("⚠️ ⚠️ ⚠️ %s 冷却过期提醒", cleanLabel(g.Label)),
+			Title: fmt.Sprintf("⚠️ %s 冷却过期提醒", cleanLabel(g.Label)),
 			Body:  phoenixBody(g, "额度已恢复，但 CPA 仍冷却到 "+formatResetTime(until.In(displayLoc(loc)))+"，请手动解除冷却", true, now.In(displayLoc(loc))),
 			Level: LevelTimeSensitive,
 			Label: g.Label,
@@ -658,11 +658,11 @@ func PlanMessage(lang, label, from, to string) Message {
 // summary is the error in one sentence, see failure.Diagnose.
 func CircuitMessage(lang string, g Group, until time.Time, summary string, loc *time.Location, now time.Time) Message {
 	if lang != LangEN {
-		// Phoenix style (v0.0.18): triple-⏸️ title and the 账号 / 模型 /
+		// Phoenix style (v0.0.18): single-⏸️ title and the 账号 / 模型 /
 		// 状态 / 时间 body.
 		return Message{
 			Kind:  KindCircuit,
-			Title: fmt.Sprintf("⏸️ ⏸️ ⏸️ %s 点火已暂停", cleanLabel(g.Label)),
+			Title: fmt.Sprintf("⏸️ %s 点火已暂停", cleanLabel(g.Label)),
 			Body:  phoenixBody(g, "点火失败已触发熔断，将暂停到 "+formatResetTime(until.In(displayLoc(loc)))+"："+truncate(summary, 220), false, now.In(displayLoc(loc))),
 			Level: LevelTimeSensitive,
 			Label: g.Label,
@@ -700,24 +700,24 @@ type Problem struct {
 // rate limited during ignition (KindRateLimited).
 func CredentialMessage(lang string, g Group, p Problem, loc *time.Location, now time.Time) Message {
 	if lang != LangEN {
-		// Phoenix style (v0.0.18): triple-emoji title and the 账号 / 模型 /
+		// Phoenix style (v0.0.18): single-emoji title and the 账号 / 模型 /
 		// 状态 / 时间 body.
 		var title, status string
 		switch p.Kind {
 		case KindSuspended:
-			title = fmt.Sprintf("🔴 🔴 🔴 %s 账号已停用", cleanLabel(g.Label))
+			title = fmt.Sprintf("🔴 %s 账号已停用", cleanLabel(g.Label))
 			status = "账号已被停用，请检查凭证。"
 			if p.AppealURL != "" {
 				status += "申诉：" + p.AppealURL
 			}
 		case KindRateLimited:
-			title = fmt.Sprintf("⏳ ⏳ ⏳ %s 被限流", cleanLabel(g.Label))
+			title = fmt.Sprintf("⏳ %s 被限流", cleanLabel(g.Label))
 			status = "被限流，自动点火暂停到 " + formatResetTime(p.Until.In(displayLoc(loc))) + "。"
 			if p.Summary != "" {
 				status += truncate(p.Summary, 220)
 			}
 		default:
-			title = fmt.Sprintf("🔴 🔴 🔴 %s 账号异常", cleanLabel(g.Label))
+			title = fmt.Sprintf("🔴 %s 账号异常", cleanLabel(g.Label))
 			switch {
 			case p.Status != "":
 				status = fmt.Sprintf("认证失败（HTTP %s），请检查凭证。", p.Status)
