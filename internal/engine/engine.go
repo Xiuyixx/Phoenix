@@ -473,7 +473,7 @@ func (e *Engine) saveState() {
 
 func (e *Engine) applyRuntimeConfig(cfg config.Config) {
 	e.egress.Timeout = cfg.RequestTimeout()
-	userAgent := "phoenix/" + e.version
+	userAgent := "Phoenix/" + e.version
 	client := &http.Client{Timeout: cfg.RequestTimeout()}
 	fanout := &notify.Fanout{
 		OnChannelError: func(msg notify.Message, err error) { e.notifyFailed("", msg, err) },
@@ -736,7 +736,7 @@ func (e *Engine) CheckRelease() error {
 // monitoring.
 func (e *Engine) readRelease(ctx context.Context, cfg config.Config) error {
 	e.releaseTried = e.now()
-	latest, err := release.Latest(ctx, &http.Client{Timeout: cfg.RequestTimeout()}, "phoenix/"+e.version)
+	latest, err := release.Latest(ctx, &http.Client{Timeout: cfg.RequestTimeout()}, "Phoenix/"+e.version)
 	if err != nil {
 		e.logf("debug", "检查新版本失败：%v", err)
 		return err
