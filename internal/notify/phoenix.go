@@ -81,6 +81,20 @@ func providerDisplayName(provider string) string {
 	}
 }
 
+// cleanLabel strips the account suffix ("#name", or a masked "#xx" when
+// two accounts share a name) from a group label, so titles and the 模型
+// line name the service only ("GPT", "Gemini", "Claude / GPT"). The
+// account itself stays on the 账号 line. Labels without a suffix pass
+// through unchanged.
+func cleanLabel(label string) string {
+	if i := strings.Index(label, "#"); i >= 0 {
+		if clean := strings.TrimSpace(label[:i]); clean != "" {
+			return clean
+		}
+	}
+	return label
+}
+
 // modelLine renders the 模型 line: "Codex / GPT" for the Codex main group,
 // "Antigravity / Gemini" for an Antigravity group, just "Claude" when
 // provider and group share the name.
@@ -178,7 +192,7 @@ func groupWindow(g Group, kind string) *quota.Window {
 // phoenixBody assembles the body of a notification in the Phoenix style:
 // 账号 / 模型, the 5H/7D quota lines when withWindows, 状态, 时间.
 func phoenixBody(g Group, status string, withWindows bool, now time.Time) string {
-	lines := []string{accountLine(g), "模型：" + modelLine(groupProvider(g), g.Label)}
+	lines := []string{accountLine(g), "模型：" + modelLine(groupProvider(g), cleanLabel(g.Label))}
 	if withWindows {
 		if l := quotaWindowLine("5H", groupWindow(g, quota.KindFiveHour), now); l != "" {
 			lines = append(lines, l)
@@ -207,14 +221,14 @@ func quotaStatusMessage(g Group, trigger, severity string, now time.Time) (title
 		emoji, kind = "🟡 🟡 🟡", "额度不足预警"
 		status = "Warning（" + windowShort(trigger) + " 额度不足）"
 	}
-	title = fmt.Sprintf("%s %s %s", emoji, g.Label, kind)
+	title = fmt.Sprintf("%s %s %s", emoji, cleanLabel(g.Label), kind)
 	return title, phoenixBody(g, status, true, now)
 }
 
 // quotaReminderMessage builds the title/body for a reset reminder: the same
 // layout, with the reset countdown as the 状态.
 func quotaReminderMessage(g Group, trigger string, untilReset time.Duration, now time.Time) (title, body string) {
-	title = fmt.Sprintf("⏰ ⏰ ⏰ %s 重置提醒", g.Label)
+	title = fmt.Sprintf("⏰ ⏰ ⏰ %s 重置提醒", cleanLabel(g.Label))
 	status := fmt.Sprintf("Reminder（%s 窗口将于 %s 后重置）", windowShort(trigger), formatQuotaRemaining(untilReset))
 	return title, phoenixBody(g, status, true, now)
 }
