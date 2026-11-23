@@ -15,10 +15,12 @@ import (
 )
 
 // pendingNotify is one queued notification. kind selects the follow-up
-// bookkeeping that runs after a successful send.
+// bookkeeping that runs after a successful send. group is the quota-group
+// key the notification belongs to (main group key for main windows).
 type pendingNotify struct {
 	kind      string // "threshold" | "recovery" | "reminder" | "stale_cooldown" | "credential" | "circuit"
 	authIndex string
+	group     string
 	window    string
 	severity  string // target severity, for threshold notifies
 	title     string
@@ -64,10 +66,14 @@ func normalizeAlertModes(a *AlertConfig) {
 
 // evaluateWindowAlertsLocked compares one fresh window sample with its
 // stored baseline and queues threshold, recovery and reminder notifications.
-// Caller must hold rt.mu (write). now is the observation time.
-func (rt *runtime) evaluateWindowAlertsLocked(acct *accountState, kind string, sample windowState, source string, now time.Time) {
-	base := rt.state.baseline(acct.AuthIndex, kind)
+// groupKey is the quota-group key the window belongs to (baselines are
+// keyed by group key, not auth_index, so two groups of one credential never
+// share a baseline). Caller must hold rt.mu (write). now is the observation
+// time.
+func (rt *runtime) evaluateWindowAlertsLocked(acct *accountState, groupKey, kind string, sample windowState, source string, now time.Time) {
+	base := rt.state.baseline(groupKey, kind)
 	severity := severityFor(sample.Remaining, rt.cfg.Alerts.Thresholds)
+	title := acct.groupTitle(groupKey)
 
 	// --- recovery detection: the reset time moved to a new window, the old
 	// reset time passed, or remaining rose by >= 5 points (Lamplighter
@@ -90,7 +96,7 @@ func (rt *runtime) evaluateWindowAlertsLocked(acct *accountState, kind string, s
 		if mode != "off" && (mode == "all" || wasExhausted) {
 			prev := base.Remaining
 			base.PendingRecovery = &pendingRecovery{At: now.Unix(), Previous: &prev, Exhausted: wasExhausted}
-			rt.queueRecoveryLocked(acct, kind, base.PendingRecovery, now)
+			rt.queueRecoveryLocked(acct, groupKey, kind, base.PendingRecovery, now)
 		} else if base.PendingRecovery != nil {
 			base.PendingRecovery = nil
 		}
@@ -104,9 +110,9 @@ func (rt *runtime) evaluateWindowAlertsLocked(acct *accountState, kind string, s
 	// so a later crossing notifies again.
 	if severityRank(severity) > severityRank(base.NotifiedSeverity) {
 		label, _, _ := windowLabel(kind)
-		title := fmt.Sprintf("Phoenix 额度提醒：%s %s", acct.Title, label)
+		notifyTitle := fmt.Sprintf("Phoenix 额度提醒：%s %s", title, label)
 		body := fmt.Sprintf("凭证 %s（%s）剩余额度 %.0f%%，重置时间 %s。", acct.AuthIndex, label, sample.Remaining, formatResetTime(sample.Reset))
-		rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "threshold", authIndex: acct.AuthIndex, window: kind, severity: severity, title: title, body: body})
+		rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "threshold", authIndex: acct.AuthIndex, group: groupKey, window: kind, severity: severity, title: notifyTitle, body: body})
 	} else if severityRank(severity) < severityRank(base.NotifiedSeverity) {
 		base.NotifiedSeverity = severity
 	}
@@ -116,9 +122,10 @@ func (rt *runtime) evaluateWindowAlertsLocked(acct *accountState, kind string, s
 
 	// --- reset reminders: 5h window 1h ahead, 7d window 1 day ahead,
 	// deduped per reset time. 7d reminders only fire when more than the
-	// critical threshold is left (mode "has_remaining").
+	// critical threshold is left (mode "has_remaining"). Reset reminders
+	// stay Codex-only: other providers have no reset-credit mechanism.
 	mode := rt.reminderModeFor(kind)
-	if mode != "off" && !sample.Reset.IsZero() {
+	if groupProvider(groupKey) == "codex" && mode != "off" && !sample.Reset.IsZero() {
 		ahead := time.Hour
 		noticeField := "1h"
 		if kind == windowSevenDay {
@@ -136,9 +143,9 @@ func (rt *runtime) evaluateWindowAlertsLocked(acct *accountState, kind string, s
 				(mode == "has_remaining" && sample.Remaining > criticalThreshold(rt.cfg.Alerts.Thresholds))
 			if allowed && already != resetKey {
 				label, _, _ := windowLabel(kind)
-				title := fmt.Sprintf("Phoenix 重置提醒：%s %s", acct.Title, label)
+				notifyTitle := fmt.Sprintf("Phoenix 重置提醒：%s %s", title, label)
 				body := fmt.Sprintf("凭证 %s（%s）将在 %s 后重置，当前剩余额度 %.0f%%。", acct.AuthIndex, label, formatDuration(untilReset), sample.Remaining)
-				rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "reminder", authIndex: acct.AuthIndex, window: kind, title: title, body: body})
+				rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "reminder", authIndex: acct.AuthIndex, group: groupKey, window: kind, title: notifyTitle, body: body})
 			}
 		}
 	}
@@ -176,21 +183,22 @@ func formatDuration(d time.Duration) string {
 }
 
 // queueRecoveryLocked queues the notification for a pending recovery.
-func (rt *runtime) queueRecoveryLocked(acct *accountState, kind string, rec *pendingRecovery, now time.Time) {
+func (rt *runtime) queueRecoveryLocked(acct *accountState, groupKey, kind string, rec *pendingRecovery, now time.Time) {
 	label, _, _ := windowLabel(kind)
-	title := fmt.Sprintf("Phoenix 额度已恢复：%s %s", acct.Title, label)
+	title := fmt.Sprintf("Phoenix 额度已恢复：%s %s", acct.groupTitle(groupKey), label)
 	prev := "未知"
 	if rec.Previous != nil {
 		prev = fmt.Sprintf("%.0f%%", *rec.Previous)
 	}
 	body := fmt.Sprintf("凭证 %s（%s）额度已恢复，上一周期结束时剩余 %s。", acct.AuthIndex, label, prev)
-	rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "recovery", authIndex: acct.AuthIndex, window: kind, title: title, body: body})
+	rt.pendingNotifies = append(rt.pendingNotifies, pendingNotify{kind: "recovery", authIndex: acct.AuthIndex, group: groupKey, window: kind, title: title, body: body})
 }
 
 // retryPendingRecoveriesLocked re-queues undelivered recovery notifications
 // younger than one hour and drops older ones. Called once per poll tick.
+// Baselines are keyed by group key; the account is resolved from it.
 func (rt *runtime) retryPendingRecoveriesLocked(now time.Time) {
-	for authIndex, byWindow := range rt.state.Baselines {
+	for groupKey, byWindow := range rt.state.Baselines {
 		for kind, base := range byWindow {
 			rec := base.PendingRecovery
 			if rec == nil {
@@ -207,11 +215,11 @@ func (rt *runtime) retryPendingRecoveriesLocked(now time.Time) {
 				rt.stateDirty = true
 				continue
 			}
-			acct := rt.accounts[authIndex]
+			acct := rt.accounts[groupAuthIndex(groupKey)]
 			if acct == nil {
 				continue
 			}
-			rt.queueRecoveryLocked(acct, kind, rec, now)
+			rt.queueRecoveryLocked(acct, groupKey, kind, rec, now)
 		}
 	}
 }
@@ -237,13 +245,20 @@ func (rt *runtime) drainPending() {
 		}
 		rt.mu.Lock()
 		rt.lastNotifyErr = ""
+		// Bookkeeping is keyed by group key (baselines migrated in
+		// 0.0.11); notifications queued before the migration carry only an
+		// auth index, which still resolves as a bare group key.
+		baselineKey := n.group
+		if baselineKey == "" {
+			baselineKey = n.authIndex
+		}
 		switch n.kind {
 		case "threshold":
-			rt.state.baseline(n.authIndex, n.window).NotifiedSeverity = n.severity
+			rt.state.baseline(baselineKey, n.window).NotifiedSeverity = n.severity
 		case "recovery":
-			rt.state.baseline(n.authIndex, n.window).PendingRecovery = nil
+			rt.state.baseline(baselineKey, n.window).PendingRecovery = nil
 		case "reminder":
-			base := rt.state.baseline(n.authIndex, n.window)
+			base := rt.state.baseline(baselineKey, n.window)
 			acct := rt.accounts[n.authIndex]
 			if acct != nil {
 				if w := acct.Windows[n.window]; w != nil && !w.Reset.IsZero() {

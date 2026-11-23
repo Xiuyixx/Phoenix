@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.11 - 2026-11-23
+
+- 多服务支持：额度轮询与自动点火从 Codex-only 扩展到 Claude 与 Antigravity（按 Lamplighter 的 provider 实现改写）。Claude 查 `api.anthropic.com/api/oauth/usage`（5 小时、7 天窗口，Opus/Sonnet/OAuth Apps/Cowork 各为独立额度组，Fable 由 `limits[]` 的 weekly_scoped 项解析），Antigravity 查 `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`（3 个 URL 依次回退，Hub 版本缓存 3 小时），按模型分 Gemini 与 Claude / GPT 两个独立额度组；Kimi 与 Grok 在服务列表中标记为不支持，不参与轮询与点火。点火按服务区分协议与候选模型：Codex `openai-response`（最新 luna 优先）、Claude `claude` 协议（最新 Haiku 优先，其次 Sonnet）、Antigravity `openai` 协议（Gemini 组最新 Flash 优先，Claude / GPT 组 Haiku > Sonnet > Opus > GPT-OSS）；Antigravity 自动点火默认关闭，开启后默认只点 Gemini 组。已配置的点火模型始终优先（Codex 的 `gpt-6-luna` 永不重置），每服务可配开关、模型与额度组，`PUT /settings` 的 `providers` 按服务合并，不会互相清空。
+- 额度组模型：账号下除主组外可有额外额度组（Claude 额外窗口、Antigravity 各模型组），`state.json` 的基线与目标改以组 key（`codex:<idx>:codex:main` / `claude:<idx>:<窗口>` / `antigravity:<idx>:<slug>`）键入，旧的裸 `auth_index` 键在加载时迁移；历史图表按组分系列，额外组标注为“账号 · 来源”；提醒（阈值/恢复）按组窗口评估，重置提醒仍只针对 Codex。点火确认改为按服务重新查询该凭证额度，直到观测到固定的未来 5 小时重置。
+- 修复模型列表 API key 保存失败：页面此前用 `fetch("/v1/models")` 直接向页面源校验，请求经 nginx 代理到 CPA 时 Authorization 头被丢掉，CPA 永远回 401，正确 key 也存不下去。现改走插件路由 `POST /check-models-key`（插件直连 CPA 校验），返回 `{ok}` / `{refused}`（401/403）/ `{reason}`（结论不明时允许保存）；`status.config` 的 `models_api_key` 恒为 `""`，新增 `models_api_key_set` 布尔；设置页 key 输入框已设置时保持为空并显示“已设置”，留空保存不发送该键（`PUT /settings` 中 `models_api_key` 缺席或 `""` = 不改动，`null` = 清空）。
+- 新增回归测试 15 个（共 57 个，含 `-race`）：服务归一化与别名（含 xai/Grok 注册 ID）、Claude/Antigravity 额度解析与被动头、各服务点火候选排序、配置模型优先级、providers 合并与 YAML groups 解析、组点火开关与 Antigravity 默认关闭、`/reset` 拒绝非 Codex、状态键迁移、`/check-models-key` 三种返回、历史额外组系列、configFields 声明、PUT 换 key 后模型缓存预热。Grok 注册 ID 按 Lamplighter 为 `xai`（`grok` 为别名），Fable 窗口 ID 为 `seven-day-fable`；`PUT /settings` 换 key 后后台预热模型列表，`next_models` 及时更新；`configFields` 补齐 `models_api_key` / `cpa_base_url` / `providers` / 阈值等声明。
+- 已知限制：Claude 与 Antigravity 只有单元测试，没有真机验证——测试服务器上没有 Claude 账号，且 Codex 凭证文件已丢失，无法做端到端验证。
+
 ## 0.0.10 - 2026-11-23
 
 - 面板按 Lamplighter 完全复刻：page.html/page.css/page.js 以 Lamplighter 原文件为底本逐字复制（628 行 CSS、暖灰纸面、三主题、1200px 容器、图表/筛选/排序/刷新/横幅/事件/设置分区、i18n 与语言/主题跟随、config_token 保存流），只做品牌与 Phoenix 差异手术；logo 用用户提供的图（web/logo.jpg，白底圆角小框 30×30 原样使用，base64 内嵌进插件，无远程请求）。

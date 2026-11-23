@@ -1,16 +1,16 @@
 # Phoenix
 
-Phoenix 是一个面向 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的原生插件，围绕 Codex 订阅凭证提供额度状态、账号错误通知、Telegram 推送、reset credit 自动重置以及管理页面操作入口。
+Phoenix 是一个面向 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的原生插件，围绕 Codex、Claude 与 Antigravity 订阅凭证提供额度状态、账号错误通知、Telegram 推送、reset credit 自动重置（仅 Codex）以及管理页面操作入口。Kimi 与 Grok 在服务列表中标记为不支持，不参与轮询与点火。
 
 项目名称取自“重生”：当周用量窗口耗尽且账号仍有 reset credit 时，Phoenix 可以消耗一张 credit，清除 CLIProxyAPI 对该凭证的本地冷却，让凭证恢复可调度状态。
 
-> 当前版本：`0.0.10`。项目仍在持续开发中，安装到生产 CPA 前建议先使用测试凭证验证上游 reset credit 接口和 CPA 版本兼容性。
+> 当前版本：`0.0.11`。项目仍在持续开发中，安装到生产 CPA 前建议先使用测试凭证验证上游 reset credit 接口和 CPA 版本兼容性。
 
 ## 主要功能
 
 ### 额度与账号状态
 
-Phoenix 通过两条路径收集额度数据：主动轮询按 `poll_interval_seconds`（默认 300 秒）枚举 Codex 凭证并查询上游 `/wham/usage`，按窗口时长识别 5 小时窗口与周窗口；被动接收 CPA 的 usage 回调，成功记为正常、`usage_limit_reached` 的 429 记为对应窗口耗尽并记录重置时间。页面新增“最近事件”列表，账号异常、重置与点火结果都会记录在内。
+Phoenix 通过两条路径收集额度数据：主动轮询按 `poll_interval_seconds`（默认 300 秒）枚举凭证并按服务查询上游额度——Codex 查 `/wham/usage`（按窗口时长识别 5 小时窗口与周窗口）、Claude 查 `api.anthropic.com/api/oauth/usage`（5 小时、7 天窗口，另有 Opus/Sonnet/OAuth Apps 等独立窗口与 Fable 窗口）、Antigravity 查 `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`（按模型分 Gemini 与 Claude / GPT 两个独立额度组）；被动接收 CPA 的 usage 回调，成功记为正常、`usage_limit_reached` 的 429 记为对应窗口耗尽并记录重置时间（Claude 被动头 `Anthropic-Ratelimit-Unified-*` 也会解析）。页面新增“最近事件”列表，账号异常、重置与点火结果都会记录在内。
 
 额度采样会持久化到插件数据目录下的历史文件（默认保留 40 天），管理页面用“额度变化”图表展示：总览按采样点着色（满/高/中/低/空五档），可点开单账号详情曲线（含匀速参考线、预测线与重置标记），支持 5 小时 / 7 天窗口与时间范围切换。
 
@@ -72,7 +72,7 @@ Bot Token 只用于调用 Telegram Bot API，不写入 Git 仓库。配置文件
 
 立即重置只走重置流程（消耗 reset credit 并清除 CPA 本地冷却），立即点火只走点火流程，两者互不触发。手动重置不再像之前那样自动跟一点火；自动重置成功后仍会按配置的延迟自动点火一次。按钮请求会被记录到 CPA 日志，页面会反馈请求已提交。
 
-点火通过宿主的模型执行回调发送一次最小 Codex 请求（只要求回复 `OK`，不推理、不用工具），从而开始一个新的 5 小时窗口；点火后会多次复查，确认出现固定的未来 5 小时重置才算成功，否则报未确认并按退避重试，多次失败后熔断到次日开始。自动点火在每日开始—结束（加宽限分钟）时段内按 5 小时窗口的重置时间调度。点火模型按插件当前配置显示，不会被页面重置为默认值；设置了模型列表 API key 后，插件会从 CPA 的 `/v1/models` 读取候选模型（最新 luna 优先），但已配置的模型始终优先。
+点火通过宿主的模型执行回调发送一次最小请求（只要求回复 `OK`，不推理、不用工具），从而开始一个新的 5 小时窗口；点火后会多次复查，确认出现固定的未来 5 小时重置才算成功，否则报未确认并按退避重试，多次失败后熔断到次日开始。自动点火在每日开始—结束（加宽限分钟）时段内按 5 小时窗口的重置时间调度。点火按服务区分：Codex 用 `openai-response` 协议（最新 luna 优先）、Claude 用 `claude` 协议（最新 Haiku 优先，其次 Sonnet）、Antigravity 用 `openai` 协议（Gemini 组最新 Flash 优先，Claude / GPT 组 Haiku > Sonnet > Opus > GPT-OSS）；Antigravity 自动点火默认关闭，开启后默认只点 Gemini 组。点火模型按插件当前配置显示，不会被页面重置为默认值；设置了模型列表 API key 后，插件会从 CPA 的 `/v1/models` 读取候选模型，但已配置的模型始终优先（Codex 为 `ignition.model`，默认 `gpt-6-luna` 的用户配置永不重置）。
 
 ## 兼容性与构建平台
 
@@ -104,12 +104,12 @@ uname -m
 
 ### 1. 下载正确的 Release 包
 
-打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.0.10`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
+打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.0.11`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
 
 Linux amd64 示例：
 
 ```bash
-VERSION=0.0.10
+VERSION=0.0.11
 mkdir -p /tmp/phoenix-$VERSION
 cd /tmp/phoenix-$VERSION
 curl -fL -o phoenix.zip "https://github.com/Xiuyixx/Phoenix/releases/download/v$VERSION/phoenix_${VERSION}_linux_amd64.zip"
@@ -127,7 +127,7 @@ unzip -o phoenix.zip
 Windows 使用 PowerShell 校验：
 
 ```powershell
-$version = "0.0.10"
+$version = "0.0.11"
 $file = "phoenix_${version}_windows_amd64.zip"
 (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
 Get-Content "${file}.sha256"
@@ -277,7 +277,11 @@ sha256sum -c dist/checksums.txt
 | `ignition.grace_seconds` | 额度窗口重置后等待的秒数。 |
 | `ignition.failure_retry_seconds` | 点火瞬时失败后的重试间隔（秒），默认 `300`。 |
 | `ignition.max_transient_failures` | 点火熔断前的瞬时失败上限，默认 `3`。 |
-| `ignition.model` | 点火使用的模型，默认 `gpt-5-codex`。 |
+| `ignition.model` | Codex 点火使用的模型，默认 `gpt-5-codex`（与 `providers.codex.model` 同步）。 |
+| `providers.codex.ignite` / `providers.codex.model` | Codex 自动点火开关与点火模型（模型即 `ignition.model`）。 |
+| `providers.claude.ignite` / `providers.claude.model` | Claude 自动点火开关与点火模型（留空为最新 Haiku 优先）。 |
+| `providers.antigravity.ignite` / `providers.antigravity.model` | Antigravity 自动点火开关（默认关闭）与点火模型（留空按额度组选模型）。 |
+| `providers.antigravity.groups` | Antigravity 自动点火的额度组，开启后默认只点 `Gemini`；可填 `Gemini, Claude / GPT`。 |
 | `ignition.models_api_key` | 从 CPA 读取模型列表用的 API key（请用专用 key，不要填管理密钥）。 |
 | `ignition.cpa_base_url` | CPA 地址，用于读取模型列表，默认 `http://127.0.0.1:8317`，请按 CPA 实际监听地址填写。 |
 | `poll_interval_seconds` | 主动额度查询间隔（秒），默认 `300`，最小 `60`。 |
@@ -310,7 +314,7 @@ sha256sum -c dist/checksums.txt
 
 ### 页面显示运行中但没有账号数据
 
-这通常表示插件已加载，但 CPA 尚未产生可识别的 usage 记录，或上游响应没有可解析的额度字段。先通过 CPA 发起一次 Codex 请求，再查看 Phoenix 页面和 CPA 日志。
+这通常表示插件已加载，但 CPA 尚未产生可识别的 usage 记录，或上游响应没有可解析的额度字段。先通过 CPA 发起一次对应服务的请求，再查看 Phoenix 页面和 CPA 日志。
 
 ### 设置保存后没有生效
 
@@ -345,18 +349,18 @@ sha256sum -c dist/checksums.txt
 
 ## 版本与发布流程
 
-版本号统一保存在 `VERSION`，并同步到 `main.go` 和 `CHANGELOG.md`。当前版本为 `0.0.10`。
+版本号统一保存在 `VERSION`，并同步到 `main.go` 和 `CHANGELOG.md`。当前版本为 `0.0.11`。
 
 后续每次功能、修复或文档变更都递增版本号，例如从 `0.0.10` 到 `0.0.11`，完成验证后执行：
 
 ```bash
-make check-version VERSION=0.0.10
+make check-version VERSION=0.0.11
 go test ./...
 git add .
 git commit -m "..."
 git push origin master
-git tag -a v0.0.10 -m "Phoenix v0.0.10"
-git push origin v0.0.10
+git tag -a v0.0.11 -m "Phoenix v0.0.11"
+git push origin v0.0.11
 ```
 
 推送版本 tag 后，GitHub Actions 会自动构建并发布：

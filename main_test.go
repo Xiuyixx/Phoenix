@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -630,7 +632,7 @@ func TestThresholdCrossingNotifyOnce(t *testing.T) {
 		t.Helper()
 		rt.mu.Lock()
 		rt.pendingNotifies = nil
-		rt.evaluateWindowAlertsLocked(acct, "5h", windowState{Remaining: remaining, Reset: now.Add(5 * time.Hour), ObservedAt: now}, "active", now)
+		rt.evaluateWindowAlertsLocked(acct, "codex:0:codex:main", "5h", windowState{Remaining: remaining, Reset: now.Add(5 * time.Hour), ObservedAt: now}, "active", now)
 		n := len(rt.pendingNotifies)
 		rt.mu.Unlock()
 		return n
@@ -643,7 +645,7 @@ func TestThresholdCrossingNotifyOnce(t *testing.T) {
 	}
 	// Simulate a successful send.
 	rt.mu.Lock()
-	rt.state.baseline("0", "5h").NotifiedSeverity = "low"
+	rt.state.baseline("codex:0:codex:main", "5h").NotifiedSeverity = "low"
 	rt.mu.Unlock()
 	if n := eval(12); n != 0 {
 		t.Errorf("12%% (still low) queued %d notifies, want 0", n)
@@ -652,7 +654,7 @@ func TestThresholdCrossingNotifyOnce(t *testing.T) {
 		t.Fatalf("5%% (critical) queued %d notifies, want 1", n)
 	}
 	rt.mu.Lock()
-	rt.state.baseline("0", "5h").NotifiedSeverity = "critical"
+	rt.state.baseline("codex:0:codex:main", "5h").NotifiedSeverity = "critical"
 	rt.mu.Unlock()
 	if n := eval(80); n != 0 {
 		t.Errorf("80%% (recovered) queued %d notifies, want 0", n)
@@ -669,15 +671,15 @@ func TestRecoveryDetection(t *testing.T) {
 	now := time.Now()
 	acct := &accountState{AuthIndex: "0", Title: "凭证 0", Windows: map[string]*windowState{}}
 	rt.mu.Lock()
-	base := rt.state.baseline("0", "5h")
+	base := rt.state.baseline("codex:0:codex:main", "5h")
 	base.Remaining = 0
 	base.Reset = now.Add(time.Hour).Format(time.RFC3339)
 	base.Exhausted = true
 	base.NotifiedSeverity = "exhausted"
 	rt.pendingNotifies = nil
-	rt.evaluateWindowAlertsLocked(acct, "5h", windowState{Remaining: 98, Reset: now.Add(6 * time.Hour), ObservedAt: now}, "active", now)
+	rt.evaluateWindowAlertsLocked(acct, "codex:0:codex:main", "5h", windowState{Remaining: 98, Reset: now.Add(6 * time.Hour), ObservedAt: now}, "active", now)
 	queued := len(rt.pendingNotifies)
-	rec := rt.state.baseline("0", "5h").PendingRecovery
+	rec := rt.state.baseline("codex:0:codex:main", "5h").PendingRecovery
 	rt.mu.Unlock()
 	if queued != 1 {
 		t.Fatalf("recovery queued %d notifies, want 1", queued)
@@ -852,7 +854,7 @@ func TestIgniteForSuccess(t *testing.T) {
 		t.Fatalf("model calls = %v, want [gpt-6-luna]", host.modelCalls)
 	}
 	rt.mu.RLock()
-	ts := rt.state.Targets["0"]
+	ts := rt.state.Targets["codex:0:codex:main"]
 	events := rt.events
 	rt.mu.RUnlock()
 	if ts == nil || ts.LastSuccess.IsZero() || ts.LastModel != "gpt-6-luna" {
@@ -975,18 +977,18 @@ func TestResolveDataDir(t *testing.T) {
 func TestStateRoundTrip(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
 	s := newPersistedState()
-	s.baseline("0", "5h").NotifiedSeverity = "low"
-	s.baseline("0", "5h").Remaining = 15
-	s.target("0").ConsecutiveFailures = 2
+	s.baseline("codex:0:codex:main", "5h").NotifiedSeverity = "low"
+	s.baseline("codex:0:codex:main", "5h").Remaining = 15
+	s.target("codex:0:codex:main").ConsecutiveFailures = 2
 	s.CredProblems["0"] = &credProblem{Kind: "auth", Fingerprint: "auth:x", Confirmed: true, Failures: 3}
 	if err := savePersistedState(dir, s); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
 	loaded := loadPersistedState(dir)
-	if loaded.baseline("0", "5h").NotifiedSeverity != "low" {
+	if loaded.baseline("codex:0:codex:main", "5h").NotifiedSeverity != "low" {
 		t.Errorf("baseline not persisted: %+v", loaded.Baselines)
 	}
-	if loaded.target("0").ConsecutiveFailures != 2 {
+	if loaded.target("codex:0:codex:main").ConsecutiveFailures != 2 {
 		t.Errorf("target not persisted: %+v", loaded.Targets)
 	}
 	if loaded.CredProblems["0"] == nil || loaded.CredProblems["0"].Kind != "auth" {
@@ -1077,8 +1079,8 @@ func TestPollOnceMatchesTypeOnlyCodex(t *testing.T) {
 // TestPollOnceNoCodexCredentialIsLoud: when the host lists credentials but
 // none matches as Codex, pollOnce must say so in listErr (surfaced by the
 // panel's notices banner) instead of finishing silently with an empty panel.
-func TestPollOnceNoCodexCredentialIsLoud(t *testing.T) {
-	host := &fakeHost{authListEntries: []pluginapi.HostAuthFileEntry{{ID: "id-1", AuthIndex: "1", Name: "claude-a.json", Provider: "claude"}}}
+func TestPollOnceNoSupportedCredentialIsLoud(t *testing.T) {
+	host := &fakeHost{authListEntries: []pluginapi.HostAuthFileEntry{{ID: "id-1", AuthIndex: "1", Name: "kimi-a.json", Provider: "kimi"}}}
 	rt := newTestRuntime(host)
 	rt.pollOnce()
 	if host.usageCalls != 0 {
@@ -1088,7 +1090,7 @@ func TestPollOnceNoCodexCredentialIsLoud(t *testing.T) {
 	listErr := rt.listErr
 	rt.mu.RUnlock()
 	if listErr == "" {
-		t.Errorf("listErr is empty, want a message explaining no Codex credential matched")
+		t.Errorf("listErr is empty, want a message explaining no supported credential matched")
 	}
 }
 
@@ -1301,13 +1303,42 @@ func TestStatusLamplighterShape(t *testing.T) {
 		t.Errorf("timezone is empty")
 	}
 	providers, ok := st["providers"].([]map[string]any)
-	if !ok || len(providers) != 1 || providers[0]["id"] != "codex" {
-		t.Errorf("providers = %v, want one codex entry", st["providers"])
-	} else if hint, _ := providers[0]["model_hint"].(map[string]any); hint["zh"] != "最新的 Luna" {
-		t.Errorf("model_hint = %v, want zh 最新的 Luna", providers[0]["model_hint"])
+	wantProviders := []struct{ id, title string }{
+		{"codex", "GPT"}, {"claude", "Claude"}, {"antigravity", "Antigravity"}, {"kimi", "Kimi"}, {"xai", "Grok"},
 	}
-	if go_, _ := st["group_order"].([]string); len(go_) != 1 || go_[0] != "GPT" {
-		t.Errorf("group_order = %v, want [GPT]", st["group_order"])
+	if !ok || len(providers) != len(wantProviders) {
+		t.Errorf("providers = %v, want %d entries", st["providers"], len(wantProviders))
+	} else {
+		for i, want := range wantProviders {
+			if providers[i]["id"] != want.id || providers[i]["title"] != want.title {
+				t.Errorf("providers[%d] = %v/%v, want %s/%s", i, providers[i]["id"], providers[i]["title"], want.id, want.title)
+			}
+		}
+		if hint, _ := providers[0]["model_hint"].(map[string]any); hint["zh"] != "最新的 Luna" {
+			t.Errorf("model_hint = %v, want zh 最新的 Luna", providers[0]["model_hint"])
+		}
+		if hint, _ := providers[1]["model_hint"].(map[string]any); hint["zh"] != "最新的 Haiku" {
+			t.Errorf("claude model_hint = %v, want zh 最新的 Haiku", providers[1]["model_hint"])
+		}
+		if hint, _ := providers[2]["model_hint"].(map[string]any); hint["zh"] != "最新的 Flash" {
+			t.Errorf("antigravity model_hint = %v, want zh 最新的 Flash", providers[2]["model_hint"])
+		}
+		if groups, _ := providers[2]["groups"].([]string); len(groups) != 2 || groups[0] != "Gemini" || groups[1] != "Claude / GPT" {
+			t.Errorf("antigravity groups = %v, want [Gemini Claude / GPT]", providers[2]["groups"])
+		}
+		if providers[3]["ignite"] != false || providers[4]["ignite"] != false {
+			t.Errorf("kimi/xai ignite = %v/%v, want false/false", providers[3]["ignite"], providers[4]["ignite"])
+		}
+	}
+	wantOrder := []string{"Claude", "GPT", "Gemini", "Kimi", "Grok", "Fable", "Claude / GPT"}
+	if go_, _ := st["group_order"].([]string); len(go_) != len(wantOrder) {
+		t.Errorf("group_order = %v, want %v", st["group_order"], wantOrder)
+	} else {
+		for i, want := range wantOrder {
+			if go_[i] != want {
+				t.Errorf("group_order[%d] = %q, want %q", i, go_[i], want)
+			}
+		}
 	}
 	for _, key := range []string{"config_error", "list_error", "notify_error", "models_error"} {
 		if _, ok := st[key]; !ok {
@@ -1499,5 +1530,649 @@ func TestHistorySeriesLamplighterFields(t *testing.T) {
 	ev := events[0]
 	if ev["kind"] != "ignite" || ev["level"] != "ok" || ev["group"] != "codex:0:codex:main" || ev["label"] != "GPT" {
 		t.Errorf("event = %v, want kind ignite level ok group codex:0:codex:main label GPT", ev)
+	}
+}
+
+// --- v0.0.11 multi-provider tests ---
+
+// TestProviderNormalization covers providerOf (Provider first, Type
+// fallback, aliases) and the group-key helpers.
+func TestProviderNormalization(t *testing.T) {
+	cases := []struct{ provider, typ, want string }{
+		{"codex", "", "codex"},
+		{"Claude", "", "claude"},
+		{"", "Claude", "claude"},
+		{"ANTIGRAVITY", "", "antigravity"},
+		{"kimi-ai", "", "kimi"},
+		{"kimi.com", "", "kimi"},
+		{"kimi_ai", "", "kimi"},
+		{"x-ai", "", "xai"},
+		{"xai", "", "xai"},
+		{"grok", "", "xai"},
+		{"", "", ""},
+		{"some_new_provider", "", "some-new-provider"},
+	}
+	for _, c := range cases {
+		got := providerOf(pluginapi.HostAuthFileEntry{Provider: c.provider, Type: c.typ})
+		if got != c.want {
+			t.Errorf("providerOf(%q/%q) = %q, want %q", c.provider, c.typ, got, c.want)
+		}
+	}
+	if got := normalizeProviderID("Claude"); got != "claude" {
+		t.Errorf("normalizeProviderID(Claude) = %q, want claude", got)
+	}
+	if got := normalizeProviderID("unknown_x"); got != "unknown-x" {
+		t.Errorf("normalizeProviderID(unknown_x) = %q, want unknown-x", got)
+	}
+	if got := mainGroupKey("claude", "2"); got != "claude:2:claude:main" {
+		t.Errorf("mainGroupKey(claude, 2) = %q", got)
+	}
+	if got := groupKeyFor("antigravity", "1", "gemini"); got != "antigravity:1:gemini" {
+		t.Errorf("groupKeyFor = %q", got)
+	}
+	provider, index, raw, ok := parseGroupKey("claude:2:claude:main")
+	if !ok || provider != "claude" || index != "2" || raw != "claude:main" {
+		t.Errorf("parseGroupKey = %q/%q/%q/%v", provider, index, raw, ok)
+	}
+	provider, index, raw, ok = parseGroupKey("0")
+	if !ok || provider != "codex" || index != "0" || raw != "codex:main" {
+		t.Errorf("parseGroupKey(0) = %q/%q/%q/%v, want codex/0/codex:main", provider, index, raw, ok)
+	}
+	if _, _, _, ok := parseGroupKey(""); ok {
+		t.Errorf("parseGroupKey(\"\") must not parse")
+	}
+}
+
+// TestParseClaudeUsage covers the main group (5h+7d), an extra window
+// (Opus), the Fable window from limits[], utilization math, and the
+// bad-payload error.
+func TestParseClaudeUsage(t *testing.T) {
+	payload := map[string]any{
+		"five_hour":        map[string]any{"utilization": 30.0, "resets_at": "2026-11-24T00:00:00Z"},
+		"seven_day":        map[string]any{"utilization": 10.0, "resets_at": "2026-11-30T00:00:00Z"},
+		"seven_day_opus":   map[string]any{"utilization": 50.0, "resets_at": "2026-11-30T00:00:00Z"},
+		"seven_day_sonnet": map[string]any{"utilization": "not-a-number", "resets_at": "2026-11-30T00:00:00Z"},
+		"limits": []any{map[string]any{
+			"kind": "weekly_scoped", "percent": 20.0, "resets_at": "2026-11-30T00:00:00Z", "is_active": true,
+			"scope": map[string]any{"model": map[string]any{"display_name": "Fable 5"}},
+		}},
+	}
+	groups, err := ParseClaudeUsage(payload)
+	if err != nil {
+		t.Fatalf("ParseClaudeUsage: %v", err)
+	}
+	byKey := map[string]quotaGroup{}
+	for _, g := range groups {
+		byKey[g.Key] = g
+	}
+	main, ok := byKey["claude:main"]
+	if !ok || len(main.Windows) != 2 || main.SourceLabel != "Claude" {
+		t.Fatalf("main group = %+v, want 2 windows", main)
+	}
+	remaining := map[string]float64{}
+	for _, w := range main.Windows {
+		remaining[w.ID] = w.Remaining
+		if w.Reset.IsZero() {
+			t.Errorf("window %s has no reset time", w.ID)
+		}
+	}
+	if remaining["5h"] != 70 || remaining["7d"] != 90 {
+		t.Errorf("main remaining = %v, want 5h 70 / 7d 90", remaining)
+	}
+	opus, ok := byKey["claude:seven-day-opus"]
+	if !ok || len(opus.Windows) != 1 || opus.Windows[0].Remaining != 50 || opus.SourceLabel != "Claude" {
+		t.Errorf("opus group = %+v, want one 50%% window", opus)
+	}
+	fable, ok := byKey["claude:seven-day-fable"]
+	if !ok || len(fable.Windows) != 1 || fable.Windows[0].Remaining != 80 || fable.SourceLabel != "Fable" {
+		t.Errorf("fable group = %+v, want one 80%% Fable window", fable)
+	}
+	if _, ok := byKey["claude:seven-day-sonnet"]; ok {
+		t.Errorf("a window without a numeric utilization must be skipped")
+	}
+	if _, err := ParseClaudeUsage(map[string]any{}); err == nil {
+		t.Errorf("empty payload must error")
+	}
+	if _, err := ParseClaudeUsage(map[string]any{"five_hour": map[string]any{"utilization": "x"}}); err == nil {
+		t.Errorf("payload without a usable window must error")
+	}
+}
+
+// TestParseClaudeHeaders covers the passive quota headers, including the
+// Fable window as 7d_oi.
+func TestParseClaudeHeaders(t *testing.T) {
+	h := http.Header{}
+	h.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.25")
+	h.Set("Anthropic-Ratelimit-Unified-5h-Reset", "2026-11-24T00:00:00Z")
+	h.Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.1")
+	h.Set("Anthropic-Ratelimit-Unified-7d-Reset", "2026-11-30T00:00:00Z")
+	h.Set("Anthropic-Ratelimit-Unified-7d_oi-Utilization", "0.4")
+	h.Set("Anthropic-Ratelimit-Unified-7d_oi-Reset", "2026-11-30T00:00:00Z")
+	groups := ParseClaudeHeaders(h)
+	byKey := map[string]quotaGroup{}
+	for _, g := range groups {
+		byKey[g.Key] = g
+	}
+	main, ok := byKey["claude:main"]
+	if !ok || len(main.Windows) != 2 {
+		t.Fatalf("main group = %+v, want 2 windows", main)
+	}
+	remaining := map[string]float64{}
+	for _, w := range main.Windows {
+		remaining[w.ID] = w.Remaining
+	}
+	if remaining["5h"] != 75 || remaining["7d"] != 90 {
+		t.Errorf("header remaining = %v, want 5h 75 / 7d 90", remaining)
+	}
+	fable, ok := byKey["claude:seven-day-fable"]
+	if !ok || len(fable.Windows) != 1 || fable.Windows[0].Remaining != 60 || fable.SourceLabel != "Fable" {
+		t.Errorf("fable group = %+v, want one 60%% Fable window", fable)
+	}
+	if groups := ParseClaudeHeaders(http.Header{}); len(groups) != 0 {
+		t.Errorf("empty headers produced %d groups, want 0", len(groups))
+	}
+}
+
+// TestParseAntigravityQuota covers both groups, 5h+weekly buckets, the
+// fraction / "75%" / >1 remaining forms, and the missing-groups error.
+func TestParseAntigravityQuota(t *testing.T) {
+	payload := map[string]any{"groups": []any{
+		map[string]any{"displayName": "Gemini Models", "buckets": []any{
+			map[string]any{"window": "5h", "remainingFraction": 0.8, "resetTime": "2026-11-24T00:00:00Z", "bucketId": "gemini-5h"},
+			map[string]any{"window": "weekly", "remainingFraction": "75%", "resetTime": "2026-11-30T00:00:00Z", "bucketId": "gemini-weekly"},
+			map[string]any{"window": "weekly", "remainingFraction": 85, "resetTime": "2026-11-30T00:00:00Z", "bucketId": "gemini-extra"},
+		}},
+		map[string]any{"displayName": "Claude and GPT Models", "buckets": []any{
+			map[string]any{"window": "five-hour", "remaining_fraction": 0.5, "reset_time": "2026-11-24T00:00:00Z"},
+		}},
+	}}
+	groups, err := ParseAntigravityQuota(payload)
+	if err != nil {
+		t.Fatalf("ParseAntigravityQuota: %v", err)
+	}
+	byKey := map[string]quotaGroup{}
+	for _, g := range groups {
+		byKey[g.Key] = g
+	}
+	gemini, ok := byKey["antigravity:gemini-models"]
+	if !ok || gemini.SourceLabel != "Gemini" || len(gemini.Windows) != 3 {
+		t.Fatalf("gemini group = %+v, want 3 windows", gemini)
+	}
+	if kind := quotaWindowKind(gemini.Windows[0]); kind != "5h" || gemini.Windows[0].Remaining != 80 {
+		t.Errorf("gemini first window = kind %s remaining %v, want 5h/80", kind, gemini.Windows[0].Remaining)
+	}
+	if gemini.Windows[1].Remaining != 75 || gemini.Windows[2].Remaining != 85 {
+		t.Errorf("gemini weekly remaining = %v/%v, want 75/85", gemini.Windows[1].Remaining, gemini.Windows[2].Remaining)
+	}
+	cgpt, ok := byKey["antigravity:claude-and-gpt-models"]
+	if !ok || cgpt.SourceLabel != "Claude / GPT" || len(cgpt.Windows) != 1 || cgpt.Windows[0].Remaining != 50 {
+		t.Errorf("claude/gpt group = %+v, want one 50%% window", cgpt)
+	} else if kind := quotaWindowKind(cgpt.Windows[0]); kind != "5h" {
+		t.Errorf("claude/gpt window kind = %q, want 5h (five-hour)", kind)
+	}
+	if _, err := ParseAntigravityQuota(map[string]any{}); err == nil {
+		t.Errorf("payload without groups must error")
+	}
+	if _, err := ParseAntigravityQuota(map[string]any{"groups": []any{}}); err == nil {
+		t.Errorf("empty groups must error")
+	}
+}
+
+// TestIgnitionCandidatesPerProvider covers the per-provider candidate
+// order: Claude Haiku before Sonnet, Antigravity Gemini Flash first,
+// Antigravity Claude/GPT Haiku > Sonnet > Opus > GPT-OSS. The Antigravity
+// selectors follow Lamplighter's three passes without dedup, so the test
+// asserts the ordering prefix, not exact equality.
+func TestIgnitionCandidatesPerProvider(t *testing.T) {
+	got := claudeCandidates([]string{"claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5", "claude-haiku-3-5-thinking", "claude-sonnet-4-0", "gpt-5-codex"})
+	want := []string{"claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-0"}
+	if len(got) != len(want) {
+		t.Fatalf("claude candidates = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("claude candidates = %v, want %v", got, want)
+		}
+	}
+
+	gemini := antigravityCandidates("Gemini", []string{"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-2.0-flash-image", "claude-sonnet-4-5"})
+	if len(gemini) < 2 || gemini[0] != "gemini-2.5-flash" || gemini[1] != "gemini-2.0-flash" {
+		t.Errorf("gemini candidates start = %v, want newest flash first", gemini)
+	}
+	lastFlash := -1
+	firstPro := len(gemini)
+	for i, m := range gemini {
+		if strings.Contains(m, "image") {
+			t.Errorf("gemini candidates include image model %q", m)
+		}
+		if strings.Contains(m, "flash") {
+			lastFlash = i
+		}
+		if strings.Contains(m, "pro") && firstPro == len(gemini) {
+			firstPro = i
+		}
+	}
+	if firstPro <= lastFlash {
+		t.Errorf("gemini candidates = %v, want flash before pro", gemini)
+	}
+
+	cgpt := antigravityCandidates("Claude / GPT", []string{"gpt-oss-120b", "claude-opus-4-1", "claude-sonnet-4-5", "claude-haiku-4-5", "claude-haiku-3-5-thinking", "gemini-2.5-flash", "claude-sonnet-4-0"})
+	wantPrefix := []string{"claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-0", "claude-opus-4-1", "gpt-oss-120b"}
+	if len(cgpt) < len(wantPrefix) {
+		t.Fatalf("claude/gpt candidates = %v, want prefix %v", cgpt, wantPrefix)
+	}
+	for i := range wantPrefix {
+		if cgpt[i] != wantPrefix[i] {
+			t.Errorf("claude/gpt candidates = %v, want prefix %v", cgpt, wantPrefix)
+		}
+	}
+}
+
+// TestConfiguredModelPriority covers per-group Models > provider Model >
+// candidates, and the Codex configured model (gpt-6-luna) always winning.
+func TestConfiguredModelPriority(t *testing.T) {
+	rt := newTestRuntime(&fakeHost{})
+	rt.cfg.Ignition.Model = "gpt-6-luna"
+	if got := rt.configuredModel("codex", "GPT"); got != "gpt-6-luna" {
+		t.Errorf("codex model = %q, want gpt-6-luna", got)
+	}
+	rt.cfg.Providers.Claude.Model = "claude-opus-4-5"
+	if got := rt.configuredModel("claude", "Claude"); got != "claude-opus-4-5" {
+		t.Errorf("claude model = %q, want claude-opus-4-5", got)
+	}
+	rt.cfg.Providers.Antigravity.Model = "gemini-2.5-pro"
+	rt.cfg.Providers.Antigravity.Models = map[string]string{"Gemini": "gemini-2.5-flash"}
+	if got := rt.configuredModel("antigravity", "Gemini"); got != "gemini-2.5-flash" {
+		t.Errorf("antigravity Gemini model = %q, want the per-group override", got)
+	}
+	if got := rt.configuredModel("antigravity", "Claude / GPT"); got != "gemini-2.5-pro" {
+		t.Errorf("antigravity Claude/GPT model = %q, want the provider model", got)
+	}
+	rt.cfg.Providers.Antigravity.Models = map[string]string{"gemini": "gemini-2.0-flash"}
+	if got := rt.configuredModel("antigravity", "Gemini"); got != "gemini-2.0-flash" {
+		t.Errorf("group override must match case-insensitively, got %q", got)
+	}
+	rt2 := newTestRuntime(&fakeHost{})
+	if got := rt2.configuredModel("claude", "Claude"); got != "" {
+		t.Errorf("unconfigured claude model = %q, want empty (candidates decide)", got)
+	}
+}
+
+// TestSettingsProvidersMerge covers PUT /settings merging providers per
+// provider (a claude-only patch must not wipe codex/antigravity, and a
+// codex model maps onto the single ignition model), plus YAML parsing of
+// providers.antigravity.groups in inline, comma and list form.
+func TestSettingsProvidersMerge(t *testing.T) {
+	rt := newTestRuntime(&fakeHost{})
+	setActive(t, rt)
+	put := func(body string) {
+		t.Helper()
+		req, err := json.Marshal(pluginapi.ManagementRequest{Method: "PUT", Path: "/v0/management/phoenix/settings", Body: []byte(body)})
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		out, err := handleManagement(req)
+		if err != nil {
+			t.Fatalf("handleManagement: %v", err)
+		}
+		decodeManagementResponse(t, out)
+	}
+	put(`{"providers":{"claude":{"ignite":false,"model":"claude-sonnet-4-5"}}}`)
+	if rt.cfg.Providers.Claude.Ignite || rt.cfg.Providers.Claude.Model != "claude-sonnet-4-5" {
+		t.Errorf("claude after merge = %+v, want ignite false / claude-sonnet-4-5", rt.cfg.Providers.Claude)
+	}
+	if !rt.cfg.Providers.Codex.Ignite || rt.cfg.Providers.Antigravity.Ignite {
+		t.Errorf("codex/antigravity ignite changed by a claude-only patch: %+v / %+v (antigravity defaults off)", rt.cfg.Providers.Codex, rt.cfg.Providers.Antigravity)
+	}
+	if len(rt.cfg.Providers.Antigravity.Groups) != 1 || rt.cfg.Providers.Antigravity.Groups[0] != "Gemini" {
+		t.Errorf("antigravity groups = %v, want [Gemini]", rt.cfg.Providers.Antigravity.Groups)
+	}
+	if rt.cfg.Ignition.Model != "gpt-5-codex" {
+		t.Errorf("ignition model = %q, want the untouched default", rt.cfg.Ignition.Model)
+	}
+	put(`{"providers":{"codex":{"model":"gpt-6-luna"}}}`)
+	if rt.cfg.Ignition.Model != "gpt-6-luna" {
+		t.Errorf("ignition model = %q, want gpt-6-luna (codex model sync)", rt.cfg.Ignition.Model)
+	}
+	if rt.cfg.Providers.Claude.Ignite || rt.cfg.Providers.Claude.Model != "claude-sonnet-4-5" {
+		t.Errorf("claude changed by a codex-only patch: %+v", rt.cfg.Providers.Claude)
+	}
+
+	cfg := defaultConfig()
+	parseYAML([]byte("providers:\n  antigravity:\n    ignite: true\n    groups: [\"Gemini\", \"Claude / GPT\"]\n"), &cfg)
+	if len(cfg.Providers.Antigravity.Groups) != 2 || cfg.Providers.Antigravity.Groups[1] != "Claude / GPT" {
+		t.Errorf("inline groups = %v, want [Gemini Claude / GPT]", cfg.Providers.Antigravity.Groups)
+	}
+	cfg2 := defaultConfig()
+	parseYAML([]byte("providers:\n  antigravity:\n    groups: Gemini, Claude / GPT\n"), &cfg2)
+	if len(cfg2.Providers.Antigravity.Groups) != 2 || cfg2.Providers.Antigravity.Groups[0] != "Gemini" {
+		t.Errorf("comma groups = %v, want [Gemini Claude / GPT]", cfg2.Providers.Antigravity.Groups)
+	}
+	cfg3 := defaultConfig()
+	parseYAML([]byte("providers:\n  antigravity:\n    groups:\n      - Claude / GPT\n"), &cfg3)
+	if len(cfg3.Providers.Antigravity.Groups) != 1 || cfg3.Providers.Antigravity.Groups[0] != "Claude / GPT" {
+		t.Errorf("list groups = %v, want [Claude / GPT] (replace, not append)", cfg3.Providers.Antigravity.Groups)
+	}
+}
+
+// TestGroupIgnitable covers the per-group ignition gate, including the
+// Antigravity default of Gemini-only.
+func TestGroupIgnitable(t *testing.T) {
+	rt := newTestRuntime(&fakeHost{})
+	// Antigravity auto-ignition defaults to off (Lamplighter): even the
+	// Gemini group is not ignitable until the switch is turned on.
+	if groupIgnitable(rt, "antigravity", "Gemini") {
+		t.Errorf("groupIgnitable(antigravity, Gemini) with the default config = true, want false (switch off by default)")
+	}
+	rt.cfg.Providers.Antigravity.Ignite = true
+	cases := []struct {
+		provider, label string
+		want            bool
+	}{
+		{"codex", "GPT", true},
+		{"claude", "Claude", true},
+		{"antigravity", "Gemini", true},
+		{"antigravity", "Claude / GPT", false},
+		{"kimi", "Kimi", false},
+		{"xai", "Grok", false},
+		{"unknown", "X", false},
+	}
+	for _, c := range cases {
+		if got := groupIgnitable(rt, c.provider, c.label); got != c.want {
+			t.Errorf("groupIgnitable(%s, %s) = %v, want %v", c.provider, c.label, got, c.want)
+		}
+	}
+	rt.cfg.Providers.Antigravity.Groups = nil
+	if !groupIgnitable(rt, "antigravity", "Claude / GPT") {
+		t.Errorf("an empty antigravity group list must ignite every group")
+	}
+	rt.cfg.Providers.Claude.Ignite = false
+	if groupIgnitable(rt, "claude", "Claude") {
+		t.Errorf("a switched-off provider must not be ignitable")
+	}
+}
+
+// TestResetRejectsNonCodex covers the /reset gate: a Claude credential is
+// refused with a Codex-only error, while a Codex credential passes the
+// gate (its later failure is about reset credits, not the provider).
+// It also checks the status target carries the provider field.
+func TestResetRejectsNonCodex(t *testing.T) {
+	now := time.Now()
+	host := &fakeHost{authListEntries: []pluginapi.HostAuthFileEntry{{ID: "id-1", AuthIndex: "1", Name: "claude-a.json", Provider: "claude"}}}
+	rt := newTestRuntime(host)
+	rt.accounts["1"] = &accountState{
+		AuthIndex: "1", Provider: "claude", Title: "Claude",
+		Windows: map[string]*windowState{"5h": {Remaining: 50, Reset: now.Add(2 * time.Hour), Source: "active", ObservedAt: now}},
+	}
+	setActive(t, rt)
+	req, err := json.Marshal(pluginapi.ManagementRequest{Method: "POST", Path: "/v0/management/phoenix/reset", Body: []byte(`{"auth_index":"1"}`)})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	out, err := handleManagement(req)
+	if err != nil {
+		t.Fatalf("handleManagement: %v", err)
+	}
+	resp := decodeManagementResponse(t, out)
+	var decoded map[string]any
+	if err := json.Unmarshal(resp.Body, &decoded); err != nil {
+		t.Fatalf("reset body is not JSON: %v (%s)", err, resp.Body)
+	}
+	if decoded["ok"] != false {
+		t.Fatalf("claude reset ok = %v, want false", decoded["ok"])
+	}
+	if errStr, _ := decoded["error"].(string); !strings.Contains(errStr, "only supported for Codex") {
+		t.Errorf("claude reset error = %q, want the Codex-only message", errStr)
+	}
+	targets, ok := rt.status().(map[string]any)["targets"].([]map[string]any)
+	if !ok || len(targets) != 1 {
+		t.Fatalf("targets = %v, want 1 claude target", rt.status().(map[string]any)["targets"])
+	}
+	if targets[0]["key"] != "claude:1:claude:main" || targets[0]["provider"] != "claude" {
+		t.Errorf("target = %v, want key claude:1:claude:main provider claude", targets[0])
+	}
+
+	codexHost := &fakeHost{usageBody: `{"credits":[]}`, authListEntries: []pluginapi.HostAuthFileEntry{{ID: "id-0", AuthIndex: "0", Name: "codex-a.json", Provider: "codex"}}}
+	rt2 := newTestRuntime(codexHost)
+	if err := rt2.reset("0"); err != nil && strings.Contains(err.Error(), "only supported for Codex") {
+		t.Errorf("codex reset must pass the provider gate, got %v", err)
+	}
+}
+
+// TestStateMigrationBareKeys covers the load-time migration of pre-0.0.11
+// bare auth_index state keys to Codex main group keys; an existing group
+// key wins over the migrated one.
+func TestStateMigrationBareKeys(t *testing.T) {
+	dir := t.TempDir()
+	s := newPersistedState()
+	s.baseline("0", "5h").NotifiedSeverity = "low"
+	s.target("0").ConsecutiveFailures = 2
+	s.baseline("codex:0:codex:main", "5h").NotifiedSeverity = "critical"
+	if err := savePersistedState(dir, s); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	loaded := loadPersistedState(dir)
+	if _, ok := loaded.Baselines["0"]; ok {
+		t.Errorf("bare baseline key survived migration: %v", loaded.Baselines)
+	}
+	if _, ok := loaded.Targets["0"]; ok {
+		t.Errorf("bare target key survived migration: %v", loaded.Targets)
+	}
+	if loaded.baseline("codex:0:codex:main", "5h").NotifiedSeverity != "critical" {
+		t.Errorf("existing group key must win, got %+v", loaded.Baselines["codex:0:codex:main"])
+	}
+	if loaded.target("codex:0:codex:main").ConsecutiveFailures != 2 {
+		t.Errorf("migrated target = %+v, want 2 failures", loaded.Targets["codex:0:codex:main"])
+	}
+}
+
+// TestCheckModelsKey covers the plugin-side models-key check the panel
+// uses instead of asking CPA directly: ok, refused on 401, inconclusive on
+// other failures, and empty key.
+func TestCheckModelsKey(t *testing.T) {
+	check := func(t *testing.T, rt *runtime, key string) map[string]any {
+		t.Helper()
+		req, err := json.Marshal(pluginapi.ManagementRequest{Method: "POST", Path: "/v0/management/phoenix/check-models-key", Body: []byte(`{"key":"` + key + `"}`)})
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		out, err := handleManagement(req)
+		if err != nil {
+			t.Fatalf("handleManagement: %v", err)
+		}
+		resp := decodeManagementResponse(t, out)
+		var decoded map[string]any
+		if err := json.Unmarshal(resp.Body, &decoded); err != nil {
+			t.Fatalf("check-models-key body is not JSON: %v (%s)", err, resp.Body)
+		}
+		return decoded
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer good-key" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"error":"Missing API key"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":[{"id":"gpt-6-luna"}]}`)
+	}))
+	defer srv.Close()
+	rt := newTestRuntime(&fakeHost{})
+	rt.cfg.Ignition.CPABaseURL = srv.URL
+	setActive(t, rt)
+	if got := check(t, rt, "good-key"); got["ok"] != true {
+		t.Errorf("good key = %v, want ok true", got)
+	}
+	if got := check(t, rt, "bad-key"); got["ok"] != false || got["refused"] != true {
+		t.Errorf("bad key = %v, want ok false refused true", got)
+	}
+	if got := check(t, rt, ""); got["ok"] != false || got["refused"] != false {
+		t.Errorf("empty key = %v, want ok false refused false", got)
+	} else if reason, _ := got["reason"].(string); reason == "" {
+		t.Errorf("empty key must carry a reason: %v", got)
+	}
+
+	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer errSrv.Close()
+	rt.cfg.Ignition.CPABaseURL = errSrv.URL
+	if got := check(t, rt, "any-key"); got["ok"] != false || got["refused"] != false {
+		t.Errorf("500 = %v, want ok false refused false (inconclusive)", got)
+	} else if reason, _ := got["reason"].(string); !strings.Contains(reason, "HTTP 500") {
+		t.Errorf("500 reason = %q, want the HTTP status", reason)
+	}
+	rt.cfg.Ignition.CPABaseURL = "http://127.0.0.1:1"
+	if got := check(t, rt, "any-key"); got["ok"] != false || got["refused"] != false {
+		t.Errorf("unreachable CPA = %v, want ok false refused false (inconclusive)", got)
+	}
+}
+
+// TestDefaultProviderSwitches covers the per-provider ignition defaults:
+// Codex and Claude on, Antigravity off (Lamplighter: monitor on, ignite
+// off) with groups [Gemini] when it is switched on. The status payload
+// reports the capability (providers[].ignite) and the switch
+// (config.providers[].ignite) separately: Antigravity can ignite, but its
+// switch is off by default.
+func TestDefaultProviderSwitches(t *testing.T) {
+	cfg := defaultConfig()
+	if !cfg.Providers.Codex.Ignite || !cfg.Providers.Claude.Ignite {
+		t.Errorf("codex/claude ignite = %v/%v, want true/true", cfg.Providers.Codex.Ignite, cfg.Providers.Claude.Ignite)
+	}
+	if cfg.Providers.Antigravity.Ignite {
+		t.Errorf("antigravity ignite = true, want false (off by default)")
+	}
+	if len(cfg.Providers.Antigravity.Groups) != 1 || cfg.Providers.Antigravity.Groups[0] != "Gemini" {
+		t.Errorf("antigravity groups = %v, want [Gemini]", cfg.Providers.Antigravity.Groups)
+	}
+	rt := newTestRuntime(&fakeHost{})
+	st := rt.status().(map[string]any)
+	providers, ok := st["providers"].([]map[string]any)
+	if !ok || len(providers) != 5 {
+		t.Fatalf("status providers = %v, want 5 entries", st["providers"])
+	}
+	if providers[2]["id"] != "antigravity" || providers[2]["ignite"] != true {
+		t.Errorf("status providers[2] = %v, want antigravity with ignite true (capability)", providers[2])
+	}
+	cfgMap, ok := st["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("status config = %v", st["config"])
+	}
+	provCfg, ok := cfgMap["providers"].(map[string]any)
+	if !ok {
+		t.Fatalf("status config providers = %v", cfgMap["providers"])
+	}
+	ag, ok := provCfg["antigravity"].(map[string]any)
+	if !ok || ag["ignite"] != false {
+		t.Errorf("status config providers.antigravity = %v, want ignite false (switch off)", provCfg["antigravity"])
+	}
+}
+
+// TestConfigFields covers the management-center field declarations: the
+// models key, CPA base URL, providers and thresholds must be declared so
+// the management center offers them (Lamplighter parity).
+func TestConfigFields(t *testing.T) {
+	want := []string{"config_token", "telegram", "alerts", "reset", "reset.credentials", "ignition", "ignition.model", "models_api_key", "cpa_base_url", "notice_threshold", "low_threshold", "critical_threshold", "recovery_notify", "reset_reminder", "providers", "poll_interval_seconds", "history_retention_days", "data_dir"}
+	got := map[string]bool{}
+	for _, f := range configFields() {
+		got[f.Name] = true
+	}
+	for _, name := range want {
+		if !got[name] {
+			t.Errorf("configFields is missing %q", name)
+		}
+	}
+}
+
+// TestPutSettingsWarmsModelsCache covers the models-key save path end to
+// end: a PUT /settings with a new key re-reads /v1/models in the
+// background, so status.next_models reflects the new key promptly instead
+// of waiting for the next ignition attempt.
+func TestPutSettingsWarmsModelsCache(t *testing.T) {
+	// NOTE: the expected header is built by concatenation, never written
+	// as one "Bearer <key>" literal.
+	const key = "good-key"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+key {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":[{"id":"gpt-6-luna"}]}`)
+	}))
+	defer srv.Close()
+	rt := newTestRuntime(&fakeHost{})
+	rt.cfg.Ignition.CPABaseURL = srv.URL
+	setActive(t, rt)
+	req, err := json.Marshal(pluginapi.ManagementRequest{Method: "PUT", Path: "/v0/management/phoenix/settings", Body: []byte(`{"models_api_key":"good-key"}`)})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	out, err := handleManagement(req)
+	if err != nil {
+		t.Fatalf("handleManagement: %v", err)
+	}
+	decodeManagementResponse(t, out)
+	if rt.cfg.Ignition.ModelsAPIKey != "good-key" {
+		t.Fatalf("models key = %q, want good-key", rt.cfg.Ignition.ModelsAPIKey)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rt.mu.Lock()
+		warmed := rt.modelsKey == "good-key" && len(rt.modelsCache) > 0
+		cache, modelsErr := rt.modelsCache, rt.modelsErr
+		rt.mu.Unlock()
+		if warmed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("models cache was not warmed after the PUT: cache=%v err=%q", cache, modelsErr)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestHistoryExtraGroupSeries covers history series for an extra quota
+// group: the main group keeps the account title, the extra group is
+// labelled "title · source label" and carries the group key.
+func TestHistoryExtraGroupSeries(t *testing.T) {
+	now := time.Now()
+	rt := newTestRuntime(&fakeHost{})
+	rt.accounts["0"] = &accountState{
+		AuthIndex: "0", Provider: "claude", Title: "Claude",
+		Windows: map[string]*windowState{"5h": {Remaining: 70, Reset: now.Add(2 * time.Hour), Source: "active", ObservedAt: now}},
+		ExtraGroups: map[string]*extraGroup{
+			"claude:0:seven-day-fable": {Key: "claude:0:seven-day-fable", SourceLabel: "Fable", Windows: map[string]*windowState{"seven-day-fable": {Remaining: 60, Reset: now.Add(24 * time.Hour), Source: "active", ObservedAt: now}}},
+		},
+	}
+	rt.histMem = []historyRecord{
+		{Kind: "s", Time: now.Add(-time.Hour).Unix(), Group: "0", Window: "5h", Remaining: 70, Reset: now.Add(2 * time.Hour).Unix(), Source: "active"},
+		{Kind: "s", Time: now.Add(-time.Hour).Unix(), Group: "claude:0:seven-day-fable", Window: "5h", Remaining: 60, Reset: now.Add(24 * time.Hour).Unix(), Source: "active"},
+	}
+	resp := rt.historyResponse("6h", "5h", now)
+	series, ok := resp["series"].([]map[string]any)
+	if !ok || len(series) != 2 {
+		t.Fatalf("series = %v, want 2", resp["series"])
+	}
+	byGroup := map[string]map[string]any{}
+	for _, s := range series {
+		byGroup[s["group"].(string)] = s
+	}
+	main, ok := byGroup["claude:0:claude:main"]
+	if !ok || main["label"] != "Claude" || main["source_label"] != "Claude" || main["provider"] != "claude" || main["auth_index"] != "0" {
+		t.Errorf("main series = %v, want Claude/claude:0:claude:main", main)
+	}
+	fable, ok := byGroup["claude:0:seven-day-fable"]
+	if !ok || fable["label"] != "Claude · Fable" || fable["source_label"] != "Fable" || fable["provider"] != "claude" || fable["auth_index"] != "0" {
+		t.Errorf("fable series = %v, want label 'Claude · Fable'", fable)
 	}
 }

@@ -40,7 +40,8 @@ func (rt *runtime) maskedConfig() map[string]any {
 			"five_hour": cfg.Alerts.ResetReminder.FiveHour,
 			"seven_day": cfg.Alerts.ResetReminder.SevenDay,
 		},
-		"models_api_key":          map[bool]string{true: "已设置", false: ""}[modelsKeySet],
+		"models_api_key":          "",
+		"models_api_key_set":      modelsKeySet,
 		"cpa_base_url":            cfg.Ignition.CPABaseURL,
 		"remember_chart_filters":  cfg.RememberChartFilters,
 		"remember_chart_expanded": cfg.RememberChartExpanded,
@@ -50,6 +51,15 @@ func (rt *runtime) maskedConfig() map[string]any {
 				// The panel's per-provider model input is a view onto
 				// ignition.model (single source of truth).
 				"model": cfg.Ignition.Model,
+			},
+			"claude": map[string]any{
+				"ignite": cfg.Providers.Claude.Ignite,
+				"model":  cfg.Providers.Claude.Model,
+			},
+			"antigravity": map[string]any{
+				"ignite": cfg.Providers.Antigravity.Ignite,
+				"model":  cfg.Providers.Antigravity.Model,
+				"groups": cfg.Providers.Antigravity.Groups,
 			},
 		},
 		"telegram": map[string]any{
@@ -130,33 +140,14 @@ func (rt *runtime) statusLocked() map[string]any {
 	titles := displayTitles(rt.accounts, indices)
 	for _, idx := range indices {
 		acct := rt.accounts[idx]
-		windows := []map[string]any{}
-		for _, kind := range []string{windowFiveHour, windowSevenDay} {
-			w, ok := acct.Windows[kind]
-			if !ok {
-				continue
-			}
-			label, short, period := windowLabel(kind)
-			win := map[string]any{
-				"id":             kind,
-				"label":          label,
-				"short":          short,
-				"kind":           kind,
-				"period_seconds": period,
-				"remaining":      w.Remaining,
-				"source":         w.Source,
-				"observed_at":    formatTimePtr(w.ObservedAt),
-			}
-			if w.Reset.IsZero() {
-				win["reset"] = nil
-			} else {
-				win["reset"] = w.Reset.Format(time.RFC3339)
-			}
-			windows = append(windows, win)
+		provider := acct.Provider
+		if provider == "" {
+			provider = "codex"
 		}
+		windows := windowEntries(acct.Windows)
 		errStr := acct.Error
 		if errStr == "" {
-			if pollErr, ok := rt.pollErrs[idx]; ok {
+			if pollErr, ok := rt.pollErrs[mainGroupKey(provider, idx)]; ok {
 				errStr = pollErr
 			}
 		}
@@ -173,19 +164,47 @@ func (rt *runtime) statusLocked() map[string]any {
 			}
 			stale = fresh && available
 		}
-		planName, planWeight := codexPlan(acct.Plan)
+		planName, planWeight := planDisplay(provider, acct.Plan)
 		title := titles[idx]
 		if title == "" {
 			title = acct.Title
 		}
-		// One Lamplighter-style quota group per credential (Codex-only):
-		// the panel's cards, chart and event labels all walk groups.
-		groups := []map[string]any{{
-			"key":          groupKey(idx),
-			"label":        title,
-			"source_label": "GPT",
-			"windows":      windows,
-		}}
+		// Lamplighter-style quota groups: the main group (codex:main /
+		// claude:main) plus every extra group (Antigravity groups, Claude
+		// extra windows). The panel's cards, chart and event labels all
+		// walk groups.
+		groups := []map[string]any{}
+		if provider == "codex" || provider == "claude" {
+			mainKey := mainGroupKey(provider, idx)
+			group := map[string]any{
+				"key":          mainKey,
+				"label":        title,
+				"source_label": providerTitle(provider),
+				"windows":      windows,
+			}
+			if pollErr, ok := rt.pollErrs[mainKey]; ok {
+				group["error"] = pollErr
+			}
+			groups = append(groups, group)
+		}
+		extraKeys := make([]string, 0, len(acct.ExtraGroups))
+		for key := range acct.ExtraGroups {
+			extraKeys = append(extraKeys, key)
+		}
+		sort.Strings(extraKeys)
+		for _, key := range extraKeys {
+			eg := acct.ExtraGroups[key]
+			group := map[string]any{
+				"key":          key,
+				"label":        title + " · " + eg.SourceLabel,
+				"source_label": eg.SourceLabel,
+				"windows":      windowEntries(eg.Windows),
+			}
+			if pollErr, ok := rt.pollErrs[key]; ok {
+				group["error"] = pollErr
+			}
+			groups = append(groups, group)
+		}
 		account := map[string]any{
 			"auth_index":         acct.AuthIndex,
 			"auth_id":            acct.AuthID,
@@ -221,42 +240,18 @@ func (rt *runtime) statusLocked() map[string]any {
 		}
 		usage[idx] = snap
 
-		// Ignition target for this credential, in Lamplighter's TargetView
-		// shape. next_due stays empty while ignition is disabled, the
-		// credential has a confirmed problem, or a non-5h window is
-		// exhausted (refreshTargets); the row itself is always listed so
-		// the manual reset button stays available (Phoenix delta).
-		ts := rt.state.target(idx)
-		var reset time.Time
-		if w, ok := acct.Windows[windowFiveHour]; ok {
-			reset = w.Reset
+		// Ignition targets, one per group with a 5h window, in Lamplighter's
+		// TargetView shape. next_due stays empty while ignition is disabled,
+		// the group is not ignitable, the credential has a confirmed
+		// problem, or a non-5h window is exhausted; the row itself is always
+		// listed so the manual reset button stays available (Phoenix delta).
+		if provider == "codex" || provider == "claude" {
+			targets = append(targets, rt.targetEntry(idx, provider, mainGroupKey(provider, idx), idx, title, acct.Windows, providerTitle(provider), now))
 		}
-		blockedWindow, blockedUntil := exhaustedWindow(acct, now)
-		nextDue := time.Time{}
-		if rt.cfg.Ignition.Enabled && rt.cfg.Providers.Codex.Ignite && rt.credentialProblemFor(idx) == "" && blockedWindow == "" {
-			nextDue = ignitionDueAt(rt.cfg.Ignition, ts, reset, now)
+		for _, key := range extraKeys {
+			eg := acct.ExtraGroups[key]
+			targets = append(targets, rt.targetEntry(idx, provider, key, key, title+" · "+eg.SourceLabel, eg.Windows, eg.SourceLabel, now))
 		}
-		target := map[string]any{
-			"key":                  groupKey(idx),
-			"auth_index":           idx,
-			"group":                idx,
-			"label":                title,
-			"provider":             "codex",
-			"next_due":             formatTimePtr(nextDue),
-			"reset":                formatTimePtr(reset),
-			"rolling":              ts.RollingReset,
-			"last_success":         formatTimePtr(ts.LastSuccess),
-			"last_attempt":         formatTimePtr(ts.LastAttempt),
-			"last_model":           ts.LastModel,
-			"last_error":           ts.LastError,
-			"status":               targetStatusFor(rt, idx, ts, now),
-			"consecutive_failures": ts.ConsecutiveFailures,
-			"circuit_until":        formatTimePtr(ts.CircuitUntil),
-			"circuit_reason":       ts.CircuitReason,
-			"blocked_window":       blockedWindow,
-			"blocked_until":        formatTimePtr(blockedUntil),
-		}
-		targets = append(targets, target)
 	}
 	events := make([]map[string]any, 0, len(rt.events))
 	for _, e := range rt.events {
@@ -273,7 +268,15 @@ func (rt *runtime) statusLocked() map[string]any {
 			row["kind"] = e.Kind
 		}
 		if e.AuthIndex != "" {
-			row["group"] = groupKey(e.AuthIndex)
+			groupKey := groupKey(e.AuthIndex)
+			if acct, ok := rt.accounts[e.AuthIndex]; ok {
+				provider := acct.Provider
+				if provider == "" {
+					provider = "codex"
+				}
+				groupKey = mainGroupKey(provider, e.AuthIndex)
+			}
+			row["group"] = groupKey
 			row["auth_index"] = e.AuthIndex
 			if t, ok := titles[e.AuthIndex]; ok {
 				row["label"] = t
@@ -305,8 +308,14 @@ func (rt *runtime) statusLocked() map[string]any {
 		lang = "zh"
 	}
 	nextModels := map[string]any{}
-	if next := rt.cachedNextModelLocked(); next != "" {
+	if next := rt.cachedNextModelForLocked("codex", "GPT"); next != "" {
 		nextModels["codex"] = next
+	}
+	if next := rt.cachedNextModelForLocked("claude", "Claude"); next != "" {
+		nextModels["claude"] = next
+	}
+	if next := rt.cachedNextModelForLocked("antigravity", "Gemini"); next != "" {
+		nextModels["antigravity"] = next
 	}
 	return map[string]any{
 		"plugin":               "phoenix",
@@ -330,13 +339,34 @@ func (rt *runtime) statusLocked() map[string]any {
 		"notify_error":         rt.lastNotifyErr,
 		"models_error":         rt.modelsErr,
 		"next_models":          nextModels,
-		"providers": []map[string]any{{
-			"id":         "codex",
-			"title":      "GPT",
-			"ignite":     true,
-			"model_hint": map[string]any{"zh": "最新的 Luna", "en": "latest Luna"},
-		}},
-		"group_order": []string{"GPT"},
+		"providers": []map[string]any{
+			{
+				"id":         "codex",
+				"title":      "GPT",
+				"ignite":     true,
+				"model_hint": map[string]any{"zh": "最新的 Luna", "en": "latest Luna"},
+			},
+			{
+				"id":         "claude",
+				"title":      "Claude",
+				"ignite":     true,
+				"model_hint": map[string]any{"zh": "最新的 Haiku", "en": "latest Haiku"},
+			},
+			{
+				"id":         "antigravity",
+				"title":      "Antigravity",
+				"ignite":     true,
+				"model_hint": map[string]any{"zh": "最新的 Flash", "en": "latest Flash"},
+				"groups":     []string{"Gemini", "Claude / GPT"},
+				"groups_hint": map[string]any{
+					"zh": "Antigravity 按模型分成多个独立的 5 小时额度组。只有勾选的额度组会自动点火；Claude / GPT 额度组较小，默认不点。",
+					"en": "Antigravity splits quota into separate 5-hour groups by model. Only checked groups are ignited; the Claude / GPT group is small and off by default.",
+				},
+			},
+			{"id": "kimi", "title": "Kimi", "ignite": false},
+			{"id": "xai", "title": "Grok", "ignite": false},
+		},
+		"group_order": []string{"Claude", "GPT", "Gemini", "Kimi", "Grok", "Fable", "Claude / GPT"},
 		"errors": map[string]any{
 			"config_error": rt.configErr,
 			"list_error":   rt.listErr,
@@ -347,12 +377,103 @@ func (rt *runtime) statusLocked() map[string]any {
 	}
 }
 
+// windowEntries renders a windows map as the status windows[] entries,
+// 5h first, then 7d, then other kinds in id order.
+func windowEntries(windows map[string]*windowState) []map[string]any {
+	kinds := make([]string, 0, len(windows))
+	for kind := range windows {
+		kinds = append(kinds, kind)
+	}
+	rank := func(kind string) int {
+		switch kind {
+		case windowFiveHour:
+			return 0
+		case windowSevenDay:
+			return 1
+		}
+		return 2
+	}
+	sort.Slice(kinds, func(i, j int) bool {
+		if rank(kinds[i]) != rank(kinds[j]) {
+			return rank(kinds[i]) < rank(kinds[j])
+		}
+		return kinds[i] < kinds[j]
+	})
+	out := []map[string]any{}
+	for _, kind := range kinds {
+		w := windows[kind]
+		label, short, period := windowLabel(kind)
+		if w.PeriodSeconds > 0 {
+			period = w.PeriodSeconds
+		}
+		win := map[string]any{
+			"id":             kind,
+			"label":          label,
+			"short":          short,
+			"kind":           kind,
+			"period_seconds": period,
+			"remaining":      w.Remaining,
+			"source":         w.Source,
+			"observed_at":    formatTimePtr(w.ObservedAt),
+		}
+		if w.Reset.IsZero() {
+			win["reset"] = nil
+		} else {
+			win["reset"] = w.Reset.Format(time.RFC3339)
+		}
+		out = append(out, win)
+	}
+	return out
+}
+
+// targetEntry builds one ignition target row in Lamplighter's TargetView
+// shape. group is the auth_index for main groups and the group key for
+// extra groups, so the frontend can tell them apart. A group without a 5h
+// window is never listed as a target; callers check that before calling.
+func (rt *runtime) targetEntry(authIndex, provider, key, group, label string, windows map[string]*windowState, sourceLabel string, now time.Time) map[string]any {
+	ts := rt.state.target(key)
+	var reset time.Time
+	if w, ok := windows[windowFiveHour]; ok {
+		reset = w.Reset
+	} else {
+		return nil
+	}
+	blockedWindow, blockedUntil := exhaustedWindowFor(windows, now)
+	nextDue := time.Time{}
+	if rt.cfg.Ignition.Enabled && groupIgnitable(rt, provider, sourceLabel) && rt.credentialProblemFor(authIndex) == "" && blockedWindow == "" {
+		nextDue = ignitionDueAt(rt.cfg.Ignition, ts, reset, now)
+	}
+	return map[string]any{
+		"key":                  key,
+		"auth_index":           authIndex,
+		"group":                group,
+		"label":                label,
+		"provider":             provider,
+		"next_due":             formatTimePtr(nextDue),
+		"reset":                formatTimePtr(reset),
+		"rolling":              ts.RollingReset,
+		"last_success":         formatTimePtr(ts.LastSuccess),
+		"last_attempt":         formatTimePtr(ts.LastAttempt),
+		"last_model":           ts.LastModel,
+		"last_error":           ts.LastError,
+		"status":               targetStatusFor(rt, authIndex, provider, ts, now),
+		"consecutive_failures": ts.ConsecutiveFailures,
+		"circuit_until":        formatTimePtr(ts.CircuitUntil),
+		"circuit_reason":       ts.CircuitReason,
+		"blocked_window":       blockedWindow,
+		"blocked_until":        formatTimePtr(blockedUntil),
+	}
+}
+
 // targetStatusFor returns ok|paused|circuit|cooling for a target: paused
-// when ignition is disabled or the credential has a confirmed problem,
-// circuit when the breaker is open, cooling while a retry/cooldown wait
-// runs, else ok.
-func targetStatusFor(rt *runtime, authIndex string, ts *targetState, now time.Time) string {
+// when ignition is disabled, the provider switch is off, or the credential
+// has a confirmed problem, circuit when the breaker is open, cooling while
+// a retry/cooldown wait runs, else ok.
+func targetStatusFor(rt *runtime, authIndex, provider string, ts *targetState, now time.Time) string {
 	if !rt.cfg.Ignition.Enabled {
+		return "paused"
+	}
+	if !rt.providerIgniteEnabled(provider) {
 		return "paused"
 	}
 	if rt.credentialProblemFor(authIndex) != "" {
@@ -365,9 +486,18 @@ func targetStatusFor(rt *runtime, authIndex string, ts *targetState, now time.Ti
 // (Lamplighter cooldown.exhaustedWindow): remaining <= 0.01 with a reset
 // still in the future (or unknown).
 func exhaustedWindow(acct *accountState, now time.Time) (string, time.Time) {
-	if w, ok := acct.Windows[windowSevenDay]; ok {
+	return exhaustedWindowFor(acct.Windows, now)
+}
+
+// exhaustedWindowFor is exhaustedWindow over an arbitrary windows map
+// (main group or one extra group).
+func exhaustedWindowFor(windows map[string]*windowState, now time.Time) (string, time.Time) {
+	for kind, w := range windows {
+		if kind == windowFiveHour {
+			continue
+		}
 		if w.Remaining <= exhaustedRemaining && (w.Reset.IsZero() || w.Reset.After(now)) {
-			return windowSevenDay, w.Reset
+			return kind, w.Reset
 		}
 	}
 	return "", time.Time{}
@@ -495,7 +625,7 @@ func displayTitles(accounts map[string]*accountState, indices []string) map[stri
 		if accountNameFromNote(acct.Note) != "" && taken[suffix[idx]] > 1 {
 			suffix[idx] += masked[idx]
 		}
-		out[idx] = "GPT" + suffix[idx]
+		out[idx] = providerTitle(acct.Provider) + suffix[idx]
 	}
 	return out
 }
@@ -530,7 +660,13 @@ func (rt *runtime) historyResponse(rangeName, window string, now time.Time) map[
 	if rt.dataDir != "" {
 		histDir = rt.dataDir + "/history"
 	}
+	// Series metadata, keyed by group key: the account title for a main
+	// group, "title · source label" for an extra group. labels stays keyed
+	// by auth index for event rows; accountProvider maps an auth index to
+	// its provider for main-group samples, which carry only the index.
 	labels := map[string]string{}
+	seriesMeta := map[string]map[string]string{}
+	accountProvider := map[string]string{}
 	{
 		idxs := make([]string, 0, len(rt.accounts))
 		for idx := range rt.accounts {
@@ -545,6 +681,22 @@ func (rt *runtime) historyResponse(rangeName, window string, now time.Time) map[
 			return idxs[i] < idxs[j]
 		})
 		labels = displayTitles(rt.accounts, idxs)
+		for _, idx := range idxs {
+			acct := rt.accounts[idx]
+			provider := acct.Provider
+			if provider == "" {
+				provider = "codex"
+			}
+			accountProvider[idx] = provider
+			title := labels[idx]
+			if title == "" {
+				title = acct.Title
+			}
+			seriesMeta[mainGroupKey(provider, idx)] = map[string]string{"auth_index": idx, "provider": provider, "source_label": providerTitle(provider), "label": title}
+			for key, eg := range acct.ExtraGroups {
+				seriesMeta[key] = map[string]string{"auth_index": idx, "provider": provider, "source_label": eg.SourceLabel, "label": title + " · " + eg.SourceLabel}
+			}
+		}
 	}
 	rt.mu.Unlock()
 	rt.histMu.Lock()
@@ -558,7 +710,16 @@ func (rt *runtime) historyResponse(rangeName, window string, now time.Time) map[
 		if rec.Kind != "s" || rec.Window != window {
 			continue
 		}
+		// Main-group samples carry the auth_index; extra-group samples
+		// carry the group key. Normalize both to the group key.
 		key := rec.Group
+		if !strings.Contains(key, ":") {
+			provider := accountProvider[key]
+			if provider == "" {
+				provider = "codex"
+			}
+			key = mainGroupKey(provider, key)
+		}
 		if _, ok := bySeries[key]; !ok {
 			order = append(order, key)
 		}
@@ -568,9 +729,22 @@ func (rt *runtime) historyResponse(rangeName, window string, now time.Time) map[
 	series := []map[string]any{}
 	for _, key := range order {
 		samples := bySeries[key]
-		label := labels[key]
+		meta := seriesMeta[key]
+		authIndex := groupAuthIndex(key)
+		label := meta["label"]
 		if label == "" {
-			label = "凭证 " + key
+			label = "凭证 " + authIndex
+		}
+		sourceLabel := meta["source_label"]
+		if sourceLabel == "" {
+			sourceLabel = providerTitle(groupProvider(key))
+		}
+		provider := meta["provider"]
+		if provider == "" {
+			provider = groupProvider(key)
+			if provider == "" {
+				provider = "codex"
+			}
 		}
 		points := bucketSamples(samples, from.Unix(), bucket)
 		if len(points) == 0 {
@@ -581,11 +755,11 @@ func (rt *runtime) historyResponse(rangeName, window string, now time.Time) map[
 			resets = [][2]any{}
 		}
 		series = append(series, map[string]any{
-			"group":        groupKey(key),
-			"auth_index":   key,
+			"group":        key,
+			"auth_index":   authIndex,
 			"label":        label,
-			"source_label": "GPT",
-			"provider":     "codex",
+			"source_label": sourceLabel,
+			"provider":     provider,
 			"window":       window,
 			"window_label": window,
 			"kind":         window,
@@ -605,11 +779,15 @@ func (rt *runtime) historyResponse(rangeName, window string, now time.Time) map[
 		default:
 			continue
 		}
+		eventGroup := groupKey(rec.Group)
+		if provider := accountProvider[rec.Group]; provider != "" {
+			eventGroup = mainGroupKey(provider, rec.Group)
+		}
 		row := map[string]any{
 			"time":       time.Unix(rec.Time, 0).Format(time.RFC3339),
 			"level":      rec.Level,
 			"kind":       rec.Event,
-			"group":      groupKey(rec.Group),
+			"group":      eventGroup,
 			"message":    rec.Message,
 			"auth_index": rec.Group,
 		}

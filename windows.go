@@ -36,6 +36,50 @@ type windowState struct {
 	Reset      time.Time
 	Source     string // "active" | "passive"
 	ObservedAt time.Time
+	// PeriodSeconds is the window length in seconds when the provider
+	// states one (18000 for 5h, 604800 for 7d); 0 when unknown.
+	PeriodSeconds int
+}
+
+// extraGroup is one non-main quota group of a credential: an Antigravity
+// group (Gemini, Claude / GPT, ...) or a Claude extra window (Fable, ...).
+// Its Key is the full group key ("antigravity:<idx>:gemini",
+// "claude:<idx>:fable"); Windows is keyed by window kind ("5h"/"7d" for
+// standard windows, the window ID otherwise).
+type extraGroup struct {
+	Key         string
+	SourceLabel string
+	Windows     map[string]*windowState
+	// ActiveWindows lists the window kinds the last successful active poll
+	// confirmed for this group, like accountState.ActiveWindows.
+	ActiveWindows []string
+}
+
+func (g *extraGroup) window(kind string) *windowState {
+	if g.Windows == nil {
+		g.Windows = map[string]*windowState{}
+	}
+	w, ok := g.Windows[kind]
+	if !ok {
+		w = &windowState{}
+		g.Windows[kind] = w
+	}
+	return w
+}
+
+// activeConfirmed reports whether kind was confirmed by an active poll for
+// this group (nil means no active poll has run yet, so passive data is
+// accepted).
+func (g *extraGroup) activeConfirmed(kind string) bool {
+	if g.ActiveWindows == nil {
+		return true
+	}
+	for _, k := range g.ActiveWindows {
+		if k == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // accountState is the live state of one credential, keyed by auth_index.
@@ -61,7 +105,11 @@ type accountState struct {
 	// passive updates are only accepted for confirmed windows once set, so
 	// a retired window is never resurrected by a stale passive record.
 	ActiveWindows []string
-	UpdatedAt     time.Time
+	// ExtraGroups holds the non-main quota groups of this credential
+	// (Antigravity groups and Claude extra windows), keyed by group key.
+	// The main group (codex:main / claude:main) stays in Windows.
+	ExtraGroups map[string]*extraGroup
+	UpdatedAt   time.Time
 	// authFailures timestamps consecutive auth-class failures, used by the
 	// 3-failures-spanning-30-minutes rule before an auth credential problem
 	// counts.
@@ -86,6 +134,34 @@ func (a *accountState) window(kind string) *windowState {
 func (a *accountState) hasWindow(kind string) bool {
 	_, ok := a.Windows[kind]
 	return ok
+}
+
+// extraGroup returns the named extra group, creating it when missing.
+func (a *accountState) extraGroup(key, sourceLabel string) *extraGroup {
+	if a.ExtraGroups == nil {
+		a.ExtraGroups = map[string]*extraGroup{}
+	}
+	g, ok := a.ExtraGroups[key]
+	if !ok {
+		g = &extraGroup{Key: key, SourceLabel: sourceLabel, Windows: map[string]*windowState{}}
+		a.ExtraGroups[key] = g
+	}
+	if g.SourceLabel == "" {
+		g.SourceLabel = sourceLabel
+	}
+	if g.Windows == nil {
+		g.Windows = map[string]*windowState{}
+	}
+	return g
+}
+
+// groupTitle returns the display title of a quota group: the account title
+// for the main group, "title · source label" for an extra group.
+func (a *accountState) groupTitle(groupKey string) string {
+	if g, ok := a.ExtraGroups[groupKey]; ok && g.SourceLabel != "" {
+		return a.Title + " · " + g.SourceLabel
+	}
+	return a.Title
 }
 
 // activeConfirmed reports whether kind was confirmed by an active poll. When
@@ -326,12 +402,16 @@ func normalizeMode(value string, allowed ...string) string {
 	return allowed[0]
 }
 
-// windowLabel returns the display label for a window kind.
+// windowLabel returns the display label for a window kind. Non-standard
+// kinds (a Claude extra window id, an Antigravity bucket id) keep their own
+// id as the label.
 func windowLabel(kind string) (label, short string, period int) {
 	switch kind {
 	case windowFiveHour:
 		return "5 小时窗口", "5h", fiveHourPeriodSeconds
-	default:
+	case windowSevenDay:
 		return "7 天窗口", "7d", sevenDayPeriodSeconds
+	default:
+		return kind, kind, 0
 	}
 }

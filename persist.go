@@ -65,11 +65,11 @@ func newPersistedState() *persistedState {
 	}
 }
 
-func (s *persistedState) baseline(authIndex, window string) *windowBaseline {
-	byWindow, ok := s.Baselines[authIndex]
+func (s *persistedState) baseline(groupKey, window string) *windowBaseline {
+	byWindow, ok := s.Baselines[groupKey]
 	if !ok {
 		byWindow = map[string]*windowBaseline{}
-		s.Baselines[authIndex] = byWindow
+		s.Baselines[groupKey] = byWindow
 	}
 	b, ok := byWindow[window]
 	if !ok {
@@ -79,13 +79,39 @@ func (s *persistedState) baseline(authIndex, window string) *windowBaseline {
 	return b
 }
 
-func (s *persistedState) target(authIndex string) *targetState {
-	t, ok := s.Targets[authIndex]
+func (s *persistedState) target(groupKey string) *targetState {
+	t, ok := s.Targets[groupKey]
 	if !ok {
 		t = &targetState{}
-		s.Targets[authIndex] = t
+		s.Targets[groupKey] = t
 	}
 	return t
+}
+
+// migrateStateKeys moves pre-0.0.11 state keys — bare auth_index values such
+// as "0" — to the Codex main group key ("codex:0:codex:main"). A group key
+// that already exists wins over the migrated one.
+func migrateStateKeys(s *persistedState) {
+	for key, byWindow := range s.Baselines {
+		if strings.Contains(key, ":") {
+			continue
+		}
+		migrated := mainGroupKey("codex", key)
+		if _, exists := s.Baselines[migrated]; !exists {
+			s.Baselines[migrated] = byWindow
+		}
+		delete(s.Baselines, key)
+	}
+	for key, ts := range s.Targets {
+		if strings.Contains(key, ":") {
+			continue
+		}
+		migrated := mainGroupKey("codex", key)
+		if _, exists := s.Targets[migrated]; !exists {
+			s.Targets[migrated] = ts
+		}
+		delete(s.Targets, key)
+	}
 }
 
 // stateFilePath is <data dir>/state.json; "" when there is no data dir.
@@ -122,6 +148,7 @@ func loadPersistedState(dataDir string) *persistedState {
 	if s.CooldownNotices == nil {
 		s.CooldownNotices = map[string]int64{}
 	}
+	migrateStateKeys(&s)
 	return &s
 }
 

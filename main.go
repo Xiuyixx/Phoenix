@@ -46,7 +46,7 @@ import (
 
 const (
 	pluginID       = "phoenix"
-	pluginVersion  = "0.0.10"
+	pluginVersion  = "0.0.11"
 	repository     = "https://github.com/Xiuyixx/Phoenix"
 	managementBase = "/v0/management/phoenix"
 	resourcePath   = "/page"
@@ -100,6 +100,13 @@ type runtime struct {
 	modelsCache   []string
 	modelsFetched time.Time
 	modelsKey     string
+	// lastProfileAt records the last profile fetch per credential, so the
+	// plan of a Claude/Antigravity account is read at most once a day.
+	lastProfileAt map[string]time.Time
+	// hubVersionCached caches the latest Antigravity Hub version from the
+	// update manifest (3h TTL, 30min retry); "" means not read yet.
+	hubVersionCached string
+	hubVersionNext   time.Time
 	// lang is the notification language the panel reported ("zh" | "en");
 	// the page POSTs /language when the management-center language changes.
 	lang string
@@ -163,17 +170,24 @@ type Config struct {
 }
 
 // ProvidersConfig holds the per-provider ignition switches, in the same
-// shape the panel sends (providers.<id>.ignite/.model). Phoenix is
-// Codex-only, so only the codex entry is used; its model is a view onto
-// Ignition.Model (single source of truth, see parseYAML).
+// shape the panel sends (providers.<id>.ignite/.model/.groups/.models).
+// The codex model is a view onto Ignition.Model (single source of truth,
+// see parseYAML); claude/antigravity models stay per-provider.
 type ProvidersConfig struct {
-	Codex ProviderOverride `yaml:"codex" json:"codex"`
+	Codex       ProviderOverride `yaml:"codex" json:"codex"`
+	Claude      ProviderOverride `yaml:"claude" json:"claude"`
+	Antigravity ProviderOverride `yaml:"antigravity" json:"antigravity"`
 }
 
 // ProviderOverride is the per-provider ignition switch for one provider.
+// Groups lists the quota groups auto-ignition covers (Antigravity only;
+// empty means every group); Models maps a group label (case-insensitive)
+// to a per-group model override.
 type ProviderOverride struct {
-	Ignite bool   `yaml:"ignite" json:"ignite"`
-	Model  string `yaml:"model" json:"model"`
+	Ignite bool              `yaml:"ignite" json:"ignite"`
+	Model  string            `yaml:"model" json:"model"`
+	Groups []string          `yaml:"groups,omitempty" json:"groups,omitempty"`
+	Models map[string]string `yaml:"models,omitempty" json:"models,omitempty"`
 }
 type TelegramConfig struct {
 	BotToken string `yaml:"bot_token" json:"bot_token"`
@@ -382,8 +396,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	}
 }
 
+// defaultConfig is the base every config (YAML or PUT patch) merges onto.
+// Antigravity auto-ignition defaults to off like Lamplighter (monitor on,
+// ignite off, groups [Gemini] when it is switched on); Codex and Claude
+// default on.
 func defaultConfig() Config {
-	return Config{Enabled: true, Alerts: AlertConfig{Thresholds: []int{50, 20, 10}, NotifyErrors: true, RecoveryNotify: WindowModes{FiveHour: "after_exhausted", SevenDay: "all"}, ResetReminder: WindowModes{FiveHour: "all", SevenDay: "has_remaining"}}, Reset: ResetConfig{Enabled: true, WeeklyOnly: true, MinimumResetSeconds: 86400}, Ignition: IgnitionConfig{Enabled: true, StartHour: 7, EndHour: 22, EndGraceMinutes: 30, GraceSeconds: 3, FailureRetrySeconds: 300, MaxTransientFailures: 3, Model: "gpt-5-codex", CPABaseURL: "http://127.0.0.1:8317"}, Providers: ProvidersConfig{Codex: ProviderOverride{Ignite: true}}, PollIntervalSeconds: 300, HistoryRetentionDays: 40, RememberChartFilters: true, RememberChartExpanded: true}
+	return Config{Enabled: true, Alerts: AlertConfig{Thresholds: []int{50, 20, 10}, NotifyErrors: true, RecoveryNotify: WindowModes{FiveHour: "after_exhausted", SevenDay: "all"}, ResetReminder: WindowModes{FiveHour: "all", SevenDay: "has_remaining"}}, Reset: ResetConfig{Enabled: true, WeeklyOnly: true, MinimumResetSeconds: 86400}, Ignition: IgnitionConfig{Enabled: true, StartHour: 7, EndHour: 22, EndGraceMinutes: 30, GraceSeconds: 3, FailureRetrySeconds: 300, MaxTransientFailures: 3, Model: "gpt-5-codex", CPABaseURL: "http://127.0.0.1:8317"}, Providers: ProvidersConfig{Codex: ProviderOverride{Ignite: true}, Claude: ProviderOverride{Ignite: true}, Antigravity: ProviderOverride{Ignite: false, Groups: []string{"Gemini"}}}, PollIntervalSeconds: 300, HistoryRetentionDays: 40, RememberChartFilters: true, RememberChartExpanded: true}
 }
 func parseYAML(b []byte, c *Config) {
 	lines := strings.Split(string(b), "\n")
@@ -403,10 +421,20 @@ func parseYAML(b []byte, c *Config) {
 		}
 		c.Alerts.Thresholds[i] = v
 	}
-	// listTarget collects "- item" lines, e.g. reset.credentials.
+	// listTarget collects "- item" lines, e.g. reset.credentials and
+	// providers.antigravity.groups. A listed groups value replaces the
+	// default ["Gemini"] instead of appending to it.
+	groupsListSeen := false
 	listTarget := func() *[]string {
 		if section == "reset" && sub == "credentials" {
 			return &c.Reset.Credentials
+		}
+		if section == "providers" && sub == "groups" {
+			if !groupsListSeen {
+				groupsListSeen = true
+				c.Providers.Antigravity.Groups = nil
+			}
+			return &c.Providers.Antigravity.Groups
 		}
 		return nil
 	}
@@ -546,6 +574,17 @@ func parseYAML(b []byte, c *Config) {
 			// The panel's per-provider model input writes here; it is the
 			// same single value as ignition.model.
 			c.Ignition.Model = v
+		case "providers.claude.ignite":
+			c.Providers.Claude.Ignite = v == "true"
+		case "providers.claude.model":
+			c.Providers.Claude.Model = v
+		case "providers.antigravity.ignite":
+			c.Providers.Antigravity.Ignite = v == "true"
+		case "providers.antigravity.model":
+			c.Providers.Antigravity.Model = v
+		case "providers.antigravity.groups":
+			// Inline form: ["Gemini"] or Gemini, Claude / GPT.
+			c.Providers.Antigravity.Groups = parseStrings(v)
 		}
 	}
 	// Top-level keys win over the legacy ignition.* locations.
@@ -650,10 +689,29 @@ type pluginRegistration struct {
 }
 
 func configFields() []pluginapi.ConfigField {
-	return []pluginapi.ConfigField{{Name: "telegram", Type: pluginapi.ConfigFieldTypeObject, Description: "Telegram Bot Token 与多个 Chat ID（使用分号分隔）"}, {Name: "alerts", Type: pluginapi.ConfigFieldTypeObject, Description: "额度阈值、恢复提醒与账号错误提醒"}, {Name: "reset", Type: pluginapi.ConfigFieldTypeObject, Description: "周用量窗口耗尽时使用 reset credit 自动重置"}, {Name: "reset.credentials", Type: pluginapi.ConfigFieldTypeArray, Description: "纳入重置的凭证（auth_index 或 auth_id），留空为全部 Codex 凭证"}, {Name: "ignition", Type: pluginapi.ConfigFieldTypeObject, Description: "窗口重置后自动发送最小请求"}, {Name: "ignition.model", Type: pluginapi.ConfigFieldTypeString, Description: "点火使用的模型，默认 gpt-5-codex"}, {Name: "poll_interval_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "额度查询间隔（秒）"}}
+	return []pluginapi.ConfigField{
+		{Name: "config_token", Type: pluginapi.ConfigFieldTypeString, Description: "配置应用确认令牌，可为空"},
+		{Name: "telegram", Type: pluginapi.ConfigFieldTypeObject, Description: "Telegram Bot Token 与多个 Chat ID（使用分号分隔）"},
+		{Name: "alerts", Type: pluginapi.ConfigFieldTypeObject, Description: "额度阈值、恢复提醒与账号错误提醒"},
+		{Name: "reset", Type: pluginapi.ConfigFieldTypeObject, Description: "周用量窗口耗尽时使用 reset credit 自动重置"},
+		{Name: "reset.credentials", Type: pluginapi.ConfigFieldTypeArray, Description: "纳入重置的凭证（auth_index 或 auth_id），留空为全部 Codex 凭证"},
+		{Name: "ignition", Type: pluginapi.ConfigFieldTypeObject, Description: "窗口重置后自动发送最小请求"},
+		{Name: "ignition.model", Type: pluginapi.ConfigFieldTypeString, Description: "点火使用的模型，默认 gpt-5-codex"},
+		{Name: "models_api_key", Type: pluginapi.ConfigFieldTypeString, Description: "读取 /v1/models 用的专用 CPA API key"},
+		{Name: "cpa_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "插件访问 CPA 自身的地址"},
+		{Name: "notice_threshold", Type: pluginapi.ConfigFieldTypeNumber, Description: "第一档提醒阈值（剩余百分比）"},
+		{Name: "low_threshold", Type: pluginapi.ConfigFieldTypeNumber, Description: "第二档提醒阈值（剩余百分比）"},
+		{Name: "critical_threshold", Type: pluginapi.ConfigFieldTypeNumber, Description: "第三档提醒阈值（剩余百分比）"},
+		{Name: "recovery_notify", Type: pluginapi.ConfigFieldTypeObject, Description: "额度恢复时通知，five_hour 和 seven_day 各取 off、all 或 after_exhausted"},
+		{Name: "reset_reminder", Type: pluginapi.ConfigFieldTypeObject, Description: "重置前提醒，five_hour 和 seven_day 各取 off、all 或 has_remaining"},
+		{Name: "providers", Type: pluginapi.ConfigFieldTypeObject, Description: "每服务自动点火开关、点火模型与 Antigravity 额度组"},
+		{Name: "poll_interval_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "额度查询间隔（秒）"},
+		{Name: "history_retention_days", Type: pluginapi.ConfigFieldTypeInteger, Description: "额度历史保留天数"},
+		{Name: "data_dir", Type: pluginapi.ConfigFieldTypeString, Description: "状态和历史目录，默认 plugins/data/phoenix"},
+	}
 }
 func managementRegistration() any {
-	return map[string]any{"routes": []map[string]string{{"method": "GET", "path": managementBase + "/status"}, {"method": "GET", "path": managementBase + "/history"}, {"method": "POST", "path": managementBase + "/refresh"}, {"method": "POST", "path": managementBase + "/reset"}, {"method": "POST", "path": managementBase + "/ignite"}, {"method": "POST", "path": managementBase + "/test-notify"}, {"method": "PUT", "path": managementBase + "/settings"}}, "resources": []map[string]string{{"path": resourcePath, "menu": "Phoenix", "description": "额度监控、推送提醒、立即重置与自动点火"}}}
+	return map[string]any{"routes": []map[string]string{{"method": "GET", "path": managementBase + "/status"}, {"method": "GET", "path": managementBase + "/history"}, {"method": "POST", "path": managementBase + "/refresh"}, {"method": "POST", "path": managementBase + "/reset"}, {"method": "POST", "path": managementBase + "/ignite"}, {"method": "POST", "path": managementBase + "/check-models-key"}, {"method": "POST", "path": managementBase + "/test-notify"}, {"method": "PUT", "path": managementBase + "/settings"}}, "resources": []map[string]string{{"path": resourcePath, "menu": "Phoenix", "description": "额度监控、推送提醒、立即重置与自动点火"}}}
 }
 
 // maxPanelEvents is the size of the "最近事件" ring (200); events are
@@ -678,7 +736,9 @@ func handleUsage(request []byte) ([]byte, error) {
 	// (limit_window_minutes 300 -> 5h, 10080 -> 7d) — and only for windows
 	// the active poll has confirmed, so a retired window is never
 	// resurrected by a stale passive record. A successful record clears
-	// the account error and any credential problem.
+	// the account error and any credential problem. Claude records also
+	// carry response headers (UsageRecord.ResponseHeaders) with the
+	// Anthropic rate-limit windows, which update the account the same way.
 	index := r.AuthIndex
 	if index == "" {
 		index = r.AuthID
@@ -688,7 +748,9 @@ func handleUsage(request []byte) ([]byte, error) {
 	triggerReset := false
 	rt.mu.Lock()
 	acct := rt.getOrCreateAccountLocked(index)
-	acct.Provider = r.Provider
+	if p := normalizeProviderID(r.Provider); p != "" {
+		acct.Provider = p
+	}
 	acct.AuthID = r.AuthID
 	if acct.Title == "" {
 		acct.Title = "凭证 " + index
@@ -708,8 +770,8 @@ func handleUsage(request []byte) ([]byte, error) {
 				w.Source = "passive"
 				w.ObservedAt = now
 				records = append(records, historyRecord{Kind: "s", Time: now.Unix(), Group: index, Window: kind, Remaining: 0, Reset: w.Reset.Unix(), Source: "passive"})
-				rt.evaluateWindowAlertsLocked(acct, kind, *w, "passive", now)
-				observeReset(rt.state.target(index), w.Reset, now, true)
+				rt.evaluateWindowAlertsLocked(acct, mainGroupKey("codex", index), kind, *w, "passive", now)
+				observeReset(rt.state.target(mainGroupKey("codex", index)), w.Reset, now, true)
 			}
 			if rt.cfg.Reset.Enabled && included(rt.cfg.Reset.Credentials, r) && exhaustedForReset(r.Failure.Body, rt.cfg.Reset.MinimumResetSeconds, rt.cfg.Reset.WeeklyOnly) {
 				triggerReset = true
@@ -738,12 +800,15 @@ func handleUsage(request []byte) ([]byte, error) {
 		}
 	} else {
 		acct.Error = ""
-		delete(rt.pollErrs, index)
+		delete(rt.pollErrs, mainGroupKey(acct.Provider, index))
 		rt.clearCredentialProblemLocked(acct)
+		if acct.Provider == "claude" && len(r.ResponseHeaders) > 0 {
+			rt.applyPassiveClaudeLocked(acct, index, r.ResponseHeaders, now, &records)
+		}
 	}
 	// Keep the legacy usage map in sync (keyed by auth_index).
 	snap := rt.lastUsage[index]
-	snap.Provider = r.Provider
+	snap.Provider = acct.Provider
 	snap.AuthID = r.AuthID
 	snap.UpdatedAt = now
 	if r.Failed {
@@ -772,6 +837,53 @@ func handleUsage(request []byte) ([]byte, error) {
 		}
 	}
 	return okEnvelope(struct{}{}), nil
+}
+
+// applyPassiveClaudeLocked applies Claude rate-limit headers from a
+// successful usage record: main-group windows go to acct.Windows, other
+// groups (Fable) to acct.ExtraGroups. Only windows the active poll has
+// confirmed are updated, like the Codex passive path. Caller holds rt.mu.
+func (rt *runtime) applyPassiveClaudeLocked(acct *accountState, index string, header http.Header, now time.Time, records *[]historyRecord) {
+	for _, g := range ParseClaudeHeaders(header) {
+		isMain := g.Key == "claude:main"
+		var fullKey string
+		if isMain {
+			fullKey = mainGroupKey("claude", index)
+		} else {
+			fullKey = groupKeyFor("claude", index, strings.TrimPrefix(g.Key, "claude:"))
+		}
+		for _, w := range g.Windows {
+			kind := quotaWindowKind(w)
+			var ws *windowState
+			var group string
+			if isMain {
+				if !acct.activeConfirmed(kind) {
+					continue
+				}
+				ws = acct.window(kind)
+				group = index
+			} else {
+				eg := acct.extraGroup(fullKey, g.SourceLabel)
+				if !eg.activeConfirmed(kind) {
+					continue
+				}
+				ws = eg.window(kind)
+				group = fullKey
+			}
+			ws.Remaining = w.Remaining
+			ws.Reset = w.Reset
+			ws.Source = "passive"
+			ws.ObservedAt = now
+			if w.Period > 0 {
+				ws.PeriodSeconds = int(w.Period.Seconds())
+			}
+			*records = append(*records, historyRecord{Kind: "s", Time: now.Unix(), Group: group, Window: kind, Remaining: w.Remaining, Reset: w.Reset.Unix(), Source: "passive"})
+			rt.evaluateWindowAlertsLocked(acct, fullKey, kind, *ws, "passive", now)
+			if isMain && kind == windowFiveHour {
+				observeReset(rt.state.target(fullKey), w.Reset, now, true)
+			}
+		}
+	}
 }
 
 func problemText(kind string, statusCode int) string {
@@ -870,6 +982,9 @@ func (rt *runtime) initLocked() {
 	}
 	if rt.state == nil {
 		rt.state = newPersistedState()
+	}
+	if rt.lastProfileAt == nil {
+		rt.lastProfileAt = map[string]time.Time{}
 	}
 }
 
@@ -1026,6 +1141,11 @@ func weeklyExhausted(body string, minimum int) bool {
 type authCredentials struct {
 	AccessToken string
 	AccountID   string
+	// ProjectID / ProxyURL / UserAgent are the Antigravity fields
+	// (Lamplighter ParseCredential); empty for Codex/Claude credentials.
+	ProjectID string
+	ProxyURL  string
+	UserAgent string
 }
 type resetCredit struct {
 	ID        string `json:"id"`
@@ -1183,9 +1303,25 @@ func extractCredentials(raw []byte) authCredentials {
 			creds.AccessToken, _ = x["access_token"].(string)
 		}
 	}
+	if creds.AccessToken == "" {
+		creds.AccessToken, _ = rawMap["accessToken"].(string)
+	}
 	creds.AccountID, _ = rawMap["account_id"].(string)
 	if creds.AccountID == "" {
 		creds.AccountID, _ = rawMap["chatgpt_account_id"].(string)
+	}
+	if creds.AccountID == "" {
+		creds.AccountID, _ = rawMap["chatgptAccountId"].(string)
+	}
+	if creds.AccountID == "" {
+		if md, ok := rawMap["metadata"].(map[string]any); ok {
+			for _, key := range []string{"account_id", "chatgpt_account_id", "chatgptAccountId"} {
+				if v, _ := md[key].(string); v != "" {
+					creds.AccountID = v
+					break
+				}
+			}
+		}
 	}
 	if creds.AccountID == "" {
 		if token, ok := rawMap["id_token"].(string); ok {
@@ -1198,6 +1334,9 @@ func extractCredentials(raw []byte) authCredentials {
 	if strings.HasPrefix(creds.AccountID, "email_") || strings.HasPrefix(creds.AccountID, "local_") {
 		creds.AccountID = ""
 	}
+	creds.ProjectID = extractProjectID(rawMap)
+	creds.ProxyURL = extractProxyURL(rawMap)
+	creds.UserAgent = extractUserAgent(rawMap)
 	return creds
 }
 
@@ -1250,17 +1389,33 @@ func jsonManagementResponse(status int, v any) ([]byte, error) {
 }
 
 // targetAuthIndex resolves a panel ignition target to an auth index: the
-// Lamplighter group key "codex:<auth_index>:codex:main" carries the index
+// Lamplighter group key "<provider>:<auth_index>:<raw>" carries the index
 // in its second segment; a bare auth_index passes through unchanged.
 func targetAuthIndex(target, authIndex string) string {
 	if authIndex != "" {
 		return authIndex
 	}
 	parts := strings.Split(target, ":")
-	if len(parts) >= 2 && parts[0] == "codex" {
+	if len(parts) >= 2 && parts[0] != "" {
 		return parts[1]
 	}
 	return target
+}
+
+// targetGroupKey resolves a panel ignition target to a quota-group key: a
+// full group key passes through, a bare auth_index (or an explicit
+// auth_index) means the Codex main group of that index.
+func targetGroupKey(target, authIndex string) string {
+	if target != "" {
+		if _, _, _, ok := parseGroupKey(target); ok && strings.Contains(target, ":") {
+			return target
+		}
+		return mainGroupKey("codex", target)
+	}
+	if authIndex != "" {
+		return mainGroupKey("codex", authIndex)
+	}
+	return ""
 }
 
 func handleManagement(request []byte) ([]byte, error) {
@@ -1327,14 +1482,14 @@ func handleManagement(request []byte) ([]byte, error) {
 			Target    string `json:"target"`
 		}
 		_ = json.Unmarshal(req.Body, &in)
-		index := targetAuthIndex(in.Target, in.AuthIndex)
-		if index == "" {
+		groupKey := targetGroupKey(in.Target, in.AuthIndex)
+		if groupKey == "" {
 			// No credential named: fall back to the first Codex credential
 			// the host knows about, like igniteFor does.
 			if entries, err := rt.host.authList(); err == nil {
 				for _, e := range entries {
 					if isCodexEntry(e) {
-						index = e.AuthIndex
+						groupKey = mainGroupKey("codex", e.AuthIndex)
 						break
 					}
 				}
@@ -1343,23 +1498,24 @@ func handleManagement(request []byte) ([]byte, error) {
 		if !rt.cfg.Ignition.Enabled {
 			return jsonManagementResponse(http.StatusOK, map[string]any{"ok": false, "error": "ignition disabled", "status": rt.status()})
 		}
-		if !rt.cfg.Providers.Codex.Ignite {
-			return jsonManagementResponse(http.StatusOK, map[string]any{"ok": false, "error": "codex ignition not enabled", "status": rt.status()})
+		provider := groupProvider(groupKey)
+		if groupKey != "" && !rt.providerIgniteEnabled(provider) {
+			return jsonManagementResponse(http.StatusOK, map[string]any{"ok": false, "error": provider + " ignition not enabled", "status": rt.status()})
 		}
 		// Synchronous like Lamplighter (up to the confirmation delays):
 		// success is a LastSuccess that moved during this call.
 		var before time.Time
-		if index != "" {
+		if groupKey != "" {
 			rt.mu.Lock()
-			before = rt.state.target(index).LastSuccess
+			before = rt.state.target(groupKey).LastSuccess
 			rt.mu.Unlock()
 		}
-		rt.ignite(index)
+		rt.igniteFor(groupKey, true)
 		ok := false
 		errStr := ""
-		if index != "" {
+		if groupKey != "" {
 			rt.mu.Lock()
-			ts := rt.state.target(index)
+			ts := rt.state.target(groupKey)
 			ok = ts.LastSuccess.After(before)
 			if !ok {
 				errStr = ts.LastError
@@ -1370,6 +1526,26 @@ func handleManagement(request []byte) ([]byte, error) {
 			errStr = "ignition failed"
 		}
 		return jsonManagementResponse(http.StatusOK, map[string]any{"ok": ok, "error": errStr, "status": rt.status()})
+	case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/check-models-key"):
+		// The panel cannot check a models API key itself: it reaches CPA
+		// through a proxy that drops the Authorization header, so CPA
+		// always answers 401 and the key could never be saved. The plugin
+		// checks the key directly against CPA /v1/models instead.
+		var in struct {
+			Key string `json:"key"`
+		}
+		_ = json.Unmarshal(req.Body, &in)
+		key := strings.TrimSpace(in.Key)
+		if key == "" {
+			return jsonManagementResponse(http.StatusOK, map[string]any{"ok": false, "refused": false, "reason": "key is empty"})
+		}
+		if _, err := fetchModelsList(rt.cfg.Ignition.CPABaseURL, key); err != nil {
+			if strings.Contains(err.Error(), "HTTP 401") || strings.Contains(err.Error(), "HTTP 403") {
+				return jsonManagementResponse(http.StatusOK, map[string]any{"ok": false, "refused": true})
+			}
+			return jsonManagementResponse(http.StatusOK, map[string]any{"ok": false, "refused": false, "reason": err.Error()})
+		}
+		return jsonManagementResponse(http.StatusOK, map[string]any{"ok": true})
 	case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/test-notify"):
 		results := rt.testNotifyResults()
 		ok := false
@@ -1406,6 +1582,7 @@ func handleManagement(request []byte) ([]byte, error) {
 			return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": "invalid settings"})
 		}
 		rt.mu.Lock()
+		oldModelsKey := rt.cfg.Ignition.ModelsAPIKey
 		for key, raw := range patch {
 			switch key {
 			case "telegram":
@@ -1428,14 +1605,11 @@ func handleManagement(request []byte) ([]byte, error) {
 				}
 				_ = json.Unmarshal(raw, &rt.cfg.Reset)
 			case "ignition":
-				_ = json.Unmarshal(raw, &rt.cfg.Ignition)
+				rt.mergeIgnitionPatch(raw)
 			case "providers":
-				_ = json.Unmarshal(raw, &rt.cfg.Providers)
-				// The panel's per-provider model input is a view onto
-				// ignition.model (single source of truth).
-				if rt.cfg.Providers.Codex.Model != "" {
-					rt.cfg.Ignition.Model = rt.cfg.Providers.Codex.Model
-				}
+				// Merge per provider: a patch with only claude must not
+				// wipe codex/antigravity.
+				rt.mergeProvidersPatch(raw)
 			case "poll_interval_seconds":
 				_ = json.Unmarshal(raw, &rt.cfg.PollIntervalSeconds)
 			case "history_retention_days":
@@ -1455,7 +1629,17 @@ func handleManagement(request []byte) ([]byte, error) {
 			case "reset_reminder":
 				_ = json.Unmarshal(raw, &rt.cfg.Alerts.ResetReminder)
 			case "models_api_key":
-				_ = json.Unmarshal(raw, &rt.cfg.Ignition.ModelsAPIKey)
+				// Absent or "" means "leave the key unchanged" (the page
+				// omits the key when the input is empty); null clears it;
+				// a non-empty value sets it.
+				if string(raw) == "null" {
+					rt.cfg.Ignition.ModelsAPIKey = ""
+				} else {
+					var v string
+					if err := json.Unmarshal(raw, &v); err == nil && v != "" {
+						rt.cfg.Ignition.ModelsAPIKey = v
+					}
+				}
 			case "cpa_base_url":
 				_ = json.Unmarshal(raw, &rt.cfg.Ignition.CPABaseURL)
 			case "remember_chart_filters":
@@ -1477,12 +1661,117 @@ func handleManagement(request []byte) ([]byte, error) {
 		}
 		// A poll-interval change takes effect without restart: pollLoop
 		// rebuilds its timer from the current config every iteration.
+		modelsKeyChanged := oldModelsKey != rt.cfg.Ignition.ModelsAPIKey
 		rt.mu.Unlock()
+		if modelsKeyChanged {
+			// A new key makes the warm model list stale; re-read it in
+			// the background so status.next_models reflects the key
+			// promptly instead of waiting for the next ignition attempt.
+			// (A CPA PATCH save warms the cache the same way through
+			// reconfigure; this covers the in-memory PUT path.)
+			go rt.warmModelsCache()
+		}
 		rt.host.log("info", "Phoenix settings updated", nil)
 		return jsonManagementResponse(http.StatusOK, rt.status())
 	}
 	return jsonManagementResponse(http.StatusNotFound, map[string]any{"error": "route not found"})
 }
+
+// mergeProvidersPatch merges a PUT /settings "providers" object per
+// provider and per field, so a patch that only mentions claude never wipes
+// the codex/antigravity settings. The codex model is a view onto
+// ignition.model (single source of truth); claude/antigravity models stay
+// per-provider.
+func (rt *runtime) mergeProvidersPatch(raw json.RawMessage) {
+	var patch map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &patch); err != nil {
+		return
+	}
+	for id, praw := range patch {
+		if id != "codex" && id != "claude" && id != "antigravity" {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(praw, &fields); err != nil {
+			continue
+		}
+		ov := rt.cfg.providerOverride(id)
+		for key, value := range fields {
+			switch key {
+			case "ignite":
+				var b bool
+				if json.Unmarshal(value, &b) == nil {
+					ov.Ignite = b
+				}
+			case "model":
+				var s string
+				if json.Unmarshal(value, &s) == nil && s != "" {
+					ov.Model = s
+					if id == "codex" {
+						rt.cfg.Ignition.Model = s
+					}
+				}
+			case "groups":
+				if g := parseGroupsValue(value); g != nil {
+					ov.Groups = g
+				}
+			case "models":
+				var m map[string]string
+				if json.Unmarshal(value, &m) == nil {
+					if ov.Models == nil {
+						ov.Models = map[string]string{}
+					}
+					for mk, mv := range m {
+						ov.Models[mk] = mv
+					}
+				}
+			}
+		}
+	}
+}
+
+// parseGroupsValue reads a groups value as a JSON array or a
+// comma-separated string; nil when it is neither.
+func parseGroupsValue(raw json.RawMessage) []string {
+	var arr []string
+	if json.Unmarshal(raw, &arr) == nil {
+		return arr
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return parseStrings(s)
+	}
+	return nil
+}
+
+// mergeIgnitionPatch merges a PUT /settings "ignition" object, except that
+// a models_api_key of "" inside it means "leave the key unchanged" (the
+// page sends the key as a top-level field; an empty nested value must not
+// clear the stored key), while null clears it.
+func (rt *runtime) mergeIgnitionPatch(raw json.RawMessage) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return
+	}
+	clearKey := false
+	if keyRaw, ok := fields["models_api_key"]; ok {
+		if string(keyRaw) == "null" {
+			clearKey = true
+			delete(fields, "models_api_key")
+		} else {
+			var v string
+			if err := json.Unmarshal(keyRaw, &v); err == nil && v == "" {
+				delete(fields, "models_api_key")
+			}
+		}
+	}
+	raw, _ = json.Marshal(fields)
+	_ = json.Unmarshal(raw, &rt.cfg.Ignition)
+	if clearKey {
+		rt.cfg.Ignition.ModelsAPIKey = ""
+	}
+}
+
 func (rt *runtime) reset(index string) error {
 	rt.host.log("info", "Phoenix manual reset requested", nil)
 	if index == "" {
@@ -1504,6 +1793,11 @@ func (rt *runtime) reset(index string) error {
 		rt.host.log("warn", "Phoenix manual reset skipped: no credential available", nil)
 		rt.addEvent("error", "手动重置跳过：没有可用的凭证")
 		return fmt.Errorf("没有可用的凭证")
+	}
+	// Reset credits are Codex-only: the reset button is only rendered on
+	// Codex rows, but the route must still refuse a non-Codex index.
+	if prov := rt.providerOfIndex(index); prov != "" && prov != "codex" {
+		return fmt.Errorf("reset is only supported for Codex credentials (provider %s)", prov)
 	}
 	if !rt.beginReset(index) {
 		rt.addEventFor("info", fmt.Sprintf("手动重置跳过：凭证 %s 已有进行中的重置", index), index, windowSevenDay, "reset", nil)
@@ -1530,6 +1824,21 @@ func codexProvider(e pluginapi.HostAuthFileEntry) string {
 
 func isCodexEntry(e pluginapi.HostAuthFileEntry) bool { return codexProvider(e) == "codex" }
 
+// providerOfIndex returns the canonical provider of a credential by auth
+// index, or "" when the host does not list it.
+func (rt *runtime) providerOfIndex(index string) string {
+	entries, err := rt.host.authList()
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if e.AuthIndex == index {
+			return providerOf(e)
+		}
+	}
+	return ""
+}
+
 func firstCredential(v []string) string {
 	for _, x := range v {
 		if strings.TrimSpace(x) != "" {
@@ -1537,10 +1846,6 @@ func firstCredential(v []string) string {
 		}
 	}
 	return ""
-}
-func (rt *runtime) ignite(index string) {
-	rt.host.log("info", "Phoenix manual ignition requested", nil)
-	rt.igniteFor(index, true)
 }
 func (rt *runtime) notify(title, body string) bool {
 	if !rt.cfg.Telegram.Enabled || rt.cfg.Telegram.BotToken == "" {
@@ -1633,10 +1938,11 @@ func (rt *runtime) pruneIfDue() {
 	rt.mu.Unlock()
 }
 
-// pollOnce enumerates Codex credentials through the host, queries the
-// upstream usage endpoint for each, and fills the dual-window account
-// state. Poll failures are recorded per account (pollErrs) and surfaced in
-// status, not silently swallowed.
+// pollOnce enumerates credentials through the host and queries the
+// upstream usage endpoint of each supported provider (codex, claude,
+// antigravity; kimi/grok are monitor-only and unknown providers are
+// skipped), filling the account state. Poll failures are recorded per
+// group (pollErrs) and surfaced in status, not silently swallowed.
 func (rt *runtime) pollOnce() {
 	if !rt.cfg.Enabled {
 		return
@@ -1655,19 +1961,23 @@ func (rt *runtime) pollOnce() {
 	rt.mu.Lock()
 	rt.listErr = ""
 	rt.mu.Unlock()
-	codexCount := 0
+	supported := 0
 	for _, e := range entries {
-		if !isCodexEntry(e) {
-			continue
+		switch providerOf(e) {
+		case "codex":
+			supported++
+			rt.pollCredential(e.AuthIndex, e)
+		case "claude", "antigravity":
+			supported++
+			rt.pollProviderCredential(e.AuthIndex, e, providerOf(e))
 		}
-		codexCount++
-		rt.pollCredential(e.AuthIndex, e)
 	}
-	if codexCount == 0 {
+	if supported == 0 {
 		// Loud failure instead of a silent empty panel: the poller ran,
-		// the host listed credentials, but none matched as Codex. Log the
-		// distinct provider/type values seen so the mismatch is diagnosable
-		// from the CPA journal instead of guessable.
+		// the host listed credentials, but none matched a supported
+		// provider. Log the distinct provider/type values seen so the
+		// mismatch is diagnosable from the CPA journal instead of
+		// guessable.
 		seen := map[string]bool{}
 		var kinds []string
 		for _, e := range entries {
@@ -1685,14 +1995,14 @@ func (rt *runtime) pollOnce() {
 				break
 			}
 		}
-		msg := fmt.Sprintf("auth list has %d entries but no Codex credential matched (checked Provider, fell back to Type); saw: %s", len(entries), strings.Join(kinds, ", "))
+		msg := fmt.Sprintf("auth list has %d entries but no supported credential matched (codex/claude/antigravity; checked Provider, fell back to Type); saw: %s", len(entries), strings.Join(kinds, ", "))
 		if len(entries) == 0 {
 			msg = "auth list is empty, no credentials to poll"
 		}
 		rt.mu.Lock()
 		rt.listErr = msg
 		rt.mu.Unlock()
-		rt.host.log("warn", fmt.Sprintf("Phoenix quota poll found no Codex credential (entries=%d; saw: %s)", len(entries), strings.Join(kinds, ", ")), nil)
+		rt.host.log("warn", fmt.Sprintf("Phoenix quota poll found no supported credential (entries=%d; saw: %s)", len(entries), strings.Join(kinds, ", ")), nil)
 	}
 	now := time.Now()
 	rt.mu.Lock()
@@ -1708,21 +2018,21 @@ func (rt *runtime) pollOnce() {
 func (rt *runtime) pollCredential(index string, entry pluginapi.HostAuthFileEntry) {
 	a, err := rt.host.authGet(index)
 	if err != nil {
-		rt.recordPollErr(index, err.Error())
+		rt.recordPollErr(index, mainGroupKey("codex", index), err.Error())
 		return
 	}
 	creds := extractCredentials(a.JSON)
 	if creds.AccessToken == "" {
-		rt.recordPollErr(index, "access token unavailable")
+		rt.recordPollErr(index, mainGroupKey("codex", index), "access token unavailable")
 		return
 	}
 	resp, err := rt.host.httpDo(pluginapi.HTTPRequest{Method: http.MethodGet, URL: "https://chatgpt.com/backend-api/wham/usage", Headers: resetHeaders(creds)})
 	if err != nil {
-		rt.recordPollErr(index, err.Error())
+		rt.recordPollErr(index, mainGroupKey("codex", index), err.Error())
 		return
 	}
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		rt.recordPollErr(index, fmt.Sprintf("upstream status %d", resp.StatusCode))
+		rt.recordPollErr(index, mainGroupKey("codex", index), fmt.Sprintf("upstream status %d", resp.StatusCode))
 		rt.mu.Lock()
 		acct := rt.getOrCreateAccountLocked(index)
 		rt.recordCredentialFailureLocked(acct, "auth", fmt.Sprintf("upstream status %d", resp.StatusCode), time.Now())
@@ -1731,12 +2041,12 @@ func (rt *runtime) pollCredential(index string, entry pluginapi.HostAuthFileEntr
 		return
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		rt.recordPollErr(index, fmt.Sprintf("upstream status %d", resp.StatusCode))
+		rt.recordPollErr(index, mainGroupKey("codex", index), fmt.Sprintf("upstream status %d", resp.StatusCode))
 		return
 	}
 	windows, plan, ok := parseCodexUsageDual(resp.Body)
 	if !ok {
-		rt.recordPollErr(index, "usage response has no recognizable window")
+		rt.recordPollErr(index, mainGroupKey("codex", index), "usage response has no recognizable window")
 		return
 	}
 	now := time.Now()
@@ -1767,7 +2077,7 @@ func (rt *runtime) pollCredential(index string, entry pluginapi.HostAuthFileEntr
 	}
 	acct.Error = ""
 	acct.UpdatedAt = now
-	delete(rt.pollErrs, index)
+	delete(rt.pollErrs, mainGroupKey("codex", index))
 	rt.clearCredentialProblemLocked(acct)
 	// A successful active sample proves the quota is back: any recorded
 	// CPA cooldown is stale history, not a live cooldown.
@@ -1795,9 +2105,9 @@ func (rt *runtime) pollCredential(index string, entry pluginapi.HostAuthFileEntr
 		w.Source = "active"
 		w.ObservedAt = now
 		records = append(records, historyRecord{Kind: "s", Time: now.Unix(), Group: index, Window: kind, Remaining: sample.Remaining, Reset: sample.Reset.Unix(), Source: "active"})
-		rt.evaluateWindowAlertsLocked(acct, kind, *w, "active", now)
+		rt.evaluateWindowAlertsLocked(acct, mainGroupKey("codex", index), kind, *w, "active", now)
 		if kind == windowFiveHour {
-			observeReset(rt.state.target(index), sample.Reset, now, false)
+			observeReset(rt.state.target(mainGroupKey("codex", index)), sample.Reset, now, false)
 		}
 	}
 	acct.ActiveWindows = confirmed
@@ -1821,16 +2131,398 @@ func (rt *runtime) pollCredential(index string, entry pluginapi.HostAuthFileEntr
 	rt.drainPending()
 }
 
-// recordPollErr records a per-account poll failure for status surfacing.
-func (rt *runtime) recordPollErr(index, msg string) {
+// pollProviderCredential polls one Claude or Antigravity credential: fetch
+// the provider quota, apply its groups to the account state, and read the
+// plan from the provider profile at most once a day.
+func (rt *runtime) pollProviderCredential(index string, entry pluginapi.HostAuthFileEntry, provider string) {
+	a, err := rt.host.authGet(index)
+	if err != nil {
+		rt.recordPollErr(index, mainGroupKey(provider, index), err.Error())
+		return
+	}
+	creds := extractCredentials(a.JSON)
+	if creds.AccessToken == "" {
+		rt.recordPollErr(index, mainGroupKey(provider, index), "access token unavailable")
+		return
+	}
+	var groups []quotaGroup
+	switch provider {
+	case "claude":
+		groups, err = rt.fetchClaudeQuota(creds)
+	case "antigravity":
+		groups, err = rt.fetchAntigravityQuota(creds)
+	}
+	if err != nil {
+		rt.recordPollErr(index, mainGroupKey(provider, index), err.Error())
+		if strings.Contains(err.Error(), "status 401") || strings.Contains(err.Error(), "status 403") {
+			rt.mu.Lock()
+			acct := rt.getOrCreateAccountLocked(index)
+			rt.recordCredentialFailureLocked(acct, "auth", err.Error(), time.Now())
+			rt.mu.Unlock()
+			rt.drainPending()
+		}
+		return
+	}
+	now := time.Now()
+	rt.mu.Lock()
+	acct := rt.getOrCreateAccountLocked(index)
+	acct.Provider = provider
+	acct.AuthID = a.Name
+	if acct.AuthID == "" {
+		acct.AuthID = index
+	}
+	if entry.Name != "" {
+		acct.Name = entry.Name
+	}
+	if entry.Email != "" {
+		acct.Email = entry.Email
+	}
+	if entry.Note != "" {
+		acct.Note = entry.Note
+	}
+	acct.Unavailable = entry.Unavailable
+	acct.UpdatedAt = now
+	rt.mu.Unlock()
+	rt.applyQuotaGroups(index, provider, groups, now)
+	rt.maybeFetchProfile(index, provider, creds, now)
+}
+
+// applyQuotaGroups applies parsed provider groups to an account: the main
+// group fills acct.Windows, other groups fill acct.ExtraGroups. History
+// samples are keyed by auth_index for main groups and by group key for
+// extra groups; alerts run per group window.
+func (rt *runtime) applyQuotaGroups(index, provider string, groups []quotaGroup, now time.Time) {
+	var records []historyRecord
 	rt.mu.Lock()
 	rt.initLocked()
-	rt.pollErrs[index] = msg
 	acct := rt.getOrCreateAccountLocked(index)
-	acct.Error = msg
+	var confirmedMain []string
+	anyExhausted := false
+	for _, g := range groups {
+		isMain := g.Key == provider+":main"
+		var fullKey string
+		if isMain {
+			fullKey = mainGroupKey(provider, index)
+		} else {
+			fullKey = groupKeyFor(provider, index, strings.TrimPrefix(g.Key, provider+":"))
+		}
+		var confirmedExtra []string
+		for _, w := range g.Windows {
+			kind := quotaWindowKind(w)
+			var ws *windowState
+			var historyGroup string
+			if isMain {
+				ws = acct.window(kind)
+				confirmedMain = append(confirmedMain, kind)
+				historyGroup = index
+			} else {
+				eg := acct.extraGroup(fullKey, g.SourceLabel)
+				ws = eg.window(kind)
+				confirmedExtra = append(confirmedExtra, kind)
+				historyGroup = fullKey
+			}
+			ws.Remaining = w.Remaining
+			ws.Reset = w.Reset
+			ws.Source = "active"
+			ws.ObservedAt = now
+			if w.Period > 0 {
+				ws.PeriodSeconds = int(w.Period.Seconds())
+			}
+			if w.Remaining <= exhaustedRemaining {
+				anyExhausted = true
+			}
+			records = append(records, historyRecord{Kind: "s", Time: now.Unix(), Group: historyGroup, Window: kind, Remaining: w.Remaining, Reset: w.Reset.Unix(), Source: "active"})
+			rt.evaluateWindowAlertsLocked(acct, fullKey, kind, *ws, "active", now)
+			if isMain && kind == windowFiveHour {
+				observeReset(rt.state.target(fullKey), w.Reset, now, false)
+			}
+			delete(rt.pollErrs, fullKey)
+		}
+		if !isMain && len(confirmedExtra) > 0 {
+			acct.ExtraGroups[fullKey].ActiveWindows = confirmedExtra
+		}
+	}
+	if len(confirmedMain) > 0 {
+		acct.ActiveWindows = confirmedMain
+	}
+	if !anyExhausted {
+		acct.CooldownUntil = time.Time{}
+	}
+	rt.recomputeAccountErrorLocked(acct)
+	if plan := groupsPlan(groups); plan != "" {
+		acct.Plan = plan
+	}
+	// Keep the legacy usage map in sync (main group only).
+	snap := rt.lastUsage[index]
+	snap.Provider = provider
+	snap.AuthID = acct.AuthID
+	snap.Status = "ok"
+	snap.UpdatedAt = now
+	if w, ok := acct.Windows[windowSevenDay]; ok {
+		snap.WeeklyRemaining = int(w.Remaining)
+		snap.WeeklyResetAt = w.Reset
+	}
+	if w, ok := acct.Windows[windowFiveHour]; ok {
+		snap.FiveRemaining = int(w.Remaining)
+		snap.FiveResetAt = w.Reset
+	}
+	rt.lastUsage[index] = snap
+	rt.mu.Unlock()
+	rt.appendHistoryRecords(records)
+	rt.drainPending()
+}
+
+// groupsPlan returns the plan carried by a quota fetch, if any.
+func groupsPlan(groups []quotaGroup) string {
+	for _, g := range groups {
+		if g.Plan != "" {
+			return g.Plan
+		}
+	}
+	return ""
+}
+
+// fetchClaudeQuota reads the Claude oauth/usage endpoint for one credential.
+func (rt *runtime) fetchClaudeQuota(creds authCredentials) ([]quotaGroup, error) {
+	header := http.Header{
+		"Authorization":  []string{"Bearer " + creds.AccessToken},
+		"User-Agent":     []string{claudeUserAgent},
+		"anthropic-beta": []string{"oauth-2025-04-20"},
+	}
+	resp, err := rt.host.httpDo(pluginapi.HTTPRequest{Method: http.MethodGet, URL: claudeUsageURL, Headers: header})
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upstream status %d", resp.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(resp.Body, &payload); err != nil {
+		return nil, fmt.Errorf("Claude usage response is not JSON: %w", err)
+	}
+	return ParseClaudeUsage(payload)
+}
+
+// fetchClaudeProfile reads the plan of a Claude account from the OAuth
+// profile, which the usage response does not state.
+func (rt *runtime) fetchClaudeProfile(creds authCredentials) (string, error) {
+	header := http.Header{
+		"Authorization":  []string{"Bearer " + creds.AccessToken},
+		"User-Agent":     []string{claudeUserAgent},
+		"anthropic-beta": []string{"oauth-2025-04-20"},
+	}
+	resp, err := rt.host.httpDo(pluginapi.HTTPRequest{Method: http.MethodGet, URL: claudeProfileURL, Headers: header})
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("upstream status %d", resp.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(resp.Body, &payload); err != nil {
+		return "", fmt.Errorf("Claude profile response is not JSON: %w", err)
+	}
+	return ParseClaudeProfile(payload)
+}
+
+// fetchAntigravityQuota reads the Antigravity quota summary for one
+// credential, trying the quota URLs in order until one returns groups.
+func (rt *runtime) fetchAntigravityQuota(creds authCredentials) ([]quotaGroup, error) {
+	if creds.ProjectID == "" {
+		return nil, fmt.Errorf("Antigravity 凭证缺少 project_id")
+	}
+	body, _ := json.Marshal(map[string]string{"project": creds.ProjectID})
+	agent := rt.antigravityUserAgent(creds)
+	var lastErr error
+	for _, url := range antigravityQuotaURLs {
+		header := http.Header{
+			"Authorization": []string{"Bearer " + creds.AccessToken},
+			"User-Agent":    []string{agent},
+		}
+		resp, err := rt.host.httpDo(pluginapi.HTTPRequest{Method: http.MethodPost, URL: url, Headers: header, Body: body})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			return nil, fmt.Errorf("upstream status %d", resp.StatusCode)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("upstream status %d", resp.StatusCode)
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(resp.Body, &payload); err != nil {
+			lastErr = fmt.Errorf("Antigravity quota response is not JSON: %w", err)
+			continue
+		}
+		groups, err := ParseAntigravityQuota(payload)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return groups, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("Antigravity 未返回额度组")
+	}
+	return nil, lastErr
+}
+
+// fetchAntigravityProfile reads the plan of an Antigravity account with the
+// request body and User-Agent CPA uses for loadCodeAssist.
+func (rt *runtime) fetchAntigravityProfile(creds authCredentials) (string, error) {
+	body, _ := json.Marshal(map[string]any{"metadata": map[string]string{"ideType": "ANTIGRAVITY"}})
+	header := http.Header{
+		"Authorization": []string{"Bearer " + creds.AccessToken},
+		"User-Agent":    []string{rt.antigravityUserAgent(creds)},
+	}
+	resp, err := rt.host.httpDo(pluginapi.HTTPRequest{Method: http.MethodPost, URL: antigravityLoadCodeAssistURL, Headers: header, Body: body})
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("upstream status %d", resp.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(resp.Body, &payload); err != nil {
+		return "", fmt.Errorf("Antigravity profile response is not JSON: %w", err)
+	}
+	return ParseAntigravityProfile(payload)
+}
+
+// maybeFetchProfile reads the plan of a Claude/Antigravity account at most
+// once a day. Failures are silent: the plan is display-only.
+func (rt *runtime) maybeFetchProfile(index, provider string, creds authCredentials, now time.Time) {
+	if provider != "claude" && provider != "antigravity" {
+		return
+	}
+	rt.mu.Lock()
+	rt.initLocked()
+	if last, ok := rt.lastProfileAt[index]; ok && now.Sub(last) < 24*time.Hour {
+		rt.mu.Unlock()
+		return
+	}
+	rt.lastProfileAt[index] = now
+	rt.mu.Unlock()
+	var plan string
+	var err error
+	switch provider {
+	case "claude":
+		plan, err = rt.fetchClaudeProfile(creds)
+	case "antigravity":
+		plan, err = rt.fetchAntigravityProfile(creds)
+	}
+	if err != nil || plan == "" {
+		return
+	}
+	rt.mu.Lock()
+	if acct := rt.accounts[index]; acct != nil {
+		acct.Plan = plan
+	}
+	rt.mu.Unlock()
+}
+
+// antigravityUserAgent returns the User-Agent CPA uses for the credential:
+// the credential's user_agent when set, otherwise the Antigravity Hub UA
+// with the latest Hub version from the update manifest.
+func (rt *runtime) antigravityUserAgent(creds authCredentials) string {
+	if ua := creds.UserAgent; ua != "" {
+		// Like CPA, a long Antigravity UA is cut to its short form.
+		if strings.HasPrefix(strings.ToLower(ua), "antigravity/") {
+			if i := strings.Index(strings.ToLower(ua), " google-api-nodejs-client/"); i > 0 {
+				ua = strings.TrimSpace(ua[:i])
+			}
+		}
+		return ua
+	}
+	return "antigravity/hub/" + rt.hubVersion() + " " + antigravityHubPlatform
+}
+
+// hubVersion returns the cached Hub version, reading the update manifest
+// first when it is due (3h TTL, 30min retry after a failure). A failed read
+// keeps the cached version; without any version the fallback is used.
+func (rt *runtime) hubVersion() string {
+	now := time.Now()
+	rt.mu.RLock()
+	cached := rt.hubVersionCached
+	next := rt.hubVersionNext
+	rt.mu.RUnlock()
+	if cached != "" && now.Before(next) {
+		return cached
+	}
+	version, err := rt.fetchHubVersion()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if err == nil {
+		rt.hubVersionCached = version
+		rt.hubVersionNext = now.Add(antigravityHubVersionTTL)
+	} else {
+		rt.hubVersionNext = now.Add(antigravityHubVersionRetry)
+	}
+	if rt.hubVersionCached == "" {
+		return antigravityFallbackVersion
+	}
+	return rt.hubVersionCached
+}
+
+// fetchHubVersion reads the version from the Hub update manifest (a small
+// YAML file; only the version: line is read).
+func (rt *runtime) fetchHubVersion() (string, error) {
+	header := http.Header{
+		"User-Agent":    []string{"electron-builder"},
+		"Cache-Control": []string{"no-cache"},
+	}
+	resp, err := rt.host.httpDo(pluginapi.HTTPRequest{Method: http.MethodGet, URL: antigravityHubManifestURL, Headers: header})
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Antigravity Hub 更新清单返回 HTTP %d", resp.StatusCode)
+	}
+	for _, line := range strings.Split(string(resp.Body), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ":", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[0]) == "version" {
+			version := strings.Trim(strings.TrimSpace(parts[1]), "\"'")
+			if !hubSemver.MatchString(version) {
+				return "", fmt.Errorf("Antigravity Hub 更新清单的版本无效: %q", version)
+			}
+			return version, nil
+		}
+	}
+	return "", fmt.Errorf("Antigravity Hub 更新清单中没有版本")
+}
+
+// recordPollErr records a per-group poll failure for status surfacing.
+// pollErrs is keyed by group key; the account error shows the main-group
+// failure, or any group failure when the main group is healthy.
+func (rt *runtime) recordPollErr(index, groupKey, msg string) {
+	rt.mu.Lock()
+	rt.initLocked()
+	rt.pollErrs[groupKey] = msg
+	acct := rt.getOrCreateAccountLocked(index)
+	rt.recomputeAccountErrorLocked(acct)
 	acct.UpdatedAt = time.Now()
 	rt.mu.Unlock()
-	rt.host.log("warn", "Phoenix quota poll failed", map[string]any{"auth_index": index, "error": msg})
+	rt.host.log("warn", "Phoenix quota poll failed", map[string]any{"auth_index": index, "group": groupKey, "error": msg})
+}
+
+// recomputeAccountErrorLocked refreshes the account error from the recorded
+// poll failures: the main-group failure first, then any group failure.
+// Caller must hold rt.mu.
+func (rt *runtime) recomputeAccountErrorLocked(acct *accountState) {
+	mainKey := mainGroupKey(acct.Provider, acct.AuthIndex)
+	if msg, ok := rt.pollErrs[mainKey]; ok {
+		acct.Error = msg
+		return
+	}
+	for key, msg := range rt.pollErrs {
+		if groupAuthIndex(key) == acct.AuthIndex {
+			acct.Error = msg
+			return
+		}
+	}
+	acct.Error = ""
 }
 
 // parseCodexUsage reads a /wham/usage payload the way Jeffery's quota
@@ -1913,27 +2605,68 @@ func windowResetAt(w map[string]any) time.Time {
 // a short CPA cooldown (<=10min) waits without counting as a failure.
 // Manual ignition bypasses schedule and circuit but does not change
 // retry/circuit state.
-func (rt *runtime) igniteFor(index string, manual bool) {
+// igniteFor sends one minimal request through the host model execution
+// callback to start a new 5-hour window for one quota group, the same shape
+// Lamplighter uses for ignition: protocol "openai-response" for Codex,
+// "claude" for Claude, "openai" for Antigravity, a "Reply with only OK"
+// prompt, no reasoning, no tools. groupKey is a quota-group key
+// ("codex:0:codex:main", "claude:0:claude:main", "antigravity:0:gemini",
+// ...); a bare auth_index still means the Codex main group, for backward
+// compatibility.
+//
+// The configured model always wins when non-empty (per-group Models
+// override, then the provider Model; for codex that is ignition.model).
+// Only when it is empty are candidates picked from the CPA model list —
+// and a model the provider rejects (400/404) is skipped for the next
+// candidate.
+//
+// After a successful request the ignition is confirmed: the provider quota
+// is re-queried at 5s, 10s, 15s, 30s, 15s until a fixed future 5h reset is
+// observed (a rolling placeholder does not count). Unconfirmed, hard, or
+// budget-exhausted failures open the circuit breaker until the next daily
+// start; transient failures retry with failure_retry_seconds x backoff 3;
+// a short CPA cooldown (<=10min) waits without counting as a failure.
+// Manual ignition bypasses schedule and circuit but does not change
+// retry/circuit state.
+func (rt *runtime) igniteFor(groupKey string, manual bool) {
 	if !rt.cfg.Ignition.Enabled {
 		rt.host.log("info", "Phoenix ignition skipped: disabled", nil)
 		return
 	}
-	if !rt.cfg.Providers.Codex.Ignite {
-		rt.host.log("info", "Phoenix ignition skipped: codex ignition not enabled", nil)
+	provider, index, _, ok := parseGroupKey(groupKey)
+	if !ok {
+		rt.host.log("warn", "Phoenix ignition skipped: bad target", map[string]any{"target": groupKey})
+		return
+	}
+	groupKey = groupKeyFor(provider, index, groupKeyRawKey(groupKey))
+	info := lookupProvider(provider)
+	if info == nil || !info.Ignite {
+		rt.host.log("info", "Phoenix ignition skipped: provider cannot be ignited", map[string]any{"provider": provider})
+		return
+	}
+	if !rt.providerIgniteEnabled(provider) {
+		rt.host.log("info", "Phoenix ignition skipped: provider ignition not enabled", map[string]any{"provider": provider})
 		return
 	}
 	authID := index
-	if index == "" {
-		if entries, err := rt.host.authList(); err == nil {
-			for _, e := range entries {
-				if isCodexEntry(e) {
-					index = e.AuthIndex
+	forcedProvider := provider
+	if entries, err := rt.host.authList(); err == nil {
+		for _, e := range entries {
+			if e.AuthIndex == index && providerOf(e) == provider {
+				if e.ID != "" {
 					authID = e.ID
-					break
 				}
+				if provider == "claude" {
+					if p := providerOf(e); p != "" {
+						forcedProvider = p
+					}
+				}
+				break
 			}
 		}
 	}
+	// A bare auth_index with no matching entry still ignites the Codex main
+	// group the old way (authID = index); other providers need an entry.
 	if index == "" {
 		rt.host.log("warn", "Phoenix ignition skipped: no credential available", nil)
 		rt.addEvent("error", "点火跳过：没有可用的凭证")
@@ -1942,10 +2675,19 @@ func (rt *runtime) igniteFor(index string, manual bool) {
 	if authID == "" {
 		authID = index
 	}
-	now := time.Now()
+	// The group label drives candidate selection and the per-group model
+	// override: the source label of the group, or the provider title when
+	// the group has never been polled.
+	groupLabel := providerTitle(provider)
 	rt.mu.Lock()
 	rt.initLocked()
-	acct := rt.getOrCreateAccountLocked(index)
+	if acct := rt.accounts[index]; acct != nil {
+		if groupKey == mainGroupKey(provider, index) {
+			groupLabel = providerTitle(provider)
+		} else if eg, ok := acct.ExtraGroups[groupKey]; ok && eg.SourceLabel != "" {
+			groupLabel = eg.SourceLabel
+		}
+	}
 	// Auto-ignition pauses while the credential has a confirmed problem,
 	// until the fingerprint changes or a manual ignition succeeds.
 	if !manual && rt.credentialProblemFor(index) != "" {
@@ -1953,8 +2695,9 @@ func (rt *runtime) igniteFor(index string, manual bool) {
 		rt.host.log("info", "Phoenix ignition skipped: credential problem", map[string]any{"auth_index": index})
 		return
 	}
-	ts := rt.state.target(index)
+	ts := rt.state.target(groupKey)
 	// A circuit or retry wait only gates automatic ignition.
+	now := time.Now()
 	if !manual {
 		if !ts.CircuitUntil.IsZero() && now.Before(ts.CircuitUntil) {
 			rt.mu.Unlock()
@@ -1967,11 +2710,11 @@ func (rt *runtime) igniteFor(index string, manual bool) {
 	}
 	rt.mu.Unlock()
 
-	models := []string{strings.TrimSpace(rt.cfg.Ignition.Model)}
+	models := []string{rt.configuredModel(provider, groupLabel)}
 	if models[0] == "" {
-		models = rt.ignitionCandidates()
+		models = rt.ignitionCandidatesFor(provider, groupLabel)
 	}
-	if len(models) == 0 {
+	if len(models) == 0 && provider == "codex" {
 		models = []string{"gpt-5-codex"}
 	}
 	var lastErr error
@@ -1982,7 +2725,7 @@ func (rt *runtime) igniteFor(index string, manual bool) {
 		if model == "" {
 			continue
 		}
-		status, err := rt.executeIgnition(index, authID, model)
+		status, err := rt.executeIgnitionFor(provider, forcedProvider, authID, model)
 		lastErr, lastStatus = err, status
 		if err == nil {
 			usedModel = model
@@ -2001,7 +2744,7 @@ func (rt *runtime) igniteFor(index string, manual bool) {
 			lastErr = ErrNoModel
 		}
 		rt.mu.Lock()
-		ts := rt.state.target(index)
+		ts := rt.state.target(groupKey)
 		ts.LastAttempt = now
 		ts.LastModel = usedModel
 		ts.LastError = truncateRunes(lastErr.Error(), 500)
@@ -2026,10 +2769,10 @@ func (rt *runtime) igniteFor(index string, manual bool) {
 		return
 	}
 	// Confirm: a fixed future 5h reset must be observed.
-	if err := rt.confirmIgnition(index); err != nil {
+	if err := rt.confirmIgnitionFor(provider, index, groupKey); err != nil {
 		now = time.Now()
 		rt.mu.Lock()
-		ts := rt.state.target(index)
+		ts := rt.state.target(groupKey)
 		ts.LastAttempt = now
 		ts.LastModel = usedModel
 		ts.LastError = truncateRunes(err.Error(), 500)
@@ -2052,16 +2795,108 @@ func (rt *runtime) igniteFor(index string, manual bool) {
 	}
 	now = time.Now()
 	rt.mu.Lock()
-	ts = rt.state.target(index)
+	ts = rt.state.target(groupKey)
 	recordTargetSuccess(ts, usedModel, now)
 	ts.LastAttempt = now
-	acct = rt.getOrCreateAccountLocked(index)
+	acct := rt.getOrCreateAccountLocked(index)
 	rt.clearCredentialProblemLocked(acct)
 	rt.stateDirty = true
 	rt.mu.Unlock()
-	rt.host.log("info", "Phoenix ignition succeeded", map[string]any{"auth_index": index, "model": usedModel})
+	rt.host.log("info", "Phoenix ignition succeeded", map[string]any{"auth_index": index, "group": groupKey, "model": usedModel})
 	rt.addEventFor("ok", fmt.Sprintf("点火成功：凭证 %s 已开始新的 5 小时窗口", index), index, windowFiveHour, "ignite", map[string]string{"model": usedModel})
 	rt.saveStateIfDirty()
+}
+
+// groupKeyRawKey returns the raw key of a group key, or "codex:main" for a
+// bare auth index.
+func groupKeyRawKey(key string) string {
+	_, _, raw, ok := parseGroupKey(key)
+	if !ok {
+		return "codex:main"
+	}
+	return raw
+}
+
+// executeIgnitionFor sends one minimal ignition request for a provider and
+// model, returning the upstream status and error (nil on 2xx).
+func (rt *runtime) executeIgnitionFor(provider, forcedProvider, authID, model string) (int, error) {
+	var protocol string
+	var body []byte
+	var stream bool
+	switch provider {
+	case "claude":
+		protocol = "claude"
+		body = claudeIgnitionBody(model)
+		stream = true
+	case "antigravity":
+		protocol = "openai"
+		body = antigravityIgnitionBody(model)
+		stream = true
+	default:
+		// Codex keeps its own entry point (executeIgnition) so the
+		// openai-response body and ForcedProvider "codex" stay untouched.
+		return rt.executeIgnition("", authID, model)
+	}
+	resp, err := rt.host.modelExecute(pluginapi.HostModelExecutionRequest{
+		EntryProtocol:  protocol,
+		ExitProtocol:   protocol,
+		Model:          model,
+		Stream:         stream,
+		Body:           body,
+		ForcedProvider: forcedProvider,
+		AuthID:         authID,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return resp.StatusCode, fmt.Errorf("upstream status %d", resp.StatusCode)
+	}
+	return resp.StatusCode, nil
+}
+
+// ignitionCandidatesFor returns the ordered candidate models for a
+// provider/group when no model is configured, from the CPA model list
+// (cached 10 minutes). Empty when no key is set or no model matches.
+func (rt *runtime) ignitionCandidatesFor(provider, groupLabel string) []string {
+	key := strings.TrimSpace(rt.cfg.Ignition.ModelsAPIKey)
+	if key == "" {
+		return nil
+	}
+	rt.mu.Lock()
+	if rt.modelsKey == key && time.Since(rt.modelsFetched) < 10*time.Minute && len(rt.modelsCache) > 0 {
+		cached := append([]string(nil), rt.modelsCache...)
+		rt.mu.Unlock()
+		return pickProviderCandidates(provider, groupLabel, cached)
+	}
+	rt.mu.Unlock()
+	available, err := fetchModelsList(rt.cfg.Ignition.CPABaseURL, key)
+	rt.mu.Lock()
+	if err != nil {
+		rt.modelsErr = err.Error()
+		rt.mu.Unlock()
+		return nil
+	}
+	rt.modelsErr = ""
+	rt.modelsCache = available
+	rt.modelsFetched = time.Now()
+	rt.modelsKey = key
+	rt.mu.Unlock()
+	return pickProviderCandidates(provider, groupLabel, available)
+}
+
+// pickProviderCandidates orders available models for a provider/group:
+// codex keeps pickIgnitionCandidates, claude prefers Haiku then Sonnet,
+// Antigravity orders per group (Flash first for Gemini).
+func pickProviderCandidates(provider, groupLabel string, available []string) []string {
+	switch provider {
+	case "claude":
+		return claudeCandidates(available)
+	case "antigravity":
+		return antigravityCandidates(groupLabel, available)
+	default:
+		return pickIgnitionCandidates(available)
+	}
 }
 
 // executeIgnitionAttempt sends one minimal Codex request for model and
@@ -2101,7 +2936,10 @@ func (rt *runtime) executeIgnition(index, authID, model string) (int, error) {
 // cache without blocking the page on a /v1/models fetch. Failures land in
 // modelsErr, surfaced by status as models_error.
 func (rt *runtime) warmModelsCache() {
-	if strings.TrimSpace(rt.cfg.Ignition.ModelsAPIKey) == "" {
+	rt.mu.Lock()
+	key := strings.TrimSpace(rt.cfg.Ignition.ModelsAPIKey)
+	rt.mu.Unlock()
+	if key == "" {
 		return
 	}
 	_ = rt.ignitionCandidates()
@@ -2111,10 +2949,21 @@ func (rt *runtime) warmModelsCache() {
 // cache only (no fetch), for status.next_models. Empty when the list has
 // never been read. The caller must hold rt.mu.
 func (rt *runtime) cachedNextModelLocked() string {
+	return rt.cachedNextModelForLocked("codex", "GPT")
+}
+
+// cachedNextModelForLocked returns the next model for a provider/group from
+// the warm model-list cache only (no fetch): the configured model wins
+// (per-group override, then provider model), else the first candidate.
+// Empty when the list has never been read. The caller must hold rt.mu.
+func (rt *runtime) cachedNextModelForLocked(provider, groupLabel string) string {
+	if m := rt.configuredModel(provider, groupLabel); m != "" {
+		return m
+	}
 	if rt.modelsKey != strings.TrimSpace(rt.cfg.Ignition.ModelsAPIKey) || time.Since(rt.modelsFetched) >= 10*time.Minute || len(rt.modelsCache) == 0 {
 		return ""
 	}
-	if c := pickIgnitionCandidates(append([]string(nil), rt.modelsCache...)); len(c) > 0 {
+	if c := pickProviderCandidates(provider, groupLabel, append([]string(nil), rt.modelsCache...)); len(c) > 0 {
 		return c[0]
 	}
 	return ""
@@ -2124,18 +2973,23 @@ func (rt *runtime) cachedNextModelLocked() string {
 // when no model is configured, fetched from CPA /v1/models with the
 // configured models API key (cached 10 minutes). Empty when no key is set.
 func (rt *runtime) ignitionCandidates() []string {
+	// The key and base URL are read under the lock: PUT /settings and
+	// reconfigure write them under the same lock, and a bare read here
+	// would race those writes.
+	rt.mu.Lock()
 	key := strings.TrimSpace(rt.cfg.Ignition.ModelsAPIKey)
+	baseURL := rt.cfg.Ignition.CPABaseURL
 	if key == "" {
+		rt.mu.Unlock()
 		return nil
 	}
-	rt.mu.Lock()
 	if rt.modelsKey == key && time.Since(rt.modelsFetched) < 10*time.Minute && len(rt.modelsCache) > 0 {
 		cached := append([]string(nil), rt.modelsCache...)
 		rt.mu.Unlock()
 		return pickIgnitionCandidates(cached)
 	}
 	rt.mu.Unlock()
-	available, err := fetchModelsList(rt.cfg.Ignition.CPABaseURL, key)
+	available, err := fetchModelsList(baseURL, key)
 	rt.mu.Lock()
 	if err != nil {
 		rt.modelsErr = err.Error()
@@ -2220,11 +3074,66 @@ func (rt *runtime) fetchFiveHourReset(index string) (time.Time, error) {
 	return sample.Reset, nil
 }
 
+// fetchFiveHourResetFor queries a provider quota for one credential and
+// returns the current 5h reset time of the named group.
+func (rt *runtime) fetchFiveHourResetFor(provider, index, groupKey string) (time.Time, error) {
+	a, err := rt.host.authGet(index)
+	if err != nil {
+		return time.Time{}, err
+	}
+	creds := extractCredentials(a.JSON)
+	if creds.AccessToken == "" {
+		return time.Time{}, errors.New("access token unavailable")
+	}
+	switch provider {
+	case "claude":
+		groups, err := rt.fetchClaudeQuota(creds)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return groupFiveHourReset(groups, groupKey)
+	case "antigravity":
+		groups, err := rt.fetchAntigravityQuota(creds)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return groupFiveHourReset(groups, groupKey)
+	default:
+		return rt.fetchFiveHourReset(index)
+	}
+}
+
+// groupFiveHourReset returns the 5h reset of the group whose raw key
+// matches groupKey ("claude:main" for a main group, the window id or slug
+// otherwise).
+func groupFiveHourReset(groups []quotaGroup, groupKey string) (time.Time, error) {
+	_, _, rawKey, _ := parseGroupKey(groupKey)
+	for _, g := range groups {
+		raw := strings.TrimPrefix(g.Key, groupProvider(groupKey)+":")
+		if raw != rawKey {
+			continue
+		}
+		for _, w := range g.Windows {
+			if quotaWindowKind(w) == windowFiveHour {
+				return w.Reset, nil
+			}
+		}
+		return time.Time{}, errors.New("quota group has no 5h window")
+	}
+	return time.Time{}, errors.New("quota group not found in response")
+}
+
 // confirmIgnition re-queries the 5h reset after an ignition attempt until
 // a fixed future reset is observed (not a rolling placeholder), or the
 // delay schedule is exhausted. A rolling observation is not confirmation:
 // the reset must stay put across two observations.
 func (rt *runtime) confirmIgnition(index string) error {
+	return rt.confirmIgnitionFor("codex", index, mainGroupKey("codex", index))
+}
+
+// confirmIgnitionFor is confirmIgnition for one provider/group: the
+// provider quota is re-queried until a fixed future 5h reset is observed.
+func (rt *runtime) confirmIgnitionFor(provider, index, groupKey string) error {
 	delays := rt.confirmDelays
 	if len(delays) == 0 {
 		delays = defaultConfirmDelays
@@ -2232,13 +3141,13 @@ func (rt *runtime) confirmIgnition(index string) error {
 	for _, delay := range delays {
 		rt.sleepOrDefault(delay)
 		now := time.Now()
-		reset, err := rt.fetchFiveHourReset(index)
+		reset, err := rt.fetchFiveHourResetFor(provider, index, groupKey)
 		if err != nil {
 			continue
 		}
 		rt.mu.Lock()
 		rt.initLocked()
-		ts := rt.state.target(index)
+		ts := rt.state.target(groupKey)
 		rolling := observeReset(ts, reset, now, false)
 		rt.stateDirty = true
 		rt.mu.Unlock()
@@ -2250,10 +3159,50 @@ func (rt *runtime) confirmIgnition(index string) error {
 	return ErrNotConfirmed
 }
 
-// maybeIgnite runs once per poll tick: for each Codex credential whose
-// ignition is due per ignitionDueAt, ignite once. Auto-ignition skips
-// credentials with a confirmed credential problem and credentials whose
-// 7d window is still exhausted (their requests would be rejected).
+// ignitionGroup is one group maybeIgnite considers: a 5h window with its
+// reset and the group's exhausted non-5h window, if any.
+type ignitionGroup struct {
+	key           string
+	label         string
+	reset         time.Time
+	blockedWindow string
+	blockedUntil  time.Time
+}
+
+// ignitionGroupsOf lists the ignitable groups of an account: the main group
+// when it has a 5h window, plus every extra group with a 5h window.
+func ignitionGroupsOf(acct *accountState, provider, index string) []ignitionGroup {
+	var out []ignitionGroup
+	if acct == nil {
+		return out
+	}
+	if w, ok := acct.Windows[windowFiveHour]; ok {
+		blocked, until := exhaustedWindowFor(acct.Windows, time.Now())
+		out = append(out, ignitionGroup{key: mainGroupKey(provider, index), label: providerTitle(provider), reset: w.Reset, blockedWindow: blocked, blockedUntil: until})
+	}
+	keys := make([]string, 0, len(acct.ExtraGroups))
+	for key := range acct.ExtraGroups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		eg := acct.ExtraGroups[key]
+		w, ok := eg.Windows[windowFiveHour]
+		if !ok {
+			continue
+		}
+		blocked, until := exhaustedWindowFor(eg.Windows, time.Now())
+		out = append(out, ignitionGroup{key: key, label: eg.SourceLabel, reset: w.Reset, blockedWindow: blocked, blockedUntil: until})
+	}
+	return out
+}
+
+// maybeIgnite runs once per poll tick: for each quota group whose ignition
+// is due per ignitionDueAt, ignite once. Auto-ignition skips credentials
+// with a confirmed credential problem, groups that are not ignitable
+// (provider switch off, or an Antigravity group that is not checked), and
+// groups whose non-5h window is still exhausted (their requests would be
+// rejected).
 func (rt *runtime) maybeIgnite() {
 	if !rt.cfg.Ignition.Enabled {
 		return
@@ -2264,36 +3213,45 @@ func (rt *runtime) maybeIgnite() {
 		return
 	}
 	for _, e := range entries {
-		if !isCodexEntry(e) {
+		provider := providerOf(e)
+		if provider != "codex" && provider != "claude" && provider != "antigravity" {
 			continue
 		}
 		rt.mu.RLock()
 		acct := rt.accounts[e.AuthIndex]
-		var reset time.Time
-		exhausted7d := false
-		if acct != nil {
-			if w, ok := acct.Windows[windowFiveHour]; ok {
-				reset = w.Reset
-			}
-			if w, ok := acct.Windows[windowSevenDay]; ok && w.Remaining <= exhaustedRemaining && (w.Reset.IsZero() || w.Reset.After(now)) {
-				exhausted7d = true
-			}
-		}
 		problem := rt.credentialProblemFor(e.AuthIndex)
-		ts := &targetState{}
-		if rt.state != nil {
-			if saved, ok := rt.state.Targets[e.AuthIndex]; ok && saved != nil {
-				ts = saved
+		groups := ignitionGroupsOf(acct, provider, e.AuthIndex)
+		if acct == nil && provider == "codex" {
+			// A Codex credential that has never been polled keeps the old
+			// behaviour: ignite once against its (unknown) 5h window.
+			groups = []ignitionGroup{{key: mainGroupKey("codex", e.AuthIndex), label: "GPT"}}
+		}
+		type dueGroup struct {
+			key string
+		}
+		var due []dueGroup
+		for _, g := range groups {
+			if problem != "" || g.blockedWindow != "" {
+				continue
 			}
+			if !groupIgnitable(rt, provider, g.label) {
+				continue
+			}
+			ts := &targetState{}
+			if rt.state != nil {
+				if saved, ok := rt.state.Targets[g.key]; ok && saved != nil {
+					ts = saved
+				}
+			}
+			if dueAt := ignitionDueAt(rt.cfg.Ignition, ts, g.reset, now); dueAt.After(now) {
+				continue
+			}
+			due = append(due, dueGroup{key: g.key})
 		}
 		rt.mu.RUnlock()
-		if problem != "" || exhausted7d {
-			continue
+		for _, g := range due {
+			go rt.igniteFor(g.key, false)
 		}
-		if due := ignitionDueAt(rt.cfg.Ignition, ts, reset, now); due.After(now) {
-			continue
-		}
-		go rt.igniteFor(e.AuthIndex, false)
 	}
 }
 

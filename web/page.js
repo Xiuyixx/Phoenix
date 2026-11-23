@@ -141,6 +141,7 @@
       notify_modes_hint: "“用完后”：窗口用完后，在下一次重置时通知一次。“有余量”：剩余高于告急阈值时才提醒。重置前提醒在 5 小时窗口重置前 1 小时、7 天窗口重置前 1 天发送。恢复通知附带上一周期的剩余额度，取自每次重置前 30 秒的查询。",
       quota_queries: "额度查询",
       models_api_key: "模型列表 API key",
+      models_key_set: "已设置",
       models_api_key_hint: "插件用这个 key 从 CPA 读取模型列表，为自动点火选择模型；不使用自动点火时可以留空。请在 CPA 的 access.api-keys 中新建一个专用 key，不要填管理密钥。",
       poll_interval: "查询间隔（秒）", request_timeout: "请求超时（秒）", history_retention: "历史保留（天）",
       passive_skip: "被动数据跳过窗口（秒）", passive_skip_max: "最多连续跳过（分钟）",
@@ -327,6 +328,7 @@
       notify_modes_hint: "\"After out\": after the window runs out, notify once at its next reset. \"If left\": remind only when more than the Critical threshold is left. Reminders are sent 1 hour before a 5-hour window resets and 1 day before a 7-day window resets. Recovery notifications include what was left of the ended cycle, from the query 30 seconds before every reset.",
       quota_queries: "Quota queries",
       models_api_key: "Model list API key",
+      models_key_set: "Set",
       models_api_key_hint: "The plugin reads CPA's model list with this key to pick ignition models; without ignition it can stay empty. Create a dedicated key in CPA's access.api-keys rather than using the management key.",
       poll_interval: "Query interval (s)", request_timeout: "Request timeout (s)", history_retention: "History retention (days)",
       passive_skip: "Passive data window (s)", passive_skip_max: "Longest skip (min)",
@@ -1000,7 +1002,13 @@
     // settings rather than a notice.
     var telegram = status.config && status.config.telegram;
     $("notify-off").hidden = !!(telegram && telegram.enabled && telegram.bot_token_set);
-    if (status.config && status.config.ignition && status.config.ignition.enabled && !status.config.models_api_key) {
+    // models_api_key_set is the status flag for a configured key; the masked
+    // models_api_key itself is always "" now. The string fallback covers a
+    // status from before the flag existed ("已设置" while a key was set).
+    var modelsKeySet = status.config && (status.config.models_api_key_set || !!status.config.models_api_key);
+    var modelsKeyHint = $("models-key-set");
+    if (modelsKeyHint) modelsKeyHint.hidden = !modelsKeySet;
+    if (status.config && status.config.ignition && status.config.ignition.enabled && !modelsKeySet) {
       box.appendChild(notice(translate("no_models_key")));
     }
   }
@@ -1344,10 +1352,12 @@
     return { kind: "success", text: tr("normal") };
   }
 
-  // The ignition card shows only while ignition is on.
+  // The manual actions card is always shown once the status loads: manual
+  // reset must stay available even when automatic ignition is off.
   function renderTargets() {
     var body = $("targets");
     clear(body);
+    $("ignition-card").hidden = false;
     var ignition = (status.config && status.config.ignition) || {};
     var endMinutes = (ignition.end_hour || 0) * 60 + (ignition.end_grace_minutes || 0);
     $("ignition-note").textContent = translate("ignition_note", pad(ignition.start_hour), ignition.grace_seconds, pad(Math.floor(endMinutes / 60) % 24) + ":" + pad(endMinutes % 60));
@@ -1357,13 +1367,20 @@
     }
     status.targets.forEach(function (t) {
       var st = targetStatus(t);
-      var resetButton = el("button", { type: "button", class: "btn btn-secondary btn-sm", text: translate("reset_now"), onclick: function () {
-        runAction(resetButton, API + "/reset", { auth_index: t.auth_index }, translate("reset_done", t.label));
-      } });
+      var actions = [];
+      // Reset is Codex-only: the reset button stays on Codex rows, before
+      // the ignite button, and Claude/Antigravity rows get ignite alone.
+      if (t.provider === "codex") {
+        var resetButton = el("button", { type: "button", class: "btn btn-secondary btn-sm", text: translate("reset_now"), onclick: function () {
+          runAction(resetButton, API + "/reset", { auth_index: t.auth_index }, translate("reset_done", t.label));
+        } });
+        actions.push(resetButton);
+      }
       var button = el("button", { type: "button", class: "btn btn-secondary btn-sm", text: translate("ignite_now"), onclick: function () {
         if (!confirm(translate("ignite_confirm", t.label))) return;
         runAction(button, API + "/ignite", { target: t.key }, translate("ignited", t.label));
       } });
+      actions.push(button);
       var next = parseTime(t.next_due), reset = parseTime(t.reset), last = parseTime(t.last_success);
       var statusCell = el("td", {}, [badge(st.kind, st.text)]);
       if (st.title) statusCell.appendChild(el("div", { class: "cell-note" }, maskedNodes(st.title)));
@@ -1374,7 +1391,7 @@
         el("td", { class: "mono", text: last ? fmtDateTime(last) : "—" }),
         el("td", { class: "mono", text: t.last_model || "—" }),
         statusCell,
-        el("td", { class: "actions" }, [resetButton, button])
+        el("td", { class: "actions" }, actions)
       ]));
     });
   }
@@ -1765,15 +1782,16 @@
     more.textContent = eventsExpanded ? translate("collapse") : translate("show_more", total);
   }
 
-  // The provider settings, built when the provider list changes: a monitor
-  // switch per provider under Services, and a row per provider in the
-  // ignition table. Providers that cannot be ignited show no ignition switch
-  // or model; those with quota groups to choose get a row of group
-  // checkboxes.
+  // The provider settings, built when the provider list changes: an ignite
+  // checkbox and a model field per provider in the ignition table.
+  // Providers that cannot be ignited show no ignition switch or model;
+  // those with quota groups to choose get a row of group checkboxes.
   function renderServiceRows() {
     var body = $("ignition-rows");
     var list = providerList();
-    var ids = list.map(function (p) { return p.id; }).join(",");
+    // The key covers what the rows show, not just the ids, so a provider
+    // that gains or loses ignition or quota groups rebuilds its rows.
+    var ids = list.map(function (p) { return p.id + ":" + (p.ignite ? "1" : "0") + ":" + (p.groups || []).join("|"); }).join(",");
     if (body.getAttribute("data-ids") === ids) return false;
     clear(body);
     list.forEach(function (p) {
@@ -3618,11 +3636,14 @@
   function topKey(name) { return name.split(".")[0]; }
 
   // Effective values come from the status config (defaults applied); saved
-  // secrets come from the raw plugin config.
+  // secrets come from the raw plugin config. The models key is never written
+  // back into its input: a saved key stays empty in the box, and the "已设置"
+  // hint next to it shows whether one is stored
+  // (status.config.models_api_key_set).
   function effectiveConfig() {
     var effective = JSON.parse(JSON.stringify(status.config || {}));
     effective.bark_url = rawConfig.bark_url || "";
-    effective.models_api_key = rawConfig.models_api_key || "";
+    effective.models_api_key = "";
     var telegram = rawConfig.telegram || {};
     effective.telegram = effective.telegram || {};
     effective.telegram.bot_token = telegram.bot_token || "";
@@ -3695,7 +3716,11 @@
     providersWithGroups().forEach(function (p) {
       var box = document.querySelector("[data-groups='" + p.id + "']");
       if (!keys || (keys.providers && !(box && box.contains(active)))) {
-        renderGroupChecks(p, getPath(effective, "providers." + p.id + ".groups"));
+        var selected = getPath(effective, "providers." + p.id + ".groups");
+        // A provider without a configured group list starts with its first
+        // group (Gemini for Antigravity); an explicit empty list stays empty.
+        if (selected === undefined) selected = (p.groups || []).slice(0, 1);
+        renderGroupChecks(p, selected);
       }
     });
     settingsFilled = true;
@@ -3828,6 +3853,12 @@
         if (saved.value === "") return;
         value = Number(saved.value);
       } else value = saved.value.trim();
+      if (top === "models_api_key" && value === "") {
+        // An empty models key means "leave the stored key unchanged":
+        // omit it from the patch instead of sending "".
+        if (intent) intent.submitted.push(input);
+        return;
+      }
       setPath(patch, input.name, value);
       if (intent) intent.submitted.push(input);
     });
@@ -4059,8 +4090,9 @@
     // key, into password fields. A value the browser fills in while the field
     // is not focused comes from autofill on page load; it is not saved, and
     // the field shows the saved value again. The management key is refused
-    // with a message. Other new keys are checked against /v1/models before
-    // saving; refusals retain the draft and inconclusive checks allow saving.
+    // with a message. Other new keys are checked by the plugin against
+    // /v1/models before saving; refusals retain the draft and inconclusive
+    // checks allow saving.
     var checked = Promise.resolve(null);
     if (input.type === "password") {
       var value = input.value.trim();
@@ -4124,15 +4156,20 @@
     });
   }
 
-  // checkKey asks CPA whether it accepts value as an API key for /v1/models,
-  // the request the plugin makes with models_api_key. It resolves to ok when
-  // CPA answers the request, refused on HTTP 401 and 403, and neither, with
-  // the reason, when the check could not tell: then the key is saved anyway.
+  // checkKey asks the plugin whether CPA accepts value as an API key for
+  // /v1/models, the request the plugin makes with models_api_key. The page
+  // must not ask CPA directly: the page is served through a proxy that
+  // drops the Authorization header, so a direct check always answers 401
+  // and no correct key could ever be saved. The plugin checks from the
+  // server side instead (POST check-models-key, same origin as the page,
+  // direct to CPA). It resolves to ok when CPA accepts the key, refused on
+  // CPA HTTP 401 and 403, and neither, with the reason, when the check
+  // could not tell: then the key is saved anyway.
   function checkKey(value) {
-    return fetch("/v1/models", { headers: { "Authorization": "Bearer " + value, "Accept": "application/json" } }).then(function (res) {
-      if (res.status === 401 || res.status === 403) return { refused: true };
-      if (res.ok) return { ok: true };
-      return { reason: "HTTP " + res.status };
+    return api("POST", API + "/check-models-key", { key: value }).then(function (data) {
+      if (data.ok) return { ok: true };
+      if (data.refused) return { refused: true };
+      return { reason: data.reason || translate("network_error") };
     }, function () { return { reason: translate("network_error") }; });
   }
 
