@@ -66,6 +66,21 @@ Actions 产物，不创建 Release。
 `VERSION`、`main.go` 的 `pluginVersion` 默认值与 `CHANGELOG.md` 的条目必须
 保持一致，`make check-version` 校验这三处。
 
+每次功能、修复或文档变更都递增版本号，例如从 0.1.2 到 0.1.3。发版前按顺序执行：
+
+```bash
+make check-version VERSION=0.1.3
+go test ./...
+git add .
+git commit -m "..."
+git push origin master
+git tag -a v0.1.3 -m "Phoenix v0.1.3"
+git push origin v0.1.3
+```
+
+推送版本 tag 后，GitHub Actions 会自动构建并发布；发布完成后在
+[Releases](https://github.com/Xiuyixx/Phoenix/releases) 中检查 tag、资产列表和校验文件。
+
 ## 修改约定
 
 - 修改宿主回调、RPC 字段或注册内容前，对照 CPA 源码中的 `sdk/pluginabi`、`sdk/pluginapi` 和 `internal/pluginhost`。`go.mod` 中的 CPA 版本与线上最低支持版本保持一致。
