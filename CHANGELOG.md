@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 - 2026-11-24
+
+- 新增仓库根目录 `registry.json`，为上架 CLIProxyAPI 官方插件商店做准备：schema_version 1，github-release 安装方式，含英文描述、作者、仓库、许可证与 zh-CN 本地化描述。
+- 发布工作流在 release job 里生成 `checksums.txt`（三个平台 zip 的 sha256sum 格式，裸文件名），随 release 资产一起发布；商店安装时 CPA 按 `checksums.txt` 校验 zip，之前只有每平台一个 `.sha256` 文件，商店安装会失败。
+
 ## 0.1.3 - 2026-11-24
 
 - README 优化：版本号全部更新到 0.1.3；结构改为简介 → 快速安装 → 主要功能 → 配置说明 → 安全与运行边界 → 故障排查 → 参考与致谢 → 许可证；轮询协议、点火调度、重置流程等技术细节只留摘要并指向 docs/architecture.md，不再与 docs 重复；版本与发布流程移到 docs/development.md；顶部增加 Release / License / Go 徽章与目录。
