@@ -301,19 +301,19 @@ func sendTelegramRaw(t *testing.T, server *httptest.Server, msg Message) {
 // TestTelegramEmailEntitiesUseUTF16Offsets pins the reported bug: the
 // message carries emoji and CJK text, so byte and rune offsets both point
 // at the wrong place. The 账号 line is "账号：user@example.com" after the
-// "🟢 🟢 🟢 GPT 额度状态通知" title: 19 UTF-16 units of title, 2 of the
-// blank line, 3 of "账号：", so the address starts at 24 and is 16 long.
+// "🟢 GPT 额度状态通知" title: 13 UTF-16 units of title, 2 of the
+// blank line, 3 of "账号：", so the address starts at 18 and is 16 long.
 func TestTelegramEmailEntitiesUseUTF16Offsets(t *testing.T) {
 	server, got := newTelegramRawServer(t)
 	sendTelegramRaw(t, server, Message{
-		Title: "🟢 🟢 🟢 GPT 额度状态通知",
+		Title: "🟢 GPT 额度状态通知",
 		Body:  "账号：user@example.com\n模型：Codex / GPT\n时间：2026-11-23 19:49:00",
 	})
 	req := got.first(t)
-	if req.Text != "🟢 🟢 🟢 GPT 额度状态通知\n\n账号：user@example.com\n模型：Codex / GPT\n时间：2026-11-23 19:49:00" {
+	if req.Text != "🟢 GPT 额度状态通知\n\n账号：user@example.com\n模型：Codex / GPT\n时间：2026-11-23 19:49:00" {
 		t.Fatalf("text changed: %q", req.Text)
 	}
-	if len(req.Entities) != 1 || req.Entities[0].Type != "email" || req.Entities[0].Offset != 24 || req.Entities[0].Length != 16 {
+	if len(req.Entities) != 1 || req.Entities[0].Type != "email" || req.Entities[0].Offset != 18 || req.Entities[0].Length != 16 {
 		t.Fatalf("entities %+v", req.Entities)
 	}
 }
