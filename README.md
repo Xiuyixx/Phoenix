@@ -1,105 +1,40 @@
 # Phoenix
 
-Phoenix 是一个面向 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的原生插件，围绕 Codex、Claude 与 Antigravity 订阅凭证提供额度状态、账号错误通知、自动点火以及管理页面操作入口。Kimi 与 Grok 在服务列表中标记为不支持，不参与轮询与点火。
+[![Release](https://img.shields.io/github/v/release/Xiuyixx/Phoenix)](https://github.com/Xiuyixx/Phoenix/releases)
+[![License](https://img.shields.io/github/license/Xiuyixx/Phoenix)](https://github.com/Xiuyixx/Phoenix/blob/master/LICENSE)
+[![Go](https://img.shields.io/github/go-mod/go-version/Xiuyixx/Phoenix)](https://github.com/Xiuyixx/Phoenix/blob/master/go.mod)
 
-> 当前版本：`0.1.0`。本版本是从 Lamplighter 干净复刻后系统改名为 Phoenix 的底本，并已移植 Phoenix 差异功能：Telegram 推送、reset credit 自动/手动重置、Phoenix 通知文案、模型 key 经插件路由校验（`POST /check-models-key`）与点火模型 fallback。
+Phoenix 是一个面向 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的原生插件，围绕 Codex、Claude 与 Antigravity 订阅凭证提供额度状态、账号错误通知、自动点火、自动重置以及管理页面操作入口。Kimi 与 Grok 在服务列表中标记为不支持，不参与轮询与点火。
 
-## 主要功能
+当前版本：`0.1.3`。通知支持 Bark、Telegram 与 webhook 三个渠道，Telegram 为 Phoenix 默认提供的渠道；reset credit 自动/手动重置是 Phoenix 相对底本的差异功能。
 
-### 额度与账号状态
+## 目录
 
-Phoenix 通过两条路径收集额度数据：主动轮询按 `poll_interval_seconds`（默认 300 秒）枚举凭证并按服务查询上游额度——Codex 查 `/wham/usage`（按窗口时长识别 5 小时窗口与周窗口）、Claude 查 `api.anthropic.com/api/oauth/usage`（5 小时、7 天窗口，另有 Opus/Sonnet/OAuth Apps 等独立窗口与 Fable 窗口）、Antigravity 查 `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`（按模型分 Gemini 与 Claude / GPT 两个独立额度组）；被动接收 CPA 的 usage 回调，成功记为正常、`usage_limit_reached` 的 429 记为对应窗口耗尽并记录重置时间（Claude 被动头 `Anthropic-Ratelimit-Unified-*` 也会解析）。页面新增“最近事件”列表，账号异常、重置与点火结果都会记录在内。
+- [快速安装](#快速安装)
+- [主要功能](#主要功能)
+  - [额度与账号状态](#额度与账号状态)
+  - [通知](#通知)
+  - [自动点火](#自动点火)
+  - [自动重置](#自动重置)
+  - [MCP](#mcp)
+- [配置说明](#配置说明)
+- [安全与运行边界](#安全与运行边界)
+- [故障排查](#故障排查)
+- [参考与致谢](#参考与致谢)
+- [许可证](#许可证)
 
-额度采样会持久化到插件数据目录下的历史文件（默认保留 40 天），管理页面用“额度变化”图表展示：总览按采样点着色（满/高/中/低/空五档），可点开单账号详情曲线（含匀速参考线、预测线与重置标记），支持 5 小时 / 7 天窗口与时间范围切换。
+## 快速安装
 
-额度数据是否完整取决于 CPA 版本、凭证类型以及上游响应中是否包含可解析的额度字段。没有收到有效额度数据时，页面会显示等待状态，不会把缺失数据当成 100% 或 0% 使用量。
+Phoenix 使用 CLIProxyAPI v8 插件 SDK（当前依赖 v8.0.36），以 c-shared 动态库加载。
 
-设置页的“账号”区支持拖动排序、填写名称与权重，卡片与图表的顺序跟随账号顺序；名称取自 CPA 凭证备注的第一行。
-
-### 通知
-
-通知按 Bark → Telegram → webhook 的顺序扇出，同时发送到所有已配置的渠道；三个渠道都没配时推送关闭。当前通知场景包括：
-
-- 账号返回 `401` 或 `403`，通常表示凭证失效、账号未授权或账号被停用。
-- 账号返回 `429`，通常表示限流或额度耗尽。
-- 额度降到提醒阈值（默认剩余 20% / 10% / 5% 各通知一次），额度恢复、重置前提醒。
-- 自动重置成功。
-- 点火失败或熔断。
-- 测试推送。
-
-通知文案为 Phoenix 定稿：中文通知用单个表情标题（🟢 Normal / 🟡 Warning / 🔴 Exhausted）与账号 / 模型 / 5H / 7D / 状态 / 时间逐行字段，账号用邮箱标识；英文通知保持 Lamplighter 原文案。
-
-Bark 请求为 `GET {bark_url}/{标题}/{正文}?group&level&icon&url`，默认分组为 `CPA`，默认图标为空（Phoenix 不带 logo，可用 `bark_icon` 自行设置）。webhook 支持 `url`、`method`、`headers`、`body`、`success_json`，请求体为空时发送内置 JSON，占位符为 `{{title}} {{body}} {{text}} {{url}} {{priority}} {{kind}} {{label}} {{time}}`。
-
-#### Telegram 推送
-
-设置 Telegram Bot Token 和接收 ID 后，Phoenix 可以向一个或多个接收者发送提醒。多个接收 ID 使用英文分号分隔，例如：
-
-```text
-123456789;987654321;-1001234567890
-```
-
-Bot Token 只用于调用 Telegram Bot API，不写入 Git 仓库。配置文件和管理接口中的 Token 应按敏感信息保护；管理接口返回的配置中 Bot Token 一律脱敏（只返回是否已设置），页面留空表示不修改。Bot Token 为空或未启用时该渠道不启用；Token 已填但未填接收 ID 时，设置页会报“Telegram 设置无效”，通知横幅中显示原因。
-
-Did Codex Reset 信号默认关闭；开启后按 `codex_reset_updates.poll_seconds`（默认 300 秒）轮询 https://didcodexreset.com/openapi/v1/records，去重后经已配置的通知渠道（含 Telegram）转发；发送失败的记录仍标记为已见，不再每轮重复播报。
-
-### 自动点火
-
-点火通过宿主的模型执行回调发送一次最小请求（只要求回复 `OK`，不推理、不用工具），从而开始一个新的 5 小时窗口；点火后会多次复查，确认出现固定的未来 5 小时重置才算成功，否则报未确认并按退避重试，多次失败后熔断到次日开始。自动点火在每日开始—结束（加宽限分钟）时段内按 5 小时窗口的重置时间调度，默认 7–22 点、结束后宽限 30 分钟、失败重试间隔 300 秒、熔断前瞬时失败上限 3 次。
-
-点火按服务区分：Codex 用 `openai-response` 协议（最新 Luna 优先）、Claude 用 `claude` 协议（最新 Haiku 优先，其次 Sonnet）、Antigravity 用 `openai` 协议（Gemini 组最新 Flash 优先，Claude / GPT 组 Haiku > Sonnet > Opus > GPT-OSS）；Antigravity 自动点火默认关闭，开启后默认只点 Gemini 组。管理页面的“立即操作”卡片是一张点火目标表，每行对应一个额度组。Codex 行有两个独立按钮，顺序固定为“立即重置”在前、“立即点火”在后；其他服务行只有“立即点火”。立即重置只走重置流程，立即点火只走点火流程，两者互不触发。
-
-点火模型按插件当前配置显示；设置了模型列表 API key 后，插件会从 CPA 的 `/v1/models` 读取候选模型，但已配置的模型始终优先。已配模型被拒时按列表候选 fallback，Codex 最后兜底试 `gpt-5-codex`（仅当它在模型列表中时）；连续被拒两次即停止点火。模型列表 API key 的校验走插件路由 `POST /check-models-key`（插件直连 CPA），页面不直接请求 CPA 的 `/v1/models`。
-
-### 自动重置（仅 Codex）
-
-自动重置只针对 Codex 订阅渠道的周用量窗口。触发条件为：
-
-1. 请求失败状态为 `429`。
-2. 错误类型为 `usage_limit_reached`。
-3. 凭证属于 Codex。
-4. 窗口是周窗口，通常由 `limit_window_minutes: 10080` 表示；缺少显式窗口字段时，根据剩余时间进行保守判断。
-5. 剩余恢复时间达到配置的最低秒数（默认 `86400`），用于排除短时 5 小时窗口。
-6. 凭证在 Phoenix 的纳入列表中，或当前配置允许自动处理全部凭证。
-7. 上游返回至少一张可用的 reset credit。
-
-命中后，Phoenix 会：
-
-1. 通过 CPA host 回调读取凭证。
-2. 提取 access token 和 ChatGPT account ID。
-3. 查询 `rate-limit-reset-credits`（失败最多重试 3 次）。
-4. 选择可用且最早到期的 credit（无到期时间的 credit 视为永不过期）。
-5. 生成一次性的幂等请求 ID。
-6. 调用 credit consume 接口（只发一次，`Content-Type: application/json`）。
-7. 只有上游返回 `reset` 或 `already_redeemed` 时才视为 credit 操作成功。
-8. 调用 CPA 的 `host.routing.reset_cooldown` 清除本地凭证冷却。
-9. 记录日志并发送通知；点火开关开启时，在点火宽限（`ignition.grace_seconds`）后自动点火一次。
-
-同一凭证 5 分钟内只做一次重置决策，重复的 429 不会消耗第二张 credit。消费 credit 后如果清除 CPA 冷却失败，Phoenix 会记录警告并通知“重置未完全成功”，不会重复消费 credit。网络错误、凭证缺失、没有可用 credit 或上游返回其他结果时，不会伪造成功状态。
-
-手动重置（“立即重置”按钮或 `POST /v0/management/phoenix/reset`）只走重置流程，不自动点火；自动重置成功后仍会按配置的延迟自动点火一次。
-
-### MCP
-
-独立 MCP HTTP 服务默认关闭。开启后在 `mcp_listen`（默认 `127.0.0.1:8318`）监听，密钥为空时页面在同一次保存中生成 `phxmcp_` 前缀的随机密钥。客户端配置示例：
-
-```bash
-claude mcp add --transport http phoenix http://127.0.0.1:8318/mcp --header "Authorization: Bearer <key>"
-```
-
-## 兼容性与构建平台
-
-Phoenix 使用 CLIProxyAPI v8 插件 SDK，并通过 c-shared 动态库加载，当前依赖的 SDK 版本为 v8.0.36。
-
-当前 GitHub Release 提供：
-
-- Linux amd64：`linux/amd64`，文件扩展名 `.so`。
-- Linux arm64：`linux/arm64`，文件扩展名 `.so`。
-- Windows amd64：`windows/amd64`，文件扩展名 `.dll`。
+| 平台 | 架构 | 文件 |
+| --- | --- | --- |
+| Linux | amd64、arm64 | `phoenix.so` |
+| Windows | amd64 | `phoenix.dll` |
 
 macOS 可以在具备 Go、CGO 和对应编译工具链的机器上自行构建；构建结果必须使用 CPA 所在系统对应的动态库格式和架构。
 
-## 从 GitHub Release 安装
+### 1. 下载正确的 Release 包
 
 以下步骤适用于已经运行 CLIProxyAPI 的服务器。请先确认 CPA 使用的系统和 CPU 架构：
 
@@ -113,14 +48,12 @@ uname -m
 - `x86_64` → `amd64`。
 - `aarch64` 或 `arm64` → `arm64`。
 
-### 1. 下载正确的 Release 包
-
-打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.1.0`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
+打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.1.3`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
 
 Linux amd64 示例：
 
 ```bash
-VERSION=0.1.0
+VERSION=0.1.3
 mkdir -p /tmp/phoenix-$VERSION
 cd /tmp/phoenix-$VERSION
 curl -fL -o phoenix.zip "https://github.com/Xiuyixx/Phoenix/releases/download/v$VERSION/phoenix_${VERSION}_linux_amd64.zip"
@@ -138,7 +71,7 @@ unzip -o phoenix.zip
 Windows 使用 PowerShell 校验：
 
 ```powershell
-$version = "0.1.0"
+$version = "0.1.3"
 $file = "phoenix_${version}_windows_amd64.zip"
 (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
 Get-Content "${file}.sha256"
@@ -205,7 +138,7 @@ plugins:
 
 ```bash
 # Docker Compose
- docker compose restart
+docker compose restart
 
 # systemd，服务名称以实际部署为准
 sudo systemctl restart cliproxyapi
@@ -221,41 +154,74 @@ sudo systemctl restart cliproxyapi
 
 不要直接假设服务名称、配置路径或容器名称。先用实际部署中的 `systemctl list-units`、`docker compose ps` 和 CPA 启动参数确认。
 
-## 从源码构建
+从源码构建、本地打包与版本发布流程见 [docs/development.md](docs/development.md)。
 
-### Linux 本机构建
+## 主要功能
 
-要求：
+### 额度与账号状态
 
-- Go 版本满足 `go.mod`。
-- GCC 或其他 CGO 编译器可用。
-- CPA 目标平台与构建目标一致。
+Phoenix 通过主动轮询（默认每 300 秒）与被动接收 CPA 的 usage 回调两条路径收集额度数据，覆盖 5 小时与 7 天两个窗口。没有收到有效额度数据时，页面显示等待状态，不会把缺失数据当成 100% 或 0% 使用量。
 
-```bash
-git clone https://github.com/Xiuyixx/Phoenix.git
-cd Phoenix
-go test ./...
-make check-version
-make build
-```
+额度采样会持久化到插件数据目录下的历史文件（默认保留 40 天），管理页面用“额度变化”图表展示：总览按采样点着色（满/高/中/低/空五档），可点开单账号详情曲线（含匀速参考线、预测线与重置标记），支持 5 小时 / 7 天窗口与时间范围切换。
 
-Linux amd64 的产物为：
+设置页的“账号”区支持拖动排序、填写名称与权重，卡片与图表的顺序跟随账号顺序；名称取自 CPA 凭证备注的第一行。
+
+各服务的额度请求地址、窗口识别与被动数据规则见 [架构文档](docs/architecture.md#额度获取)。
+
+### 通知
+
+通知按 Bark → Telegram → webhook 的顺序扇出，同时发送到所有已配置的渠道；三个渠道都没配时推送关闭。当前通知场景包括：
+
+- 账号返回 `401` 或 `403`，通常表示凭证失效、账号未授权或账号被停用。
+- 账号返回 `429`，通常表示限流或额度耗尽。
+- 额度降到提醒阈值（默认剩余 20% / 10% / 5% 各通知一次），额度恢复、重置前提醒。
+- 自动重置成功。
+- 点火失败或熔断。
+- 测试推送。
+
+通知文案为 Phoenix 定稿：中文通知用单个表情标题（🟢 Normal / 🟡 Warning / 🔴 Exhausted）与账号 / 模型 / 5H / 7D / 状态 / 时间逐行字段，账号用邮箱标识；英文通知保持 Lamplighter 原文案。
+
+设置 Telegram Bot Token 和接收 ID 后，Phoenix 可以向一个或多个接收者发送提醒。多个接收 ID 使用英文分号分隔，例如：
 
 ```text
-dist/phoenix.so
+123456789;987654321;-1001234567890
 ```
 
-手动安装时，将它复制为 CPA 插件目录中的 `phoenix.so`。
+Bot Token 只用于调用 Telegram Bot API，不写入 Git 仓库。管理接口返回的配置中 Bot Token 一律脱敏（只返回是否已设置），页面留空表示不修改。Bot Token 为空时该渠道不启用；Token 已填但未填接收 ID 时，设置页会报“Telegram 设置无效”，通知横幅中显示原因。
 
-### 本地 Release 包
+Bark 填推送地址（到 device key 为止），webhook 支持自定义方法、请求头、请求体与成功条件。Did Codex Reset 信号默认关闭；开启后按 `codex_reset_updates.poll_seconds`（默认 300 秒）轮询 https://didcodexreset.com/openapi/v1/records，去重后经已配置的通知渠道（含 Telegram）转发；发送失败的记录仍标记为已见，不再每轮重复播报。
+
+各渠道的发送格式与成功条件见 [架构文档](docs/architecture.md#通知)。
+
+### 自动点火
+
+点火通过宿主的模型执行回调发送一次最小请求（只要求回复 `OK`，不推理、不用工具），从而开始一个新的 5 小时窗口；点火后会多次复查，确认出现固定的未来 5 小时重置才算成功，否则报未确认并按退避重试，多次失败后熔断到次日开始。自动点火在每日开始—结束（加宽限分钟）时段内按 5 小时窗口的重置时间调度，默认 7–22 点、结束后宽限 30 分钟、失败重试间隔 300 秒、熔断前瞬时失败上限 3 次。
+
+点火模型按服务区分：Codex 最新 Luna 优先、Claude 最新 Haiku 优先、Antigravity Gemini 组最新 Flash 优先；Antigravity 自动点火默认关闭，开启后默认只点 Gemini 组。管理页面的“立即操作”卡片是一张点火目标表，每行对应一个额度组。Codex 行有两个独立按钮，顺序固定为“立即重置”在前、“立即点火”在后；其他服务行只有“立即点火”。立即重置只走重置流程，立即点火只走点火流程，两者互不触发。
+
+点火模型按插件当前配置显示；设置了模型列表 API key 后，插件会从 CPA 的 `/v1/models` 读取候选模型，但已配置的模型始终优先。已配模型被拒时按列表候选 fallback。模型列表 API key 的校验走插件路由 `POST /check-models-key`（插件直连 CPA），页面不直接请求 CPA 的 `/v1/models`。
+
+点火时间、请求、确认与失败保护的细节见 [架构文档](docs/architecture.md#点火)。
+
+### 自动重置
+
+自动重置只针对 Codex 订阅渠道的周用量窗口：被动 usage 回调收到 `usage_limit_reached` 的 429、周窗口耗尽且账号持有可用 reset credit 时，自动消耗一张最早到期的 credit 并清除 CPA 本地冷却，无需人工干预；点火开关开启时，在点火宽限后自动点火一次。
+
+同一凭证 5 分钟内只做一次重置决策，消费 credit 只发一次；清除冷却失败时通知“重置未完全成功”，不重复消费 credit。网络错误、凭证缺失、没有可用 credit 或上游返回其他结果时，不会伪造成功状态。
+
+手动重置（“立即重置”按钮或 `POST /v0/management/phoenix/reset`）只走重置流程，不自动点火；自动重置成功后仍会按配置的延迟自动点火一次。
+
+触发条件与重置链的完整流程见 [架构文档](docs/architecture.md#重置)。
+
+### MCP
+
+独立 MCP HTTP 服务默认关闭。开启后在 `mcp_listen`（默认 `127.0.0.1:8318`）监听，密钥为空时页面在同一次保存中生成 `phxmcp_` 前缀的随机密钥。客户端配置示例：
 
 ```bash
-make release VERSION=$(cat VERSION)
-unzip -l dist/phoenix_$(cat VERSION)_linux_amd64.zip
-sha256sum -c dist/checksums.txt
+claude mcp add --transport http phoenix http://127.0.0.1:8318/mcp --header "Authorization: Bearer <key>"
 ```
 
-`make release` 使用当前主机的 `GOOS/GOARCH`，适合在本机生成测试包。跨平台正式包由 GitHub Actions 按 runner 原生 shell 构建，Windows 使用 PowerShell 的 `Compress-Archive` 和 `Get-FileHash`。
+协议、鉴权与工具数据见 [架构文档](docs/architecture.md#mcp)。
 
 ## 配置说明
 
@@ -332,31 +298,6 @@ sha256sum -c dist/checksums.txt
 - Linux amd64、Linux arm64、Windows amd64 成功后才会创建 Release。
 
 构建警告不会自动等同于失败，应以每个 job 的 `conclusion` 和最终 Release 资产为准。
-
-## 版本与发布流程
-
-版本号统一保存在 `VERSION`，并同步到 `main.go` 和 `CHANGELOG.md`。当前版本为 `0.1.0`。
-
-后续每次功能、修复或文档变更都递增版本号，例如从 `0.1.0` 到 `0.1.1`，完成验证后执行：
-
-```bash
-make check-version VERSION=0.1.1
-go test ./...
-git add .
-git commit -m "..."
-git push origin master
-git tag -a v0.1.1 -m "Phoenix v0.1.1"
-git push origin v0.1.1
-```
-
-推送版本 tag 后，GitHub Actions 会自动构建并发布：
-
-- `phoenix_<version>_linux_amd64.zip`
-- `phoenix_<version>_linux_arm64.zip`
-- `phoenix_<version>_windows_amd64.zip`
-- 每个平台对应的 `.sha256` 校验文件
-
-GitHub Actions 不会发布当前工作流未构建的平台。发布完成后，应在 [Releases](https://github.com/Xiuyixx/Phoenix/releases) 中检查 tag、资产列表和校验文件。
 
 ## 参考与致谢
 
