@@ -27,7 +27,7 @@ Phoenix 通过两条路径收集额度数据：主动轮询按 `poll_interval_se
 - 点火失败或熔断。
 - 测试推送。
 
-通知文案为 Phoenix 定稿：中文通知用三组表情标题（🟢 Normal / 🟡 Warning / 🔴 Exhausted）与账号 / 模型 / 5H / 7D / 状态 / 时间逐行字段，账号用邮箱标识；英文通知保持 Lamplighter 原文案。
+通知文案为 Phoenix 定稿：中文通知用单个表情标题（🟢 Normal / 🟡 Warning / 🔴 Exhausted）与账号 / 模型 / 5H / 7D / 状态 / 时间逐行字段，账号用邮箱标识；英文通知保持 Lamplighter 原文案。
 
 Bark 请求为 `GET {bark_url}/{标题}/{正文}?group&level&icon&url`，默认分组为 `CPA`，默认图标为空（Phoenix 不带 logo，可用 `bark_icon` 自行设置）。webhook 支持 `url`、`method`、`headers`、`body`、`success_json`，请求体为空时发送内置 JSON，占位符为 `{{title}} {{body}} {{text}} {{url}} {{priority}} {{kind}} {{label}} {{time}}`。
 
