@@ -3996,7 +3996,10 @@
     if (text) {
       if (failed) {
         var compact = el("span", { "data-save-part": "compact" });
-        compact.textContent = translate("save_failed_compact");
+        // On narrow screens the summary and reason are hidden, leaving only
+        // the compact text; include the failure reason there so a refused
+        // key still says why instead of only "save failed".
+        compact.textContent = translate("save_failed_compact") + translate("save_failure_reason", saveText(failed.failure.text));
         node.appendChild(compact);
       }
       var message = el("span", { "data-save-part": failed ? "summary" : "progress" });

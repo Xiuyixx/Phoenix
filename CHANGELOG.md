@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.12 - 2026-11-23
+
+- 修复模型列表 API key 在手机上始终保存失败：服务器日志证明失败发生在浏览器本地、没有任何校验或保存请求发到 CPA——保存时输入框里的值是浏览器自动填入的 CPA 管理密钥（与管理中心同源，iOS Safari 会把已保存的管理密钥填进密码框，粘贴后失焦时还可能被还原），页面按设计直接拒绝管理密钥。`autocomplete="one-time-code"` 拦不住这种自动填充，改用 `autocomplete="new-password"`（模型列表 API key 与 Telegram Bot Token 两个密码框均改），并加 `autocapitalize/autocorrect/spellcheck` 关闭。另修一个连带问题：窄屏下保存失败只显示紧凑文案“✕ 保存失败”，具体的拒绝原因被 CSS 藏起来了，用户看不到到底为什么失败；现把原因拼进紧凑文案，手机上也能看到（例如“✕ 保存失败：这是 CPA 管理密钥，未保存。请填写 access.api-keys 中的 key”）。
+
 ## 0.0.11 - 2026-11-23
 
 - 多服务支持：额度轮询与自动点火从 Codex-only 扩展到 Claude 与 Antigravity（按 Lamplighter 的 provider 实现改写）。Claude 查 `api.anthropic.com/api/oauth/usage`（5 小时、7 天窗口，Opus/Sonnet/OAuth Apps/Cowork 各为独立额度组，Fable 由 `limits[]` 的 weekly_scoped 项解析），Antigravity 查 `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`（3 个 URL 依次回退，Hub 版本缓存 3 小时），按模型分 Gemini 与 Claude / GPT 两个独立额度组；Kimi 与 Grok 在服务列表中标记为不支持，不参与轮询与点火。点火按服务区分协议与候选模型：Codex `openai-response`（最新 luna 优先）、Claude `claude` 协议（最新 Haiku 优先，其次 Sonnet）、Antigravity `openai` 协议（Gemini 组最新 Flash 优先，Claude / GPT 组 Haiku > Sonnet > Opus > GPT-OSS）；Antigravity 自动点火默认关闭，开启后默认只点 Gemini 组。已配置的点火模型始终优先（Codex 的 `gpt-6-luna` 永不重置），每服务可配开关、模型与额度组，`PUT /settings` 的 `providers` 按服务合并，不会互相清空。
