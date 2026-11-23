@@ -1,0 +1,363 @@
+// Package plugin implements the CPA plugin RPC methods on top of the engine.
+// Package main forwards every native call to Handle.
+package plugin
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Xiuyixx/Phoenix/internal/config"
+	"github.com/Xiuyixx/Phoenix/internal/engine"
+	"github.com/Xiuyixx/Phoenix/internal/host"
+	"github.com/Xiuyixx/Phoenix/internal/mcp"
+	"github.com/Xiuyixx/Phoenix/internal/models"
+	"github.com/Xiuyixx/Phoenix/internal/providers"
+	"github.com/Xiuyixx/Phoenix/internal/web"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+const (
+	repository  = "https://github.com/Xiuyixx/Phoenix"
+	apiBase     = "/v0/management/" + config.PluginID
+	pagePath    = "/page"
+	stopTimeout = 10 * time.Second
+)
+
+// Plugin handles the RPC methods of one loaded plugin instance.
+type Plugin struct {
+	version     string
+	engine      *engine.Engine
+	once        sync.Once
+	mcp         *mcp.Server
+	lifecycleMu sync.Mutex
+	stopped     bool
+}
+
+// New creates the plugin. dataDir is the default data directory derived from
+// the plugin file location; hostConfigPath is the CPA config file.
+func New(h host.Host, version, dataDir, hostConfigPath string) *Plugin {
+	p := &Plugin{
+		version: version,
+		engine: engine.New(engine.Options{
+			Host:           h,
+			Version:        version,
+			DataDir:        dataDir,
+			HostConfigPath: hostConfigPath,
+		}),
+	}
+	p.mcp = mcp.New(engine.NewMCPBackend(p.engine), version)
+	return p
+}
+
+type envelope struct {
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *envelopeError  `json:"error,omitempty"`
+}
+
+type envelopeError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func ok(value any) ([]byte, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(envelope{OK: true, Result: raw})
+}
+
+// ErrorEnvelope encodes a failed RPC result.
+func ErrorEnvelope(code, message string) []byte {
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
+	return raw
+}
+
+// Handle runs one RPC method and returns the response envelope. A panic is
+// turned into an error envelope so that it cannot crash CPA.
+func (p *Plugin) Handle(method string, request []byte) (out []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			out = ErrorEnvelope("plugin_panic", fmt.Sprint(r))
+		}
+	}()
+	result, err := p.handle(method, request)
+	if err != nil {
+		return ErrorEnvelope("plugin_error", err.Error())
+	}
+	return result
+}
+
+// Shutdown stops the engine.
+func (p *Plugin) Shutdown() {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	p.stopped = true
+	// Close MCP connections before the engine and host callbacks are released.
+	p.mcp.Close()
+	p.engine.Stop(stopTimeout)
+}
+
+func (p *Plugin) status() engine.Status {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	status := p.engine.Status()
+	status.MCP = p.mcp.State()
+	return status
+}
+
+func (p *Plugin) handle(method string, request []byte) ([]byte, error) {
+	switch method {
+	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+		var req struct {
+			ConfigYAML []byte `json:"config_yaml"`
+		}
+		if len(request) > 0 {
+			if err := json.Unmarshal(request, &req); err != nil {
+				return nil, fmt.Errorf("decode lifecycle request: %w", err)
+			}
+		}
+		cfg, err := config.Parse(req.ConfigYAML)
+		p.lifecycleMu.Lock()
+		if !p.stopped {
+			revision := p.engine.Configure(cfg, err)
+			if err == nil {
+				p.mcp.Configure(cfg.MCPEnabled, cfg.MCPListen, cfg.MCPKey)
+				p.engine.MCPConfigured(revision)
+			}
+			p.once.Do(p.engine.Start)
+		}
+		p.lifecycleMu.Unlock()
+		return ok(p.registration())
+	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
+		p.Shutdown()
+		return ok(struct{}{})
+	case pluginabi.MethodManagementRegister:
+		return ok(managementRegistration())
+	case pluginabi.MethodManagementHandle:
+		var req pluginapi.ManagementRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, fmt.Errorf("decode management request: %w", err)
+		}
+		return ok(p.handleManagement(req))
+	case pluginabi.MethodUsageHandle:
+		var record pluginapi.UsageRecord
+		if err := json.Unmarshal(request, &record); err == nil {
+			p.engine.ObserveUsage(record)
+		}
+		return ok(struct{}{})
+	}
+	return ErrorEnvelope("unknown_method", "unknown method: "+method), nil
+}
+
+type registration struct {
+	SchemaVersion uint32             `json:"schema_version"`
+	Metadata      pluginapi.Metadata `json:"metadata"`
+	Capabilities  map[string]bool    `json:"capabilities"`
+}
+
+func field(name string, kind pluginapi.ConfigFieldType, description string) pluginapi.ConfigField {
+	return pluginapi.ConfigField{Name: name, Type: kind, Description: description}
+}
+
+func (p *Plugin) registration() registration {
+	return registration{
+		SchemaVersion: pluginabi.SchemaVersion,
+		Metadata: pluginapi.Metadata{
+			Name:             "Phoenix",
+			Version:          p.version,
+			Author:           "Xiuyixx",
+			GitHubRepository: repository,
+			ConfigFields: []pluginapi.ConfigField{
+				field("config_token", pluginapi.ConfigFieldTypeString, "配置应用确认令牌，可为空 / Configuration acknowledgment token; may be empty"),
+				field("bark_url", pluginapi.ConfigFieldTypeString, "Bark 推送地址，到 device key 为止；为空时不通过 Bark 推送 / Bark push URL up to the device key; empty disables Bark"),
+				field("bark_group", pluginapi.ConfigFieldTypeString, "Bark 通知分组 / Bark notification group"),
+				field("telegram", pluginapi.ConfigFieldTypeObject, "Telegram 推送：bot_token、chat_ids（多个用分号分隔）、enabled；bot_token 为空时不启用 / Telegram notifications: bot_token, chat_ids (separated by semicolons) and enabled; empty bot_token disables it"),
+				field("webhook", pluginapi.ConfigFieldTypeObject, "自定义 webhook：url、method、headers、body、success_json；url 为空时不启用 / Custom webhook: url, method, headers, body, success_json; empty url disables it"),
+				field("mcp_enabled", pluginapi.ConfigFieldTypeBoolean, "启用独立 MCP HTTP 服务 / Enable the independent MCP HTTP server"),
+				field("mcp_listen", pluginapi.ConfigFieldTypeString, "MCP 监听地址，默认 127.0.0.1:8318 / MCP listen address, default 127.0.0.1:8318"),
+				field("mcp_key", pluginapi.ConfigFieldTypeString, "MCP 专用 Bearer 密钥 / Dedicated MCP Bearer key"),
+				field("models_api_key", pluginapi.ConfigFieldTypeString, "读取 /v1/models 用的专用 CPA API key / Dedicated CPA API key for reading /v1/models"),
+				field("cpa_base_url", pluginapi.ConfigFieldTypeString, "插件访问 CPA 自身的地址 / Address the plugin uses to reach CPA"),
+				field("notice_threshold", pluginapi.ConfigFieldTypeNumber, "第一档提醒阈值（剩余百分比） / First alert threshold (percent remaining)"),
+				field("low_threshold", pluginapi.ConfigFieldTypeNumber, "第二档提醒阈值（剩余百分比） / Second alert threshold (percent remaining)"),
+				field("critical_threshold", pluginapi.ConfigFieldTypeNumber, "第三档提醒阈值（剩余百分比） / Third alert threshold (percent remaining)"),
+				field("recovery_notify", pluginapi.ConfigFieldTypeObject, "额度恢复时通知，five_hour 和 seven_day 各取 off、all 或 after_exhausted / Recovery notifications, off, all or after_exhausted for five_hour and seven_day"),
+				field("reset_reminder", pluginapi.ConfigFieldTypeObject, "重置前提醒，five_hour 和 seven_day 各取 off、all 或 has_remaining / Reset reminders, off, all or has_remaining for five_hour and seven_day"),
+				field("timezone_offset_hours", pluginapi.ConfigFieldTypeNumber, "显示时间和点火时段使用的 UTC 偏移 / UTC offset for displayed times and ignition hours"),
+				field("poll_interval_seconds", pluginapi.ConfigFieldTypeInteger, "主动查询间隔，对齐到整点 / Active query interval, aligned to the hour"),
+				field("passive_skip_seconds", pluginapi.ConfigFieldTypeInteger, "整点前多少秒内有被动数据时跳过主动查询，0 为不跳过 / Skip the active query when passive data arrived this many seconds before the slot; 0 never skips"),
+				field("passive_skip_max_minutes", pluginapi.ConfigFieldTypeInteger, "同一账号最多连续跳过多少分钟 / Longest run of skipped queries per account, in minutes"),
+				field("ignition", pluginapi.ConfigFieldTypeObject, "点火开关、每日时段和失败保护 / Ignition switch, daily hours and failure protection"),
+				field("ignition.model", pluginapi.ConfigFieldTypeString, "点火使用的模型（旧配置写法，等价于 providers.codex.model）/ Ignition model, legacy spelling of providers.codex.model"),
+				field("reset", pluginapi.ConfigFieldTypeObject, "周用量窗口耗尽时使用 reset credit 自动重置 / Automatic reset with a reset credit when the weekly window is exhausted"),
+				field("providers", pluginapi.ConfigFieldTypeObject, providersDescription()),
+				field("codex_reset_updates", pluginapi.ConfigFieldTypeObject, "转发 Did Codex Reset 的重置信号 / Forward Did Codex Reset signals"),
+				field("history_retention_days", pluginapi.ConfigFieldTypeInteger, "额度历史保留天数 / Days of quota history to keep"),
+				field("data_dir", pluginapi.ConfigFieldTypeString, "状态和历史目录，默认 plugins/data/phoenix / State and history directory, default plugins/data/phoenix"),
+			},
+		},
+		Capabilities: map[string]bool{
+			"management_api": true,
+			"usage_plugin":   true,
+		},
+	}
+}
+
+type route struct {
+	Method      string
+	Path        string
+	Description string
+}
+
+type resource struct {
+	Path        string
+	Menu        string
+	Description string
+}
+
+func managementRegistration() map[string]any {
+	return map[string]any{
+		"routes": []route{
+			{Method: http.MethodGet, Path: apiBase + "/status", Description: "Phoenix status"},
+			{Method: http.MethodGet, Path: apiBase + "/history", Description: "Phoenix quota history"},
+			{Method: http.MethodPost, Path: apiBase + "/refresh", Description: "Query quota now"},
+			{Method: http.MethodPost, Path: apiBase + "/reset", Description: "Reset one Codex credential with a reset credit now"},
+			{Method: http.MethodPost, Path: apiBase + "/ignite", Description: "Ignite one quota window now"},
+			{Method: http.MethodPost, Path: apiBase + "/test-notify", Description: "Send a test notification to every channel"},
+			{Method: http.MethodPost, Path: apiBase + "/language", Description: "Set the notification language"},
+			{Method: http.MethodPost, Path: apiBase + "/check-update", Description: "Check for a newer release"},
+			{Method: http.MethodPost, Path: apiBase + "/check-models-key", Description: "Validate a CPA API key against CPA /v1/models"},
+		},
+		"resources": []resource{
+			{Path: pagePath, Menu: "Phoenix", Description: "额度监控、自动点火和额度图表 / Quota monitoring, ignition and quota chart"},
+		},
+	}
+}
+
+func jsonResponse(status int, value any) pluginapi.ManagementResponse {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		status = http.StatusInternalServerError
+		raw = []byte(`{"error":"encode response failed"}`)
+	}
+	return pluginapi.ManagementResponse{
+		StatusCode: status,
+		Headers:    http.Header{"Content-Type": []string{"application/json; charset=utf-8"}, "Cache-Control": []string{"no-store"}},
+		Body:       raw,
+	}
+}
+
+func errorResponse(status int, err error) pluginapi.ManagementResponse {
+	return jsonResponse(status, map[string]string{"error": err.Error()})
+}
+
+func (p *Plugin) handleManagement(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	path := strings.TrimRight(req.Path, "/")
+	if strings.HasSuffix(path, "/"+config.PluginID+pagePath) && strings.Contains(path, "/v0/resource/plugins/") {
+		return pluginapi.ManagementResponse{
+			StatusCode: http.StatusOK,
+			Headers: http.Header{
+				"Content-Type":  []string{"text/html; charset=utf-8"},
+				"Cache-Control": []string{"no-store"},
+			},
+			Body: web.Page(),
+		}
+	}
+	var body struct {
+		AuthIndex string `json:"auth_index"`
+		Target    string `json:"target"`
+		Language  string `json:"language"`
+		Key       string `json:"key"`
+	}
+	if len(req.Body) > 0 {
+		_ = json.Unmarshal(req.Body, &body)
+	}
+	switch strings.ToUpper(req.Method) + " " + path {
+	case "GET " + apiBase + "/status":
+		return jsonResponse(http.StatusOK, p.status())
+	case "GET " + apiBase + "/history":
+		resp, err := p.engine.HistoryRange(req.Query.Get("range"), req.Query.Get("window"))
+		if err != nil {
+			return errorResponse(http.StatusInternalServerError, err)
+		}
+		return jsonResponse(http.StatusOK, resp)
+	case "POST " + apiBase + "/refresh":
+		return actionResponse(p.engine.Refresh(strings.TrimSpace(body.AuthIndex)), p)
+	case "POST " + apiBase + "/reset":
+		cfg := p.engine.Config()
+		if !cfg.Reset.Enabled {
+			return jsonResponse(http.StatusOK, map[string]any{"ok": false, "error": "reset disabled", "status": p.status()})
+		}
+		return actionResponse(p.engine.Reset(strings.TrimSpace(body.AuthIndex)), p)
+	case "POST " + apiBase + "/ignite":
+		if strings.TrimSpace(body.Target) == "" {
+			return errorResponse(http.StatusBadRequest, errors.New("缺少 target"))
+		}
+		return actionResponse(p.engine.Ignite(strings.TrimSpace(body.Target)), p)
+	case "POST " + apiBase + "/test-notify":
+		results, err := p.engine.TestNotify()
+		if err != nil {
+			return actionResponse(err, p)
+		}
+		ok := true
+		for _, result := range results {
+			ok = ok && result.OK
+		}
+		return jsonResponse(http.StatusOK, map[string]any{"ok": ok, "results": results, "status": p.status()})
+	case "POST " + apiBase + "/language":
+		return actionResponse(p.engine.SetLanguage(body.Language), p)
+	case "POST " + apiBase + "/check-update":
+		return actionResponse(p.engine.CheckRelease(), p)
+	case "POST " + apiBase + "/check-models-key":
+		// The page validates the models API key through this route so the
+		// browser never calls CPA /v1/models directly: the in-page
+		// request would cross the management proxy and lose its
+		// Authorization header. The plugin calls CPA itself.
+		key := strings.TrimSpace(body.Key)
+		if key == "" {
+			return jsonResponse(http.StatusOK, map[string]any{"ok": false, "reason": "key 为空"})
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		_, err := (&models.Lister{}).List(ctx, p.status().Config.CPABaseURL, key)
+		if err == nil {
+			return jsonResponse(http.StatusOK, map[string]any{"ok": true})
+		}
+		if strings.Contains(err.Error(), "HTTP 401") || strings.Contains(err.Error(), "HTTP 403") {
+			return jsonResponse(http.StatusOK, map[string]any{"ok": false, "refused": true})
+		}
+		return jsonResponse(http.StatusOK, map[string]any{"ok": false, "reason": err.Error()})
+	}
+	return errorResponse(http.StatusNotFound, fmt.Errorf("unknown route %s %s", req.Method, req.Path))
+}
+
+func actionResponse(err error, p *Plugin) pluginapi.ManagementResponse {
+	if errors.Is(err, engine.ErrNotRunning) {
+		return errorResponse(http.StatusServiceUnavailable, err)
+	}
+	if err != nil {
+		return jsonResponse(http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "status": p.status()})
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"ok": true, "status": p.status()})
+}
+
+// providersDescription describes the providers key with the provider IDs,
+// such as "codex、claude 的监控和点火设置 / Monitoring and ignition settings
+// for codex and claude".
+func providersDescription() string {
+	ids := providers.IDs()
+	english := strings.Join(ids, ", ")
+	if n := len(ids); n > 1 {
+		english = strings.Join(ids[:n-1], ", ") + " and " + ids[n-1]
+	}
+	return strings.Join(ids, "、") + " 的监控和点火设置 / Monitoring and ignition settings for " + english
+}

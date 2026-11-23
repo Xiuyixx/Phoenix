@@ -1,0 +1,792 @@
+// Package engine runs Phoenix's background loop: quota polling, passive
+// quota updates, ignition, notifications and history.
+//
+// One goroutine owns the state and performs all network work in order.
+// usage.handle and the management API talk to it through channels, so the
+// host callbacks never block on upstream requests.
+package engine
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime/debug"
+	"sync"
+	"time"
+
+	"github.com/Xiuyixx/Phoenix/internal/config"
+	"github.com/Xiuyixx/Phoenix/internal/egress"
+	"github.com/Xiuyixx/Phoenix/internal/host"
+	"github.com/Xiuyixx/Phoenix/internal/ignite"
+	"github.com/Xiuyixx/Phoenix/internal/models"
+	"github.com/Xiuyixx/Phoenix/internal/notify"
+	"github.com/Xiuyixx/Phoenix/internal/release"
+	"github.com/Xiuyixx/Phoenix/internal/store"
+)
+
+const (
+	// startupDelay gives CPA time to load credentials and executors.
+	startupDelay       = 20 * time.Second
+	enabledCheckPeriod = 30 * time.Second
+	lockRetryPeriod    = 10 * time.Second
+	pruneInterval      = 6 * time.Hour
+	maxEvents          = 200
+	maxSleep           = time.Hour
+	restartDelay       = 30 * time.Second
+	// The latest release is read again after releaseCheckPeriod, and after
+	// releaseRetryPeriod when a read fails.
+	releaseCheckPeriod = 6 * time.Hour
+	releaseRetryPeriod = 30 * time.Minute
+	// Opening the management page reads the latest release unless a read was
+	// tried within releaseRecheckPeriod. GitHub allows 60 unauthenticated API
+	// requests an hour per address.
+	releaseRecheckPeriod = time.Minute
+)
+
+// releaseAutoCheck enables the periodic GitHub release check in the engine
+// loop. Phoenix does not ship release checks: it stays off by default, so a
+// running plugin never contacts GitHub on its own. The release package and
+// the manual POST /check-update route are kept intact for a later decision;
+// the management page never calls that route.
+var releaseAutoCheck = false
+
+// confirmDelays are the waits between ignition confirmation checks.
+var confirmDelays = []time.Duration{5 * time.Second, 10 * time.Second, 15 * time.Second, 30 * time.Second, 15 * time.Second}
+
+// Options configures an Engine.
+type Options struct {
+	Host           host.Host
+	Version        string
+	DataDir        string
+	HostConfigPath string
+	// Now and Sleep can be replaced in tests.
+	Now func() time.Time
+	// TelegramBaseURL overrides https://api.telegram.org for tests. Empty
+	// uses the real Bot API.
+	TelegramBaseURL string
+}
+
+// Engine is the Phoenix background service.
+type Engine struct {
+	host            host.Host
+	version         string
+	defaultDataDir  string
+	hostConfigPath  string
+	now             func() time.Time
+	telegramBaseURL string
+
+	// mu guards the fields read by the management API and usage.handle.
+	mu                 sync.Mutex
+	cfg                config.Config
+	cfgRevision        uint64
+	runtimeRevision    uint64
+	runtimeToken       string
+	mcpRevision        uint64
+	appliedRevision    uint64
+	configAppliedToken string
+	cfgErr             string
+	dataDir            string
+	enabled            bool
+	running            bool
+	lockErr            string
+	creds              map[string]*Cred
+	groups             map[string]*GroupView
+	targets            []TargetView
+	events             []Event
+	lastPoll           time.Time
+	nextPoll           time.Time
+	pollErrs           map[string]string
+	modelsErr          string
+	// notifyInvalid is the reason each notification channel's settings
+	// were not applied, by channel name ("Telegram", "Webhook").
+	notifyInvalid map[string]string
+	lang          string // notification language, a copy of state.Language
+	// nextModels is the model automatic selection picks next, per provider.
+	nextModels map[string]string
+	// latest is the latest release when it is newer than this version.
+	latest release.Release
+	// releaseMu is held while the latest release is read, and guards
+	// releaseTried and releaseAt, when a read was last tried and when one last
+	// succeeded.
+	releaseMu    sync.Mutex
+	releaseTried time.Time
+	releaseAt    time.Time
+	// plans is the raw plan per auth index, a copy of state.Plans.
+	plans map[string]string
+	// credProblems is the reason of the credential problem per auth index,
+	// a copy of state.Credentials.
+	credProblems map[string]string
+
+	// Owned by the loop goroutine.
+	state *store.State
+	// credNoticeTried is when the credential notification of each account
+	// was last sent or tried; flushCredentialNotices skips the ones tried
+	// during the same poll.
+	credNoticeTried map[string]time.Time
+	stateFile       *store.StateFile
+	history         *store.History
+	dirty           bool
+	egress          *egress.Egress
+	lister          *models.Lister
+	alerts          *notify.Alerts
+	passiveAt       map[string]time.Time
+	// fableSeen marks credentials whose passive Fable window was logged.
+	fableSeen map[string]bool
+	activeAt  map[string]time.Time
+	// probed holds the times around resets each credential was queried
+	// for, until probeLate after them.
+	probed      map[string][]time.Time
+	lastSample  map[string]sampleMark
+	pendingSamp map[string]store.Record
+	lock        *store.Lock
+	// modelsSource is the CPA address and models key the model list is read
+	// from outside an ignition; modelsTried and modelsOK tell whether it was
+	// read and whether that worked.
+	modelsSource string
+	modelsTried  bool
+	modelsOK     bool
+	// refused holds when the provider refused a model for a quota group,
+	// keyed by group key and model.
+	refused map[string]time.Time
+	// resetState guards the reset-credit flows, one per credential; see
+	// reset.go. resetSleep and resetIgnite are test overrides for the
+	// grace sleep and the post-reset ignition; nil means time.Sleep and
+	// the management ignite command.
+	resetState  map[string]resetGuard
+	resetMu     sync.Mutex
+	resetSleep  func(time.Duration)
+	resetIgnite func(authIndex string)
+
+	usageCh chan usageEvent
+	cmdCh   chan command
+	wakeCh  chan struct{}
+	stopCh  chan struct{}
+	doneCh  chan struct{}
+	stopped bool
+	started bool
+}
+
+// New creates an engine. Start runs it.
+func New(opts Options) *Engine {
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+	cfg := config.Default()
+	e := &Engine{
+		host:            opts.Host,
+		version:         opts.Version,
+		defaultDataDir:  opts.DataDir,
+		hostConfigPath:  opts.HostConfigPath,
+		now:             now,
+		telegramBaseURL: opts.TelegramBaseURL,
+		cfg:             cfg,
+		enabled:         true,
+		creds:           map[string]*Cred{},
+		groups:          map[string]*GroupView{},
+		plans:           map[string]string{},
+		pollErrs:        map[string]string{},
+		passiveAt:       map[string]time.Time{},
+		activeAt:        map[string]time.Time{},
+		probed:          map[string][]time.Time{},
+		lastSample:      map[string]sampleMark{},
+		pendingSamp:     map[string]store.Record{},
+		lister:          &models.Lister{},
+		resetState:      map[string]resetGuard{},
+		usageCh:         make(chan usageEvent, 512),
+		cmdCh:           make(chan command),
+		wakeCh:          make(chan struct{}, 1),
+		stopCh:          make(chan struct{}),
+		doneCh:          make(chan struct{}),
+	}
+	e.egress = &egress.Egress{Host: opts.Host, Timeout: cfg.RequestTimeout()}
+	return e
+}
+
+// Configure 接收有效配置并返回实例内接收序号，后台循环负责运行时应用。
+// 解析失败时保留上一份配置、记录状态错误并返回 0。
+func (e *Engine) Configure(cfg config.Config, parseErr error) uint64 {
+	e.mu.Lock()
+	if parseErr != nil {
+		e.cfgErr = parseErr.Error()
+		e.mu.Unlock()
+		return 0
+	}
+	e.cfgRevision++
+	revision := e.cfgRevision
+	e.cfg = cfg
+	e.cfgErr = ""
+	e.mu.Unlock()
+	e.wake()
+	return revision
+}
+
+// MCPConfigured 确认该配置已完成监听器配置，包括停用和绑定失败。
+func (e *Engine) MCPConfigured(revision uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mcpRevision = max(e.mcpRevision, revision)
+	e.confirmConfigLocked()
+}
+
+func (e *Engine) confirmRuntimeConfig(revision uint64, token string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if revision < e.runtimeRevision {
+		return
+	}
+	e.runtimeRevision = revision
+	e.runtimeToken = token
+	e.confirmConfigLocked()
+}
+
+func (e *Engine) confirmConfigLocked() {
+	// MCP 配置按接收序号串行执行；较新的 MCP 确认也证明较早版本已执行。
+	// 后台循环可跳过未应用的中间配置，只发布它实际确认过的版本。
+	if e.runtimeRevision > e.appliedRevision && e.mcpRevision >= e.runtimeRevision {
+		e.appliedRevision = e.runtimeRevision
+		e.configAppliedToken = e.runtimeToken
+	}
+}
+
+func (e *Engine) configSnapshot() (config.Config, uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cfg, e.cfgRevision
+}
+
+func (e *Engine) config() config.Config {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cfg
+}
+
+func (e *Engine) wake() {
+	select {
+	case e.wakeCh <- struct{}{}:
+	default:
+	}
+}
+
+// Start launches the background loop once.
+func (e *Engine) Start() {
+	e.mu.Lock()
+	if e.started || e.stopped {
+		e.mu.Unlock()
+		return
+	}
+	e.started = true
+	e.mu.Unlock()
+	go e.supervise()
+}
+
+// Stop ends the loop and waits up to timeout for it to finish. A stopped
+// engine never starts again; CPA loads a new instance instead.
+func (e *Engine) Stop(timeout time.Duration) {
+	e.mu.Lock()
+	if e.stopped {
+		e.mu.Unlock()
+		return
+	}
+	e.stopped = true
+	started := e.started
+	close(e.stopCh)
+	e.mu.Unlock()
+	if !started {
+		return
+	}
+	select {
+	case <-e.doneCh:
+	case <-time.After(timeout):
+	}
+}
+
+func (e *Engine) stopping() bool {
+	select {
+	case <-e.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// sleep waits for d or until the engine stops. It returns false when stopping.
+func (e *Engine) sleep(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-e.stopCh:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// supervise restarts the loop after a panic. A panic inside the plugin would
+// otherwise terminate the whole CPA process.
+func (e *Engine) supervise() {
+	defer close(e.doneCh)
+	defer e.releaseLock()
+	for !e.stopping() {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					e.logf("error", "后台循环异常，将在 30 秒后重启：%v\n%s", r, debug.Stack())
+				}
+			}()
+			e.run()
+		}()
+		if !e.sleep(restartDelay) {
+			return
+		}
+	}
+}
+
+func (e *Engine) releaseLock() {
+	if e.lock != nil {
+		e.lock.Release()
+		e.lock = nil
+	}
+	e.mu.Lock()
+	e.running = false
+	e.mu.Unlock()
+}
+
+func (e *Engine) logf(level, format string, args ...any) {
+	if e.host == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	e.host.Log(level, fmt.Sprintf(format, args...), nil)
+}
+
+func (e *Engine) resolveDataDir(cfg config.Config) string {
+	if cfg.DataDir != "" {
+		return cfg.DataDir
+	}
+	if e.defaultDataDir != "" {
+		return e.defaultDataDir
+	}
+	return filepath.Join("plugins", "data", config.PluginID)
+}
+
+// checkEnabled reads the CPA config file. When the file cannot be read, the
+// plugin assumes it is enabled.
+func (e *Engine) checkEnabled() bool {
+	enabled := true
+	if e.hostConfigPath != "" {
+		if raw, err := os.ReadFile(e.hostConfigPath); err == nil {
+			if value, err := config.PluginEnabled(raw); err == nil {
+				enabled = value
+			}
+		}
+	}
+	e.mu.Lock()
+	changed := e.enabled != enabled
+	e.enabled = enabled
+	e.mu.Unlock()
+	if changed {
+		if enabled {
+			e.logf("info", "插件已重新启用")
+		} else {
+			e.logf("info", "插件已在 CPA 配置中停用，暂停所有后台任务")
+		}
+	}
+	return enabled
+}
+
+func (e *Engine) openStores(cfg config.Config) error {
+	dir := e.resolveDataDir(cfg)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("创建数据目录 %s 失败: %w", dir, err)
+	}
+	e.stateFile = &store.StateFile{Path: filepath.Join(dir, "state.json")}
+	state, _, err := e.stateFile.Load()
+	if err != nil {
+		e.logf("warn", "%v", err)
+	}
+	e.state = state
+	e.history = &store.History{Dir: filepath.Join(dir, "history")}
+	e.mu.Lock()
+	e.dataDir = dir
+	e.lang = notify.NormalizeLang(state.Language)
+	e.credProblems = map[string]string{}
+	for authIndex, st := range state.Credentials {
+		if st != nil && st.Reason != "" {
+			e.credProblems[authIndex] = st.Reason
+		}
+	}
+	e.plans = map[string]string{}
+	for authIndex, plan := range state.Plans {
+		if plan != nil && plan.Plan != "" {
+			e.plans[authIndex] = plan.Plan
+		}
+	}
+	e.mu.Unlock()
+	if e.alerts != nil {
+		e.alerts.Lang = e.language()
+	}
+	e.loadRecentEvents()
+	return nil
+}
+
+func (e *Engine) acquireLock(dir string) bool {
+	for !e.stopping() {
+		lock, ok, err := store.TryLock(filepath.Join(dir, "instance.lock"))
+		if err != nil {
+			e.mu.Lock()
+			e.lockErr = err.Error()
+			e.mu.Unlock()
+			return false
+		}
+		if ok {
+			e.lock = lock
+			e.mu.Lock()
+			e.lockErr = ""
+			e.mu.Unlock()
+			return true
+		}
+		e.mu.Lock()
+		e.lockErr = "另一个 Phoenix 实例仍在运行，等待它退出"
+		e.mu.Unlock()
+		if !e.sleep(lockRetryPeriod) {
+			return false
+		}
+	}
+	return false
+}
+
+func (e *Engine) saveState() {
+	if !e.dirty || e.stateFile == nil {
+		return
+	}
+	if err := e.stateFile.Save(e.state); err != nil {
+		e.logf("warn", "保存状态失败：%v", err)
+		return
+	}
+	e.dirty = false
+}
+
+func (e *Engine) applyRuntimeConfig(cfg config.Config) {
+	e.egress.Timeout = cfg.RequestTimeout()
+	userAgent := "phoenix/" + e.version
+	client := &http.Client{Timeout: cfg.RequestTimeout()}
+	fanout := &notify.Fanout{
+		OnChannelError: func(msg notify.Message, err error) { e.notifyFailed("", msg, err) },
+	}
+	if cfg.BarkURL != "" {
+		fanout.Channels = append(fanout.Channels, notify.Channel{Name: "Bark", Sender: &notify.Bark{
+			URL:       cfg.BarkURL,
+			Group:     cfg.BarkGroup,
+			Icon:      cfg.BarkIcon,
+			UserAgent: userAgent,
+			Client:    client,
+		}})
+	}
+	invalid := map[string]string{}
+	var invalidErrs []error
+	telegram, err := notify.NewTelegram(cfg.Telegram)
+	if err != nil {
+		invalid["Telegram"] = "Telegram 设置无效：" + err.Error()
+		invalidErrs = append(invalidErrs, fmt.Errorf("Telegram 设置无效：%w", err))
+		e.logf("warn", "Telegram 设置无效，未启用：%v", err)
+	} else if telegram != nil {
+		telegram.UserAgent = userAgent
+		telegram.Client = client
+		telegram.BaseURL = e.telegramBaseURL
+		fanout.Channels = append(fanout.Channels, notify.Channel{Name: "Telegram", Sender: telegram})
+	}
+	webhook, err := notify.NewWebhook(cfg.Webhook)
+	if err != nil {
+		invalid["Webhook"] = "Webhook 设置无效：" + err.Error()
+		invalidErrs = append(invalidErrs, fmt.Errorf("Webhook 设置无效：%w", err))
+		e.logf("warn", "Webhook 设置无效，未启用：%v", err)
+	} else if webhook != nil {
+		webhook.UserAgent = userAgent
+		webhook.Client = client
+		webhook.Loc = cfg.Location()
+		webhook.Now = e.now
+		fanout.Channels = append(fanout.Channels, notify.Channel{Name: "Webhook", Sender: webhook})
+	}
+	if len(invalidErrs) > 0 {
+		fanout.Invalid = errors.Join(invalidErrs...)
+	}
+	e.mu.Lock()
+	e.notifyInvalid = invalid
+	e.mu.Unlock()
+	e.alerts = &notify.Alerts{
+		Cfg:     cfg,
+		Lang:    e.language(),
+		Sender:  fanout,
+		OnSent:  func(msg notify.Message) { e.notified("", msg) },
+		OnError: func(msg notify.Message, err error) { e.notifyFailed("", msg, err) },
+	}
+}
+
+// applyPendingConfig 在每轮开始确认接收版本，非运行时字段的变化也需要确认。
+func (e *Engine) applyPendingConfig(applied config.Config) (config.Config, bool) {
+	cfg, revision := e.configSnapshot()
+	if !sameRuntimeConfig(cfg, applied) {
+		e.applyRuntimeConfig(cfg)
+	}
+	e.confirmRuntimeConfig(revision, cfg.ConfigToken)
+	return cfg, cfg.PollIntervalSeconds != applied.PollIntervalSeconds
+}
+
+func alignedAfter(t time.Time, interval time.Duration) time.Time {
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	return t.Truncate(interval).Add(interval)
+}
+
+func (e *Engine) run() {
+	if !e.sleep(startupDelay) {
+		return
+	}
+	cfg, revision := e.configSnapshot()
+	if err := e.openStores(cfg); err != nil {
+		e.logf("error", "%v", err)
+		e.addEvent("error", "error", "", err.Error())
+		return
+	}
+	if !e.acquireLock(e.dataDir) {
+		return
+	}
+	e.mu.Lock()
+	e.running = true
+	e.mu.Unlock()
+	e.applyRuntimeConfig(cfg)
+	e.confirmRuntimeConfig(revision, cfg.ConfigToken)
+	e.logf("info", "Phoenix %s 已启动，数据目录 %s", e.version, e.dataDir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-e.stopCh
+		cancel()
+	}()
+
+	now := e.now()
+	nextPoll := now
+	nextFeed := now
+	nextRelease := now
+	nextEnabledCheck := now
+	nextPrune := now
+	appliedCfg := cfg
+	for !e.stopping() {
+		now = e.now()
+		var pollChanged bool
+		cfg, pollChanged = e.applyPendingConfig(appliedCfg)
+		if pollChanged {
+			nextPoll = now
+		}
+		appliedCfg = cfg
+		if !now.Before(nextEnabledCheck) {
+			e.checkEnabled()
+			nextEnabledCheck = now.Add(enabledCheckPeriod)
+		}
+		e.mu.Lock()
+		enabled := e.enabled
+		e.mu.Unlock()
+
+		if enabled {
+			e.drainUsage(ctx)
+			if cfg.CodexResetUpdates.Enabled && !now.Before(nextFeed) {
+				e.pollResetFeed(ctx, cfg)
+				nextFeed = alignedAfter(e.now(), time.Duration(cfg.CodexResetUpdates.PollSeconds)*time.Second)
+			}
+			e.maybeReadModels(ctx, cfg, !now.Before(nextPoll))
+			if !now.Before(nextPoll) {
+				e.poll(ctx, cfg, nextPoll, "", false)
+				nextPoll = alignedAfter(e.now(), cfg.PollInterval())
+			}
+			e.runProbes(ctx, cfg, e.now())
+			if cfg.Ignition.Enabled {
+				e.performDue(ctx, cfg)
+			}
+			if !now.Before(nextPrune) {
+				e.history.Prune(e.now(), time.Duration(cfg.HistoryRetentionDays)*24*time.Hour)
+				nextPrune = e.now().Add(pruneInterval)
+			}
+			// Last in the round: queries and ignitions that are due run first.
+			// The request still holds the loop for up to the request timeout
+			// when GitHub does not answer, like Did Codex Reset.
+			if releaseAutoCheck && release.Comparable(e.version) && !now.Before(nextRelease) {
+				nextRelease = e.checkRelease(ctx, cfg)
+			}
+			e.flushSamples(e.now(), false)
+			e.refreshTargets(cfg)
+			e.saveState()
+		}
+		e.mu.Lock()
+		e.nextPoll = nextPoll
+		e.mu.Unlock()
+
+		wakeAt := now.Add(maxSleep)
+		for _, candidate := range []time.Time{nextPoll, nextEnabledCheck, nextPrune} {
+			if candidate.Before(wakeAt) {
+				wakeAt = candidate
+			}
+		}
+		if enabled && cfg.CodexResetUpdates.Enabled && nextFeed.Before(wakeAt) {
+			wakeAt = nextFeed
+		}
+		if enabled && release.Comparable(e.version) && nextRelease.Before(wakeAt) {
+			wakeAt = nextRelease
+		}
+		if enabled && cfg.Ignition.Enabled {
+			if due := e.nextDue(cfg); !due.IsZero() && due.Before(wakeAt) {
+				wakeAt = due
+			}
+		}
+		if enabled {
+			// A query that came due while this round ran is run right away.
+			if due, probe := e.probes(e.now()); len(due) > 0 {
+				wakeAt = e.now()
+			} else if !probe.IsZero() && probe.Before(wakeAt) {
+				wakeAt = probe
+			}
+		}
+		if len(e.pendingSamp) > 0 {
+			if flush := e.now().Add(time.Minute); flush.Before(wakeAt) {
+				wakeAt = flush
+			}
+		}
+		wait := wakeAt.Sub(e.now())
+		if wait < 0 {
+			wait = 0
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-e.stopCh:
+			timer.Stop()
+		case <-e.wakeCh:
+			timer.Stop()
+		case ev := <-e.usageCh:
+			timer.Stop()
+			if enabled {
+				e.applyUsage(ctx, ev)
+			}
+		case cmd := <-e.cmdCh:
+			timer.Stop()
+			e.runCommand(ctx, cmd)
+		case <-timer.C:
+		}
+	}
+	e.flushSamples(e.now(), true)
+	e.saveState()
+}
+
+// checkRelease reads the latest release and returns when to read it again.
+// It does not wait for a read the page started, and skips the read when one
+// succeeded within releaseRecheckPeriod.
+func (e *Engine) checkRelease(ctx context.Context, cfg config.Config) time.Time {
+	if !e.releaseMu.TryLock() {
+		return e.now().Add(releaseRetryPeriod)
+	}
+	defer e.releaseMu.Unlock()
+	if !e.releaseAt.IsZero() && e.now().Sub(e.releaseAt) < releaseRecheckPeriod {
+		return e.now().Add(releaseCheckPeriod)
+	}
+	if e.readRelease(ctx, cfg) != nil {
+		return e.now().Add(releaseRetryPeriod)
+	}
+	return e.now().Add(releaseCheckPeriod)
+}
+
+// CheckRelease reads the latest release when the management page opens,
+// unless a read is under way or was tried within releaseRecheckPeriod, so
+// that page loads do not queue up when GitHub does not answer. Like the
+// periodic check, it reads nothing for a development build or while the
+// plugin is disabled.
+func (e *Engine) CheckRelease() error {
+	e.mu.Lock()
+	ready := e.running && e.enabled
+	e.mu.Unlock()
+	if !ready {
+		return ErrNotRunning
+	}
+	if !release.Comparable(e.version) || !e.releaseMu.TryLock() {
+		return nil
+	}
+	defer e.releaseMu.Unlock()
+	if !e.releaseTried.IsZero() && e.now().Sub(e.releaseTried) < releaseRecheckPeriod {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-e.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return e.readRelease(ctx, e.config())
+}
+
+// readRelease reads the latest release and keeps it when it is newer than
+// this version. The caller holds releaseMu. A failed read keeps the previous
+// result and is only logged at debug level: it does not affect quota
+// monitoring.
+func (e *Engine) readRelease(ctx context.Context, cfg config.Config) error {
+	e.releaseTried = e.now()
+	latest, err := release.Latest(ctx, &http.Client{Timeout: cfg.RequestTimeout()}, "phoenix/"+e.version)
+	if err != nil {
+		e.logf("debug", "检查新版本失败：%v", err)
+		return err
+	}
+	e.releaseAt = e.now()
+	if !release.Newer(e.version, latest.Version) {
+		latest = release.Release{}
+	}
+	e.mu.Lock()
+	e.latest = latest
+	e.mu.Unlock()
+	return nil
+}
+
+// sameRuntimeConfig reports whether the settings used to build the
+// notification channels and HTTP clients are unchanged.
+func sameRuntimeConfig(a, b config.Config) bool {
+	return a.BarkURL == b.BarkURL && a.BarkGroup == b.BarkGroup && a.BarkIcon == b.BarkIcon &&
+		reflect.DeepEqual(a.Telegram, b.Telegram) &&
+		reflect.DeepEqual(a.Webhook, b.Webhook) &&
+		a.RequestTimeoutSeconds == b.RequestTimeoutSeconds && a.NoticeThreshold == b.NoticeThreshold &&
+		a.LowThreshold == b.LowThreshold && a.CriticalThreshold == b.CriticalThreshold &&
+		a.RecoveryNotify == b.RecoveryNotify && a.ResetReminder == b.ResetReminder &&
+		a.Location().String() == b.Location().String() && a.PollIntervalSeconds == b.PollIntervalSeconds
+}
+
+// waitWithUsage sleeps for d while applying passive updates as they arrive.
+func (e *Engine) waitWithUsage(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	for {
+		select {
+		case <-e.stopCh:
+			return false
+		case ev := <-e.usageCh:
+			e.applyUsage(ctx, ev)
+		case <-timer.C:
+			return true
+		}
+	}
+}
+
+func (e *Engine) schedule(cfg config.Config) ignite.Schedule {
+	return ignite.Schedule{Cfg: cfg.Ignition, Loc: cfg.Location()}
+}
+
+// labelFor returns the display label of a group for cred.
+func labelFor(sourceLabel string, cred *Cred) string {
+	if cred == nil || cred.Suffix == "" {
+		return sourceLabel
+	}
+	return sourceLabel + cred.Suffix
+}

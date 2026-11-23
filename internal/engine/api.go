@@ -1,0 +1,903 @@
+package engine
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Xiuyixx/Phoenix/internal/config"
+	"github.com/Xiuyixx/Phoenix/internal/mcp"
+	"github.com/Xiuyixx/Phoenix/internal/notify"
+	"github.com/Xiuyixx/Phoenix/internal/providers"
+	"github.com/Xiuyixx/Phoenix/internal/quota"
+	"github.com/Xiuyixx/Phoenix/internal/store"
+)
+
+// commandTimeout bounds how long a management request waits for the loop.
+const commandTimeout = 3 * time.Minute
+
+// Event is one entry of the event log.
+type Event struct {
+	Time    time.Time `json:"time"`
+	Level   string    `json:"level"`
+	Kind    string    `json:"kind"`
+	Group   string    `json:"group,omitempty"`
+	Message string    `json:"message"`
+	// Label and Detail split Message into the quota group and the rest,
+	// so the page can show events in columns.
+	Label  string `json:"label,omitempty"`
+	Detail string `json:"detail,omitempty"`
+	// Params holds the values of the event, such as the model or the retry
+	// delay, so the page can write the event in its own language. Message
+	// and Detail stay in Chinese for the CPA log and older events.
+	Params map[string]string `json:"params,omitempty"`
+	// Account is the auth index of the account an account event concerns.
+	// It is internal: MCP maps it to the current account label, and Group
+	// stays the key the page matches events and notifications by.
+	Account string `json:"-"`
+}
+
+func (e *Engine) addEvent(level, kind, group, message string) {
+	e.addEventDetail(level, kind, group, "", message, message, nil)
+}
+
+// addEventDetail records an event. message is the full text for the CPA log;
+// label and detail are the quota group and a short description for the page,
+// which shows the event type separately.
+func (e *Engine) addEventDetail(level, kind, group, label, detail, message string, params map[string]string) {
+	e.addAccountEvent("", level, kind, group, label, detail, message, params)
+}
+
+// addAccountEvent records an event of the account with auth index account,
+// which may have no quota group yet.
+func (e *Engine) addAccountEvent(account, level, kind, group, label, detail, message string, params map[string]string) {
+	now := e.now()
+	e.mu.Lock()
+	e.events = append(e.events, Event{Time: now, Level: level, Kind: kind, Group: group, Message: message, Label: label, Detail: detail, Params: params, Account: account})
+	if len(e.events) > maxEvents {
+		e.events = e.events[len(e.events)-maxEvents:]
+	}
+	e.mu.Unlock()
+	if e.history != nil {
+		e.history.Append(store.Record{Kind: "e", Time: now.Unix(), Group: group, Event: kind, Level: level, Message: message, Label: label, Detail: detail, Params: params, Account: account})
+	}
+	e.logf(level, "%s", message)
+}
+
+func (e *Engine) loadRecentEvents() {
+	now := e.now()
+	records, err := e.history.Query(now.Add(-7*24*time.Hour), now)
+	if err != nil {
+		return
+	}
+	var events []Event
+	for _, record := range records {
+		if record.Kind != "e" {
+			continue
+		}
+		events = append(events, Event{
+			Time:    time.Unix(record.Time, 0).UTC(),
+			Level:   record.Level,
+			Kind:    record.Event,
+			Group:   record.Group,
+			Message: record.Message,
+			Label:   record.Label,
+			Detail:  record.Detail,
+			Params:  record.Params,
+			Account: record.Account,
+		})
+	}
+	if len(events) > maxEvents {
+		events = events[len(events)-maxEvents:]
+	}
+	e.mu.Lock()
+	e.events = append(events, e.events...)
+	e.mu.Unlock()
+}
+
+type command struct {
+	kind  string
+	arg   string
+	reply chan commandReply
+}
+
+type commandReply struct {
+	err error
+	// results is the outcome per channel of test_notify.
+	results []ChannelResult
+}
+
+// ErrNotRunning means the background loop has not started yet.
+var ErrNotRunning = errors.New("Phoenix 尚未就绪：CPA 启动后约 20 秒开始运行，或插件已在配置中停用")
+
+func (e *Engine) send(kind, arg string) error {
+	return e.dispatch(kind, arg).err
+}
+
+// dispatch hands a command to the loop and waits for its reply.
+func (e *Engine) dispatch(kind, arg string) commandReply {
+	e.mu.Lock()
+	ready := e.running && e.enabled
+	e.mu.Unlock()
+	if !ready {
+		return commandReply{err: ErrNotRunning}
+	}
+	cmd := command{kind: kind, arg: arg, reply: make(chan commandReply, 1)}
+	timer := time.NewTimer(commandTimeout)
+	defer timer.Stop()
+	select {
+	case e.cmdCh <- cmd:
+	case <-timer.C:
+		return commandReply{err: errors.New("后台任务繁忙，请稍后再试")}
+	case <-e.stopCh:
+		return commandReply{err: ErrNotRunning}
+	}
+	select {
+	case reply := <-cmd.reply:
+		return reply
+	case <-timer.C:
+		return commandReply{err: errors.New("操作超时")}
+	case <-e.stopCh:
+		return commandReply{err: ErrNotRunning}
+	}
+}
+
+// Config returns a snapshot of the current configuration.
+func (e *Engine) Config() config.Config { return e.config() }
+
+// Refresh runs an active query now, for one credential or for all when
+// authIndex is empty.
+func (e *Engine) Refresh(authIndex string) error { return e.send("refresh", authIndex) }
+
+// Ignite ignites one target now.
+func (e *Engine) Ignite(key string) error { return e.send("ignite", key) }
+
+// Reset runs a manual reset-credit reset for one credential now, or for
+// the first configured Codex credential when authIndex is empty.
+func (e *Engine) Reset(authIndex string) error { return e.send("reset", authIndex) }
+
+// ChannelResult is the outcome of a test notification on one channel.
+type ChannelResult struct {
+	Channel string `json:"channel"`
+	OK      bool   `json:"ok"`
+	Error   string `json:"error,omitempty"`
+	// Response is the start of the webhook response.
+	Response string `json:"response,omitempty"`
+	// Unchecked is true for a webhook without success_json, where only the
+	// HTTP status was checked.
+	Unchecked bool `json:"unchecked,omitempty"`
+}
+
+// TestNotify sends a test notification to each configured channel. A
+// webhook whose settings were not applied is reported as failed.
+func (e *Engine) TestNotify() ([]ChannelResult, error) {
+	reply := e.dispatch("test_notify", "")
+	return reply.results, reply.err
+}
+
+func (e *Engine) runCommand(ctx context.Context, cmd command) {
+	defer func() {
+		if r := recover(); r != nil {
+			cmd.reply <- commandReply{err: fmt.Errorf("内部错误：%v", r)}
+		}
+	}()
+	cfg := e.config()
+	var err error
+	var results []ChannelResult
+	switch cmd.kind {
+	case "refresh":
+		e.poll(ctx, cfg, e.now(), cmd.arg, true)
+		e.mu.Lock()
+		if cmd.arg != "" {
+			if text, ok := e.pollErrs[cmd.arg]; ok {
+				err = errors.New(text)
+			}
+		} else if text, ok := e.pollErrs[""]; ok {
+			err = errors.New(text)
+		}
+		e.mu.Unlock()
+	case "ignite":
+		err = errNoTarget
+		for _, t := range e.collectTargets(cfg) {
+			if t.group.Key == cmd.arg {
+				err = e.igniteTarget(ctx, cfg, t, true)
+				break
+			}
+		}
+	case "reset":
+		err = e.resetManual(cmd.arg)
+	case "test_notify":
+		results, err = e.testNotify(ctx)
+	case "language":
+		lang := notify.NormalizeLang(cmd.arg)
+		e.mu.Lock()
+		e.lang = lang
+		e.mu.Unlock()
+		e.state.Language = lang
+		e.dirty = true
+		if e.alerts != nil {
+			e.alerts.Lang = lang
+		}
+	default:
+		err = fmt.Errorf("未知操作：%s", cmd.kind)
+	}
+	e.refreshTargets(cfg)
+	e.saveState()
+	cmd.reply <- commandReply{err: err, results: results}
+}
+
+// testNotify sends the test message to all channels at once, so the test
+// takes as long as the slowest channel and stays within commandTimeout.
+func (e *Engine) testNotify(ctx context.Context) ([]ChannelResult, error) {
+	var results []ChannelResult
+	e.mu.Lock()
+	invalid := maps.Clone(e.notifyInvalid)
+	e.mu.Unlock()
+	names := make([]string, 0, len(invalid))
+	for name := range invalid {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		results = append(results, ChannelResult{Channel: name, Error: invalid[name]})
+	}
+	var channels []notify.Channel
+	if e.alerts != nil {
+		if fanout, ok := e.alerts.Sender.(*notify.Fanout); ok {
+			channels = fanout.Channels
+		}
+	}
+	if len(results) == 0 && len(channels) == 0 {
+		return nil, notify.ErrNotConfigured
+	}
+	lang := e.language()
+	msg := notify.Message{
+		Kind:  notify.KindTest,
+		Title: notify.T(lang, "test_title"),
+		Body:  notify.T(lang, "test_body"),
+		Level: notify.LevelActive,
+	}
+	tested := make([]ChannelResult, len(channels))
+	var wg sync.WaitGroup
+	for i, channel := range channels {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result := ChannelResult{Channel: channel.Name}
+			defer func() {
+				if r := recover(); r != nil {
+					result.OK, result.Error = false, fmt.Sprintf("内部错误：%v", r)
+				}
+				tested[i] = result
+			}()
+			var err error
+			if webhook, ok := channel.Sender.(*notify.Webhook); ok {
+				result.Response, err = webhook.Deliver(ctx, msg)
+				result.Unchecked = !webhook.Checked()
+			} else {
+				err = channel.Sender.Send(ctx, msg)
+			}
+			result.OK = err == nil
+			if err != nil {
+				result.Error = err.Error()
+			}
+		}()
+	}
+	wg.Wait()
+	return append(tested, results...), nil
+}
+
+// joinNotifyInvalid joins per-channel settings errors in channel order,
+// so the banner and the test result are deterministic.
+func joinNotifyInvalid(invalid map[string]string) string {
+	names := make([]string, 0, len(invalid))
+	for name := range invalid {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	reasons := make([]string, 0, len(names))
+	for _, name := range names {
+		reasons = append(reasons, invalid[name])
+	}
+	return strings.Join(reasons, "；")
+}
+
+// WindowStatus is one window on the status page.
+type WindowStatus struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Short string `json:"short"`
+	// Kind is "5h", "7d" or empty for a window of another length.
+	Kind          string    `json:"kind,omitempty"`
+	PeriodSeconds float64   `json:"period_seconds,omitempty"`
+	Remaining     float64   `json:"remaining"`
+	Reset         time.Time `json:"reset,omitempty"`
+	Source        string    `json:"source"`
+	ObservedAt    time.Time `json:"observed_at"`
+}
+
+// GroupStatus is one quota group on the status page.
+type GroupStatus struct {
+	Key         string         `json:"key"`
+	Label       string         `json:"label"`
+	SourceLabel string         `json:"source_label"`
+	Windows     []WindowStatus `json:"windows"`
+}
+
+// AccountStatus is one credential on the status page.
+type AccountStatus struct {
+	AuthIndex string `json:"auth_index"`
+	Provider  string `json:"provider"`
+	Title     string `json:"title"`
+	Email     string `json:"email,omitempty"`
+	Name      string `json:"name"`
+	// Note is the CPA credential note, whose first line names the account.
+	Note        string `json:"note,omitempty"`
+	Unavailable bool   `json:"unavailable"`
+	// CooldownUntil is when CPA ends its cooldown of the account.
+	CooldownUntil time.Time `json:"cooldown_until,omitempty"`
+	// StaleCooldown is true when the cooldown outlasts a recovered quota.
+	StaleCooldown bool   `json:"stale_cooldown,omitempty"`
+	Error         string `json:"error,omitempty"`
+	// CredentialProblem is "auth" when the provider rejects the credential
+	// and "suspended" when it disabled the account, see
+	// store.CredentialState; empty otherwise.
+	CredentialProblem string        `json:"credential_problem,omitempty"`
+	Groups            []GroupStatus `json:"groups"`
+	// Plan is the name of the account's plan, empty while it is not known,
+	// and DefaultWeight the weight of the account in the total of several
+	// accounts when account_weights does not set one.
+	Plan          string  `json:"plan,omitempty"`
+	DefaultWeight float64 `json:"default_weight"`
+}
+
+// Status is the response of the status endpoint.
+type Status struct {
+	ConfigAppliedToken string    `json:"config_applied_token"`
+	MCP                mcp.State `json:"mcp"`
+	Version            string    `json:"version"`
+	Running            bool      `json:"running"`
+	Enabled            bool      `json:"enabled"`
+	ConfigError        string    `json:"config_error,omitempty"`
+	LockError          string    `json:"lock_error,omitempty"`
+	ModelsError        string    `json:"models_error,omitempty"`
+	ListError          string    `json:"list_error,omitempty"`
+	// NotifyError is the reason notification channel settings were not applied.
+	NotifyError string `json:"notify_error,omitempty"`
+	DataDir     string `json:"data_dir"`
+	// LatestVersion and ReleaseURL describe the latest release when it is
+	// newer than Version.
+	LatestVersion string `json:"latest_version,omitempty"`
+	ReleaseURL    string `json:"release_url,omitempty"`
+	// Language is the notification language, "zh" or "en".
+	Language string `json:"language"`
+	// Timezone and UTCOffset describe the effective display time zone.
+	Timezone  string          `json:"timezone"`
+	UTCOffset int             `json:"utc_offset_seconds"`
+	Now       time.Time       `json:"now"`
+	LastPoll  time.Time       `json:"last_poll,omitempty"`
+	NextPoll  time.Time       `json:"next_poll,omitempty"`
+	Config    config.Config   `json:"config"`
+	Accounts  []AccountStatus `json:"accounts"`
+	Targets   []TargetView    `json:"targets"`
+	Events    []Event         `json:"events"`
+	// NextModels is the model automatic selection picks next, per provider.
+	NextModels map[string]string `json:"next_models,omitempty"`
+	// Providers lists the supported providers in display order, for the
+	// settings, and GroupOrder the display order of quota groups.
+	Providers  []ProviderInfo `json:"providers"`
+	GroupOrder []string       `json:"group_order"`
+}
+
+// ProviderInfo describes a provider for the settings page.
+type ProviderInfo struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	// Ignite is false for providers that cannot be ignited.
+	Ignite bool `json:"ignite"`
+	// ModelHint describes the automatic ignition model.
+	ModelHint *providers.Text `json:"model_hint,omitempty"`
+	// Groups are the quota groups offered as ignition checkboxes, explained
+	// by GroupsHint.
+	Groups     []string        `json:"groups,omitempty"`
+	GroupsHint *providers.Text `json:"groups_hint,omitempty"`
+}
+
+func providerInfos() []ProviderInfo {
+	var out []ProviderInfo
+	for _, p := range providers.All() {
+		info := ProviderInfo{ID: p.ID, Title: p.Title, Ignite: p.Ignition != nil}
+		if p.Ignition != nil {
+			hint := p.Ignition.Hint
+			info.ModelHint = &hint
+			info.Groups = p.Ignition.Groups
+			if len(p.Ignition.Groups) > 0 {
+				groupsHint := p.Ignition.GroupsHint
+				info.GroupsHint = &groupsHint
+			}
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
+// Status returns a snapshot for the management page. Secrets are removed
+// from the config: only whether they are set is reported.
+func (e *Engine) Status() Status {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cfg := e.cfg
+	cfg.MCPKeySet = cfg.MCPKey != ""
+	cfg.MCPKey = ""
+	// The config token is a write-only acknowledgment token: it is never
+	// sent down to the page (the page mints a fresh one per save).
+	cfg.ConfigToken = ""
+	cfg.AccountOrder = append([]string(nil), cfg.AccountOrder...)
+	if cfg.BarkURL != "" {
+		cfg.BarkURL = "已设置"
+	}
+	// Phoenix masking: models_api_key is always "" in the status payload
+	// and models_api_key_set reports whether one is configured.
+	cfg.ModelsAPIKeySet = cfg.ModelsAPIKey != ""
+	cfg.ModelsAPIKey = ""
+	// The Telegram bot token is a secret; only whether it is set is
+	// reported, so the page can show the notify-off hint correctly.
+	if cfg.Telegram.BotToken != "" {
+		cfg.Telegram.BotTokenSet = true
+		cfg.Telegram.BotToken = ""
+	}
+	// The webhook URL, headers and body can hold tokens and topic names.
+	cfg.Webhook.URLSet = cfg.Webhook.URL != ""
+	cfg.Webhook.BodySet = cfg.Webhook.Body != ""
+	if cfg.Webhook.URL != "" {
+		cfg.Webhook.URL = "已设置"
+	}
+	if cfg.Webhook.Body != "" {
+		cfg.Webhook.Body = "已设置"
+	}
+	if len(cfg.Webhook.Headers) > 0 {
+		headers := make(map[string]string, len(cfg.Webhook.Headers))
+		for name := range cfg.Webhook.Headers {
+			headers[name] = "已设置"
+		}
+		cfg.Webhook.Headers = headers
+	}
+	status := Status{
+		ConfigAppliedToken: e.configAppliedToken,
+		Version:            e.version,
+		Running:            e.running,
+		Enabled:            e.enabled,
+		ConfigError:        e.cfgErr,
+		LockError:          e.lockErr,
+		ModelsError:        e.modelsErr,
+		NextModels:         maps.Clone(e.nextModels),
+		ListError:          e.pollErrs[""],
+		NotifyError:        joinNotifyInvalid(e.notifyInvalid),
+		Language:           notify.NormalizeLang(e.lang),
+		DataDir:            e.dataDir,
+		Timezone:           e.cfg.Location().String(),
+		Now:                e.now().UTC(),
+		LastPoll:           e.lastPoll,
+		NextPoll:           e.nextPoll,
+		Config:             cfg,
+		Targets:            append([]TargetView{}, e.targets...),
+		Providers:          providerInfos(),
+		GroupOrder:         providers.GroupOrder(),
+	}
+	status.LatestVersion, status.ReleaseURL = e.latest.Version, e.latest.URL
+	_, status.UTCOffset = e.now().In(e.cfg.Location()).Zone()
+	creds := make([]*Cred, 0, len(e.creds))
+	for _, cred := range e.creds {
+		creds = append(creds, cred)
+	}
+	order := make(map[string]int, len(cfg.AccountOrder))
+	for i, name := range cfg.AccountOrder {
+		if _, exists := order[name]; !exists {
+			order[name] = i
+		}
+	}
+	sort.SliceStable(creds, func(i, j int) bool {
+		ri, listedI := order[creds[i].Name]
+		rj, listedJ := order[creds[j].Name]
+		if listedI != listedJ {
+			return listedI
+		}
+		if listedI && ri != rj {
+			return ri < rj
+		}
+		if creds[i].Provider != creds[j].Provider {
+			return providers.Rank(creds[i].Provider) < providers.Rank(creds[j].Provider)
+		}
+		if creds[i].Suffix != creds[j].Suffix {
+			return creds[i].Suffix < creds[j].Suffix
+		}
+		return creds[i].Name < creds[j].Name
+	})
+	for _, cred := range creds {
+		account := AccountStatus{
+			AuthIndex:   cred.AuthIndex,
+			Provider:    cred.Provider,
+			Title:       labelFor(providers.Title(cred.Provider), cred),
+			Email:       cred.Email,
+			Name:        cred.Name,
+			Note:        cred.Note,
+			Unavailable: cred.Unavailable,
+			Error:       e.pollErrs[cred.AuthIndex],
+
+			CredentialProblem: e.credProblems[cred.AuthIndex],
+		}
+		plan := providers.PlanOf(cred.Provider, e.plans[cred.AuthIndex])
+		account.Plan, account.DefaultWeight = plan.Name, plan.Weight
+		var groups []*GroupView
+		for _, group := range e.groups {
+			if group.AuthIndex == cred.AuthIndex {
+				groups = append(groups, group)
+			}
+		}
+		sort.SliceStable(groups, func(i, j int) bool {
+			if ri, rj := providers.GroupRank(groups[i].SourceLabel), providers.GroupRank(groups[j].SourceLabel); ri != rj {
+				return ri < rj
+			}
+			return groups[i].Key < groups[j].Key
+		})
+		if now := e.now(); cred.CooldownUntil.After(now) {
+			account.CooldownUntil = cred.CooldownUntil
+			account.StaleCooldown = staleCooldown(cred, groups, now)
+		}
+		for _, group := range groups {
+			gs := GroupStatus{Key: group.Key, Label: group.Label, SourceLabel: group.SourceLabel}
+			for _, w := range group.Windows {
+				gs.Windows = append(gs.Windows, WindowStatus{
+					ID:            w.ID,
+					Label:         w.Label,
+					Short:         quota.ShortLabel(w.Label),
+					Kind:          quota.Kind(w.Window),
+					PeriodSeconds: w.Period.Seconds(),
+					Remaining:     w.Remaining,
+					Reset:         w.Reset,
+					Source:        string(w.Source),
+					ObservedAt:    w.ObservedAt,
+				})
+			}
+			account.Groups = append(account.Groups, gs)
+		}
+		status.Accounts = append(status.Accounts, account)
+	}
+	for i := len(e.events) - 1; i >= 0 && len(status.Events) < 100; i-- {
+		status.Events = append(status.Events, e.events[i])
+	}
+	if status.Accounts == nil {
+		status.Accounts = []AccountStatus{}
+	}
+	if status.Events == nil {
+		status.Events = []Event{}
+	}
+	return status
+}
+
+// Series is the history of one window.
+type Series struct {
+	Group       string `json:"group"`
+	Window      string `json:"window"`
+	WindowLabel string `json:"window_label"`
+	// Kind is "5h", "7d" or empty for a window of another length.
+	Kind        string       `json:"kind,omitempty"`
+	Label       string       `json:"label"`
+	SourceLabel string       `json:"source_label"` // label without the account suffix
+	Provider    string       `json:"provider"`
+	AuthIndex   string       `json:"auth_index"`
+	Points      [][3]float64 `json:"points"` // [unix seconds, remaining, 1 for passive]
+	Resets      [][2]int64   `json:"resets"` // [sample time, scheduled reset; 0 means unknown]
+}
+
+// HistoryResponse is the response of the history endpoint.
+type HistoryResponse struct {
+	From   time.Time `json:"from"`
+	To     time.Time `json:"to"`
+	Bucket int64     `json:"bucket_seconds"`
+	Series []Series  `json:"series"`
+	Events []Event   `json:"events"`
+}
+
+// historyRanges are the fixed spans the chart offers, in hours for the
+// 5-hour window and days for the 7-day window: one unit, half of a window
+// plus one, a window plus one, half a day or month (two whole windows), a
+// day or a month, and five windows plus one. See internal/web/page.js.
+var historyRanges = map[string]time.Duration{
+	"1h":  time.Hour,
+	"3h":  3 * time.Hour,
+	"6h":  6 * time.Hour,
+	"12h": 12 * time.Hour,
+	"24h": 24 * time.Hour,
+	"26h": 26 * time.Hour,
+	"4d":  4 * 24 * time.Hour,
+	"8d":  8 * 24 * time.Hour,
+	"15d": 15 * 24 * time.Hour,
+	"36d": 36 * 24 * time.Hour,
+}
+
+// RangeSpan returns the span of a history range, 24 hours for an unknown
+// one. "1mo" reaches back to the same date of the previous month in loc, or
+// to its last day when that month is shorter, so it covers one monthly
+// billing period.
+func RangeSpan(name string, now time.Time, loc *time.Location) time.Duration {
+	if span, ok := historyRanges[name]; ok {
+		return span
+	}
+	if name == "1mo" {
+		local := now.In(loc)
+		year, month, day := local.Date()
+		if last := time.Date(year, month, 0, 0, 0, 0, 0, loc).Day(); day > last {
+			day = last
+		}
+		from := time.Date(year, month-1, day, local.Hour(), local.Minute(), local.Second(), local.Nanosecond(), loc)
+		return now.Sub(from)
+	}
+	return 24 * time.Hour
+}
+
+// HistoryRange returns the history for a named range, see RangeSpan, and
+// the windows of one kind, see History.
+func (e *Engine) HistoryRange(name, kind string) (HistoryResponse, error) {
+	return e.History(RangeSpan(name, e.now(), e.config().Location()), kind)
+}
+
+func (e *Engine) mcpHistoryRange(ctx context.Context, name, kind string, accept func(store.Record) bool) (HistoryResponse, error) {
+	return e.historyContext(ctx, RangeSpan(name, e.now(), e.config().Location()), kind, true, accept)
+}
+
+// historyBucket returns the bucket length in seconds for a span. Spans up to
+// 2 days keep every sample; longer spans use 10 minutes, then 15 minutes
+// over 4 days, 30 minutes over 8 days and one hour over 15 days, so that a
+// series of a named range has at most about 800 points. The chart is about
+// 1000 pixels wide.
+func historyBucket(span time.Duration) int64 {
+	const day = 24 * time.Hour
+	switch {
+	case span > 15*day:
+		return 3600
+	case span > 8*day:
+		return 1800
+	case span > 4*day:
+		return 900
+	case span > 2*day:
+		return 600
+	}
+	return 0
+}
+
+// historyLead is how far before a range History looks for the last sample
+// of each series. The page joins samples up to 3.5 poll intervals or bucket
+// lengths apart, more with passive skipping; a day covers these.
+const historyLead = 24 * time.Hour
+
+// History returns quota samples and events for the last span. Long spans are
+// reduced to the last sample per bucket. Each series also starts with its
+// last sample before the span, within historyLead, so that the chart line
+// reaches the left edge instead of starting at the first sample in the span.
+// With kind "5h" or "7d" only windows of that kind are returned, otherwise
+// all windows.
+func (e *Engine) History(span time.Duration, kind string) (HistoryResponse, error) {
+	return e.historyContext(context.Background(), span, kind, false, nil)
+}
+
+func (e *Engine) historyContext(ctx context.Context, span time.Duration, kind string, bounded bool, accept func(store.Record) bool) (HistoryResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return HistoryResponse{}, err
+	}
+	e.mu.Lock()
+	dataDir := e.dataDir
+	labels := map[string]GroupView{}
+	for key, group := range e.groups {
+		labels[key] = GroupView{Key: key, Provider: group.Provider, AuthIndex: group.AuthIndex, SourceLabel: group.SourceLabel, Label: group.Label, Windows: append([]WindowView(nil), group.Windows...)}
+	}
+	e.mu.Unlock()
+	now := e.now().UTC()
+	resp := HistoryResponse{From: now.Add(-span), To: now, Bucket: historyBucket(span), Series: []Series{}, Events: []Event{}}
+	if dataDir == "" {
+		return resp, nil
+	}
+	history := &store.History{Dir: dataDir + "/history"}
+	var records []store.Record
+	var window store.HistoryWindow
+	var err error
+	if bounded {
+		// MCP 保留有限桶用于预测及响应，不构造管理图表的重置事件。
+		bucket := max(resp.Bucket, max(1, int64(span.Seconds())/2000))
+		records, err = history.QuerySampled(ctx, resp.From.Add(-historyLead), now, bucket, accept)
+	} else {
+		window, err = history.QueryWindow(ctx, resp.From, now)
+		records = window.Records
+	}
+	if err != nil {
+		return resp, err
+	}
+	from := resp.From.Unix()
+	series := map[string]*Series{}
+	before := map[string][3]float64{}
+	var order []string
+	resetEvents := map[string][][2]int64{}
+	knownReset := window.KnownReset
+	previousReset := map[string]int64{}
+	visit := func(record store.Record) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		key := record.Group + "|" + record.Window
+		if !bounded && record.Kind == "s" {
+			changes := resetEvents[key]
+			if record.Reset != 0 {
+				knownReset[key] = true
+			}
+			previous, seen := previousReset[key]
+			previousReset[key] = record.Reset
+			if !seen || (record.Reset == 0) != (previous == 0) || absInt64(record.Reset-previous) > 60 {
+				change := [2]int64{record.Time, record.Reset}
+				if record.Time < resp.From.Unix() {
+					changes = [][2]int64{change}
+				} else {
+					changes = append(changes, change)
+				}
+				resetEvents[key] = changes
+			}
+		}
+		if record.Time < resp.From.Add(-historyLead).Unix() {
+			return nil
+		}
+		passive := 0.0
+		if record.Source == string(quota.SourcePassive) {
+			passive = 1
+		}
+		point := [3]float64{float64(record.Time), record.Remaining, passive}
+		if record.Time < from {
+			if record.Kind != "e" {
+				before[key] = point
+			}
+			return nil
+		}
+		if record.Kind == "e" {
+			if record.Event == "ignite" || record.Event == "ignite_manual" || record.Event == "ignite_failed" || record.Event == "ignite_paused" {
+				resp.Events = append(resp.Events, Event{
+					Time: time.Unix(record.Time, 0).UTC(), Level: record.Level, Kind: record.Event,
+					Group: record.Group, Message: record.Message, Label: record.Label, Detail: record.Detail, Params: record.Params,
+				})
+			}
+			return nil
+		}
+		s, ok := series[key]
+		if !ok {
+			// Windows no longer reported are known by their ID.
+			kind := quota.Kind(quota.Window{ID: record.Window})
+			s = &Series{Group: record.Group, Window: record.Window, WindowLabel: record.Window, Kind: kind}
+			if kind != "" {
+				s.WindowLabel = kind
+			}
+			if group, ok := labels[record.Group]; ok {
+				s.Label = group.Label
+				s.SourceLabel = group.SourceLabel
+				s.Provider = group.Provider
+				s.AuthIndex = group.AuthIndex
+				for _, w := range group.Windows {
+					if w.ID == record.Window {
+						s.WindowLabel = quota.ShortLabel(w.Label)
+						s.Kind = quota.Kind(w.Window)
+					}
+				}
+			} else {
+				s.Label = record.Group
+				s.SourceLabel = record.Group
+			}
+			if lead, ok := before[key]; ok {
+				s.Points = append(s.Points, lead)
+			}
+			series[key] = s
+			order = append(order, key)
+		}
+		// The sample before the span stays its own point.
+		if resp.Bucket > 0 && len(s.Points) > 0 {
+			last := s.Points[len(s.Points)-1]
+			if int64(last[0]) >= from && int64(last[0])/resp.Bucket == record.Time/resp.Bucket {
+				s.Points[len(s.Points)-1] = point
+				return nil
+			}
+		}
+		s.Points = append(s.Points, point)
+		return nil
+	}
+	// 范围前只用最后一个样本初始化重置状态；其时间无需是 x 首次出现的时间。
+	for _, predecessor := range window.Before {
+		if err := visit(predecessor); err != nil {
+			return resp, err
+		}
+	}
+	for _, record := range records {
+		if err := visit(record); err != nil {
+			return resp, err
+		}
+	}
+	filter := kind == quota.KindFiveHour || kind == quota.KindSevenDay
+	for _, key := range order {
+		if filter && series[key].Kind != kind {
+			continue
+		}
+		series[key].Resets = [][2]int64{}
+		if knownReset[key] {
+			series[key].Resets = append(series[key].Resets, resetEvents[key]...)
+		}
+		resp.Series = append(resp.Series, *series[key])
+	}
+	return resp, nil
+}
+
+// notifyParams returns the event params of a notification: its title, its
+// kind as notify_kind and, for a recovery, the IDs of the reset windows.
+// The page attaches the notification to the event that triggered it.
+func notifyParams(msg notify.Message) map[string]string {
+	params := map[string]string{"title": msg.Title, "notify_kind": msg.Kind}
+	if len(msg.Windows) > 0 {
+		params["windows"] = strings.Join(msg.Windows, ",")
+	}
+	return params
+}
+
+// notified records a delivered notification. The page shows its title, which
+// is already in the notification language. group is the quota group that
+// triggered it; when empty, the group of msg is used.
+func (e *Engine) notified(group string, msg notify.Message) {
+	if group == "" {
+		group = msg.Group
+	}
+	e.addEventDetail("info", "notify", group, msg.Label, msg.Title, msg.Title, notifyParams(msg))
+}
+
+// notifyFailed records a notification that a channel did not accept.
+func (e *Engine) notifyFailed(group string, msg notify.Message, err error) {
+	if group == "" {
+		group = msg.Group
+	}
+	params := notifyParams(msg)
+	params["error"] = err.Error()
+	e.addEventDetail("warn", "notify_failed", group, msg.Label, fmt.Sprintf("%s：%v", msg.Title, err),
+		fmt.Sprintf("推送失败 %s：%v", msg.Title, err), params)
+}
+
+// recordingSender records the notifications it delivers and the ones that
+// fail, for senders that report neither, such as ProcessResetRecords.
+type recordingSender struct {
+	e    *Engine
+	next notify.Sender
+}
+
+func (r recordingSender) Send(ctx context.Context, msg notify.Message) error {
+	err := r.next.Send(ctx, msg)
+	switch {
+	case errors.Is(err, notify.ErrNotConfigured):
+	case err != nil:
+		r.e.notifyFailed("", msg, err)
+	default:
+		r.e.notified("", msg)
+	}
+	return err
+}
+
+// language returns the notification language.
+func (e *Engine) language() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return notify.NormalizeLang(e.lang)
+}
+
+// SetLanguage records the Management Center language reported by the page;
+// notifications use it from then on.
+func (e *Engine) SetLanguage(lang string) error { return e.send("language", lang) }
+
+// eventTime formats a time for event params; the page shows it in the
+// plugin's time zone.
+func eventTime(t time.Time) string {
+	return t.UTC().Format(time.RFC3339)
+}

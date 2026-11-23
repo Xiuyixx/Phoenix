@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.20 - 2026-11-23
+
+- 整体换基到 Lamplighter 源码，再接 Phoenix 差异：模块与插件 id 改为 `github.com/Xiuyixx/Phoenix` / phoenix，SDK 保持 CLIProxyAPI/v8 v8.0.36；面板与功能以 Lamplighter 为准，只保留 5 处 Phoenix 差异——“立即操作”卡名、每行“立即重置”按钮、重置设置、Telegram 设置、webhook 设置。
+- 自动重置与手动重置全套（Phoenix 独有）：reset credit 查询与消耗（consume 带 `Content-Type: application/json`）、清 CPA 本地冷却、grace 后自动点火、重置提醒、立即重置按钮与 `POST /reset` 路由；模拟测试覆盖完整链路，零真实 credit。
+- Telegram 通知渠道（Phoenix 独有）：Bot Token + 接收 ID（分号分隔）、测试推送分渠道回显；Webhook 按 Lamplighter 实现保留（地址 + 方法/头/体/成功条件，占位符 `{{title}} {{body}} {{text}} {{url}} {{priority}} {{kind}} {{label}} {{time}}`），与 Telegram 同时发；两者都没配才关闭通知，失败记 lastNotifyErr 进面板横幅。
+- 通知文案换回 v0.0.18 定稿（三组表情标题、账号用邮箱、5H/7D/恢复/剩余时长格式），触发与去重逻辑用 Lamplighter 的（cycleEnded、SameResetCycle 10 秒容差、首次观测只记基线、按组去重、poll 与 /refresh 串行化）；阈值默认改为 20/10/5，恢复模式 5h `after_exhausted` / 7d `all`，重置提醒 5h `off` / 7d `has_remaining`。
+- Did Codex Reset 保留 Lamplighter 实现，经通知扇出走 Telegram；发送失败仍标记已见，不再每轮重复播报。
+- 多 provider（codex/claude/antigravity/kimi/xai）、账号管理（拖动排序、名称、权重，卡片与图表顺序跟随）、额度图表默认不勾选，全部用 Lamplighter 的实现与默认值。
+- 点火用 Lamplighter 实现 + Phoenix fallback 链：已配模型 → 列表候选 → gpt-5-codex 兜底（仅当它在 CPA 列表中时），被拒两次即停；宿主 model.execute 错误详情（code/message/HTTP 状态）原样透传到面板；轮询跳过空 auth_index，重启瞬间不再报 6 次空轮询错误。
+- 配置兼容：服务器现有 phoenix 配置段继续生效；旧键只读映射——`alerts.thresholds[]int` 与 `ignition.model`（gpt-6-luna）仅当新键未写时映射，`providers` 嵌套映射直读；status 里 `models_api_key` 恒为空（另给 `models_api_key_set`）、`config_token` 不下发。
+- 历史修复保留或等价实现：模型 key 走插件路由 `POST /check-models-key` 校验；Bot Token 保存只对 models_api_key 跑校验、空 token 视为保持不变、密码框 `autocomplete="new-password"`；无 5h 窗口的组不进目标列表，页面不再因此崩溃。
+- MCP / Release 自动检查 / Bark 保留在代码里但默认关闭、不暴露；`POST /check-update` 手动路由仍可达，面板不调用。
+
 ## 0.0.19 - 2026-11-23
 
 - 面板顶部去掉 logo：删掉页眉的 logo 图片、web.go 里的 logo 内嵌（`web/logo.jpg` 不再打进插件二进制）和对应的 `header .logo` 样式，页眉只剩 Phoenix 凤凰标题。logo 文件仍保留在仓库里，以后想加回来随时可以恢复。

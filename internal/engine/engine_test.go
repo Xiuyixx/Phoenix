@@ -1,0 +1,1510 @@
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Xiuyixx/Phoenix/internal/config"
+	"github.com/Xiuyixx/Phoenix/internal/host"
+	"github.com/Xiuyixx/Phoenix/internal/notify"
+	"github.com/Xiuyixx/Phoenix/internal/providers"
+	"github.com/Xiuyixx/Phoenix/internal/quota"
+	"github.com/Xiuyixx/Phoenix/internal/release"
+	"github.com/Xiuyixx/Phoenix/internal/store"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+type fakeHost struct {
+	mu       sync.Mutex
+	auths    []pluginapi.HostAuthFileEntry
+	files    map[string]string
+	http     func(req pluginapi.HTTPRequest) pluginapi.HTTPResponse
+	execute  func(req pluginapi.HostModelExecutionRequest) (pluginapi.HostModelExecutionResponse, error)
+	requests []pluginapi.HTTPRequest
+	executed []pluginapi.HostModelExecutionRequest
+}
+
+func (f *fakeHost) AuthList() ([]pluginapi.HostAuthFileEntry, error) { return f.auths, nil }
+
+func (f *fakeHost) AuthGet(authIndex string) (json.RawMessage, error) {
+	raw, ok := f.files[authIndex]
+	if !ok {
+		return nil, errors.New("auth not found")
+	}
+	return json.RawMessage(raw), nil
+}
+
+func (f *fakeHost) ModelExecuteStream(req pluginapi.HostModelExecutionRequest) (pluginapi.HostModelStreamResponse, error) {
+	f.mu.Lock()
+	f.executed = append(f.executed, req)
+	f.mu.Unlock()
+	resp, err := f.execute(req)
+	return pluginapi.HostModelStreamResponse{StatusCode: resp.StatusCode, Headers: resp.Headers, StreamID: "test-stream"}, err
+}
+
+func (f *fakeHost) ModelStreamRead(string) (pluginapi.HostModelStreamReadResponse, error) {
+	return pluginapi.HostModelStreamReadResponse{Payload: []byte("data: [DONE]\n\n"), Done: true}, nil
+}
+
+func (f *fakeHost) ModelStreamClose(string) error { return nil }
+
+func (f *fakeHost) HTTPDo(_ context.Context, req pluginapi.HTTPRequest, _ time.Duration) (pluginapi.HTTPResponse, error) {
+	f.mu.Lock()
+	f.requests = append(f.requests, req)
+	f.mu.Unlock()
+	return f.http(req), nil
+}
+
+func (f *fakeHost) Log(string, string, map[string]any) {}
+
+func (f *fakeHost) requestsTo(url string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, req := range f.requests {
+		if strings.HasPrefix(req.URL, url) {
+			n++
+		}
+	}
+	return n
+}
+
+type fakeSender struct{ sent []notify.Message }
+
+func (f *fakeSender) Send(_ context.Context, msg notify.Message) error {
+	f.sent = append(f.sent, msg)
+	return nil
+}
+
+var shanghai = time.FixedZone("UTC+8", 8*3600)
+
+type clock struct{ t time.Time }
+
+func (c *clock) now() time.Time      { return c.t }
+func (c *clock) add(d time.Duration) { c.t = c.t.Add(d) }
+
+func newTestEngine(t *testing.T, h *fakeHost, c *clock) (*Engine, *fakeSender) {
+	t.Helper()
+	return newTestEngineIn(t, h, c, t.TempDir())
+}
+
+// newTestEngineIn starts an engine on the data directory dir, to test a
+// restart.
+func newTestEngineIn(t *testing.T, h *fakeHost, c *clock, dir string) (*Engine, *fakeSender) {
+	t.Helper()
+	models := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"id":"gpt-6-luna"},{"id":"claude-haiku-4-5-20251001"},{"id":"claude-3-5-haiku-20241022"},{"id":"claude-sonnet-4-6"},{"id":"gemini-3.8-flash-high"}]}`))
+	}))
+	t.Cleanup(models.Close)
+	cfg := config.Default()
+	cfg.CPABaseURL = models.URL
+	cfg.ModelsAPIKey = "k"
+	cfg.DataDir = dir
+	cfg.Timezone = "Asia/Shanghai"
+	e := New(Options{Host: h, Version: "test", Now: c.now})
+	e.Configure(cfg, nil)
+	if err := e.openStores(cfg); err != nil {
+		t.Fatal(err)
+	}
+	e.applyRuntimeConfig(cfg)
+	sender := &fakeSender{}
+	e.alerts.Sender = sender
+	return e, sender
+}
+
+func standardHost(c *clock) *fakeHost {
+	return &fakeHost{
+		auths: []pluginapi.HostAuthFileEntry{
+			{ID: "codex-a.json", AuthIndex: "1", Name: "codex-a.json", Provider: "codex", Email: "alice.work@example.com"},
+			{ID: "codex-b.json", AuthIndex: "2", Name: "codex-b.json", Provider: "codex", Email: "bob.team@example.net"},
+			{ID: "codex-c.json", AuthIndex: "5", Name: "codex-c.json", Provider: "codex", Disabled: true},
+			{ID: "claude.json", AuthIndex: "3", Name: "claude.json", Provider: "claude", Email: "me@example.com"},
+			{ID: "ag.json", AuthIndex: "4", Name: "ag.json", Provider: "antigravity"},
+		},
+		files: map[string]string{
+			"1": `{"access_token":"t1","account_id":"acc1"}`,
+			"2": `{"access_token":"t2"}`,
+			"3": `{"access_token":"t3"}`,
+			"4": `{"access_token":"t4","project_id":"p4"}`,
+		},
+		http: func(req pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+			reset := c.t.Add(3 * time.Hour)
+			switch {
+			case req.URL == providers.CodexUsageURL:
+				body := `{"rate_limit":{"primary_window":{"used_percent":40,"limit_window_seconds":18000,"reset_at":` +
+					strconv.FormatInt(reset.Unix(), 10) + `},"secondary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_after_seconds":86400}}}`
+				return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(body)}
+			case req.URL == providers.ClaudeUsageURL:
+				body := `{"five_hour":{"utilization":30,"resets_at":"` + reset.UTC().Format(time.RFC3339) + `"},"seven_day":{"utilization":20,"resets_at":"` +
+					reset.Add(48*time.Hour).UTC().Format(time.RFC3339) + `"}}`
+				return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(body)}
+			case strings.Contains(req.URL, "retrieveUserQuotaSummary"):
+				return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"groups":[{"displayName":"Gemini Models","buckets":[{"window":"5h","remainingFraction":0.5,"resetTime":"` +
+					reset.UTC().Format(time.RFC3339) + `"}]}]}`)}
+			}
+			return pluginapi.HTTPResponse{StatusCode: 404}
+		},
+	}
+}
+
+func TestPollBuildsAccountsWithSuffixes(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	e, _ := newTestEngine(t, h, c)
+	e.poll(context.Background(), e.config(), c.t, "", false)
+
+	status := e.Status()
+	if len(status.Accounts) != 4 {
+		t.Fatalf("want 4 monitored accounts (disabled skipped), got %d", len(status.Accounts))
+	}
+	titles := []string{}
+	for _, account := range status.Accounts {
+		titles = append(titles, account.Title)
+	}
+	if strings.Join(titles, ",") != "GPT#am,GPT#rk,Claude,Antigravity" &&
+		strings.Join(titles, ",") != "GPT#rk,GPT#am,Claude,Antigravity" {
+		t.Fatalf("titles %v", titles)
+	}
+	for _, req := range h.requests {
+		if req.URL == providers.CodexUsageURL && req.Headers.Get("Authorization") == "Bearer t1" && req.Headers.Get("Chatgpt-Account-Id") != "acc1" {
+			t.Fatal("Codex request must carry the account ID")
+		}
+	}
+	if status.Accounts[3].Groups[0].SourceLabel != "Gemini" {
+		t.Fatalf("antigravity group %+v", status.Accounts[3].Groups)
+	}
+}
+
+func TestNotesNameAccounts(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	e, _ := newTestEngine(t, h, c)
+	h.auths = []pluginapi.HostAuthFileEntry{
+		{ID: "codex-a.json", AuthIndex: "1", Name: "codex-a.json", Provider: "codex", Email: "alice.work@example.com", Note: " 主力号 "},
+		{ID: "codex-b.json", AuthIndex: "2", Name: "codex-b.json", Provider: "codex", Email: "bob.team@example.net"},
+		{ID: "claude.json", AuthIndex: "3", Name: "claude.json", Provider: "claude", Email: "me@example.com", Note: "工作\n2026-09 购入"},
+		{ID: "ag.json", AuthIndex: "4", Name: "ag.json", Provider: "antigravity", Note: "a very long account name for testing"},
+	}
+	creds, err := e.loadCreds(e.config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var suffixes []string
+	for _, cred := range creds {
+		suffixes = append(suffixes, cred.Suffix)
+	}
+	if got := strings.Join(suffixes, ","); got != "#主力号,#am,#工作,#a very long account …" {
+		t.Fatalf("suffixes %s", got)
+	}
+
+	h.auths[1].Note = "主力号"
+	creds, _ = e.loadCreds(e.config())
+	if creds[0].Suffix != "#主力号#rk" || creds[1].Suffix != "#主力号#am" {
+		t.Fatalf("same names %q %q", creds[0].Suffix, creds[1].Suffix)
+	}
+
+	// A name equal to another account's email suffix also gets its own.
+	h.auths[0].Note = "am"
+	h.auths[1].Note = ""
+	creds, _ = e.loadCreds(e.config())
+	if creds[0].Suffix != "#am#rk" || creds[1].Suffix != "#am" {
+		t.Fatalf("name like an email suffix %q %q", creds[0].Suffix, creds[1].Suffix)
+	}
+}
+
+func TestStatusOrdersGroupsLikeThePage(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	base := h.http
+	h.http = func(req pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+		if !strings.Contains(req.URL, "retrieveUserQuotaSummary") {
+			return base(req)
+		}
+		reset := c.t.Add(3 * time.Hour).UTC().Format(time.RFC3339)
+		return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"groups":[{"displayName":"Claude and GPT Models","buckets":[{"window":"5h","remainingFraction":1,"resetTime":"` + reset + `"}]},{"displayName":"Gemini Models","buckets":[{"window":"5h","remainingFraction":0.5,"resetTime":"` + reset + `"}]}]}`)}
+	}
+	e, _ := newTestEngine(t, h, c)
+	e.poll(context.Background(), e.config(), c.t, "", false)
+
+	var labels []string
+	for _, group := range e.Status().Accounts[3].Groups {
+		labels = append(labels, group.SourceLabel)
+	}
+	if strings.Join(labels, ",") != "Gemini,Claude / GPT" {
+		t.Fatalf("antigravity groups %v", labels)
+	}
+}
+
+func TestPassiveDataSkipsActiveQueryNearTheSlot(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	e.poll(ctx, e.config(), c.t, "", false)
+	before := h.requestsTo(providers.ClaudeUsageURL)
+
+	// A Claude request 30 seconds before the next slot.
+	c.add(4*time.Minute + 30*time.Second)
+	e.applyUsage(ctx, usageEvent{provider: "claude", authIndex: "3", header: http.Header{
+		"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.35"},
+		"Anthropic-Ratelimit-Unified-5h-Reset":       {strconv.FormatInt(c.t.Add(3*time.Hour).Unix(), 10)},
+	}})
+	c.add(30 * time.Second)
+	e.poll(ctx, e.config(), c.t, "", false)
+	if got := h.requestsTo(providers.ClaudeUsageURL); got != before {
+		t.Fatalf("Claude query should be skipped, got %d requests", got-before)
+	}
+	if got := e.Status().Accounts[2].Groups[0].Windows[0]; got.Source != "passive" || got.Remaining != 65 {
+		t.Fatalf("passive window %+v", got)
+	}
+
+	// Passive data two minutes before the slot is too old.
+	c.add(3 * time.Minute)
+	e.passiveAt["3"] = c.t
+	c.add(2 * time.Minute)
+	e.poll(ctx, e.config(), c.t, "", false)
+	if got := h.requestsTo(providers.ClaudeUsageURL); got != before+1 {
+		t.Fatalf("Claude query should run, got %d", got-before)
+	}
+
+	// After 30 minutes without an active query, skipping stops.
+	e.activeAt["3"] = c.t.Add(-31 * time.Minute)
+	e.passiveAt["3"] = c.t.Add(-10 * time.Second)
+	if e.shouldSkipActive(e.config(), e.creds["3"], c.t, c.t) {
+		t.Fatal("skipping must stop after passive_skip_max_minutes")
+	}
+}
+
+func claudeIgnitionHost(c *clock, failFirst error) *fakeHost {
+	h := standardHost(c)
+	expired := c.t.Add(-time.Minute)
+	// The current Claude window expired a minute ago.
+	base := h.http
+	h.http = func(req pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+		if req.URL == providers.ClaudeUsageURL {
+			return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"five_hour":{"utilization":0,"resets_at":"` + expired.UTC().Format(time.RFC3339) + `"}}`)}
+		}
+		return base(req)
+	}
+	calls := 0
+	h.execute = func(req pluginapi.HostModelExecutionRequest) (pluginapi.HostModelExecutionResponse, error) {
+		calls++
+		if calls == 1 && failFirst != nil {
+			return pluginapi.HostModelExecutionResponse{}, failFirst
+		}
+		return pluginapi.HostModelExecutionResponse{StatusCode: 200, Headers: http.Header{
+			"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.01"},
+			"Anthropic-Ratelimit-Unified-5h-Reset":       {strconv.FormatInt(c.t.Add(5*time.Hour).Unix(), 10)},
+		}}, nil
+	}
+	return h
+}
+
+func TestIgnitionIsConfirmedFromResponseHeaders(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := claudeIgnitionHost(c, nil)
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	cfg := e.config()
+	cfg.Providers["codex"] = config.Provider{Monitor: true}
+	e.Configure(cfg, nil)
+	e.poll(ctx, cfg, c.t, "", false)
+	e.performDue(ctx, cfg)
+
+	if len(h.executed) != 1 {
+		t.Fatalf("want one ignition, got %d", len(h.executed))
+	}
+	req := h.executed[0]
+	if req.AuthID != "claude.json" || req.ForcedProvider != "claude" || req.Model != "claude-haiku-4-5-20251001" || req.EntryProtocol != "claude" {
+		t.Fatalf("ignition request %+v", req)
+	}
+	ts := e.state.Target("claude:3:claude:main")
+	if ts.LastModel != "claude-haiku-4-5-20251001" || ts.LastSuccessEpoch == 0 || ts.ConsecutiveFailures != 0 {
+		t.Fatalf("target state %+v", ts)
+	}
+	var ignited *Event
+	for i, ev := range e.Status().Events {
+		if ev.Kind == "ignite" {
+			ignited = &e.Status().Events[i]
+		}
+	}
+	if ignited == nil || ignited.Params["model"] != "claude-haiku-4-5-20251001" || ignited.Params["reset"] == "" {
+		t.Fatalf("ignite event %+v", ignited)
+	}
+	e.refreshTargets(cfg)
+	for _, target := range e.Status().Targets {
+		if target.Key == "claude:3:claude:main" && !target.NextDue.Equal(c.t.Add(5*time.Hour+3*time.Second).UTC()) {
+			t.Fatalf("next due %v", target.NextDue)
+		}
+	}
+}
+
+func TestIgnitionTriesNextModelWhenCredentialRejectsOne(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := claudeIgnitionHost(c, &host.Error{Code: "host_call_failed", Message: "auth_not_found: no auth available", Status: 503})
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	cfg := e.config()
+	cfg.Providers["codex"] = config.Provider{Monitor: true}
+	e.Configure(cfg, nil)
+	e.poll(ctx, cfg, c.t, "", false)
+	e.performDue(ctx, cfg)
+	if len(h.executed) != 2 || h.executed[1].Model != "claude-3-5-haiku-20241022" {
+		t.Fatalf("executed %+v", h.executed)
+	}
+	if ts := e.state.Target("claude:3:claude:main"); ts.LastModel != "claude-3-5-haiku-20241022" {
+		t.Fatalf("target state %+v", ts)
+	}
+}
+
+func TestIgnitionUsesNewestModelOverLastSuccessfulOne(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := claudeIgnitionHost(c, nil)
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	cfg := e.config()
+	cfg.Providers["codex"] = config.Provider{Monitor: true}
+	e.Configure(cfg, nil)
+	e.state.Target("claude:3:claude:main").LastModel = "claude-3-5-haiku-20241022"
+	e.poll(ctx, cfg, c.t, "", false)
+	e.performDue(ctx, cfg)
+	if len(h.executed) != 1 || h.executed[0].Model != "claude-haiku-4-5-20251001" {
+		t.Fatalf("executed %+v", h.executed)
+	}
+	if ts := e.state.Target("claude:3:claude:main"); ts.LastModel != "claude-haiku-4-5-20251001" {
+		t.Fatalf("target state %+v", ts)
+	}
+}
+
+func TestIgnitionFallsBackWhenProviderRefusesNewestModel(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	refused := &host.Error{Code: "model_execution_failed", Message: `{"type":"error","error":{"type":"not_found_error","message":"model: claude-haiku-4-5-20251001"}}`, Status: 404}
+	h := claudeIgnitionHost(c, refused)
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	cfg := e.config()
+	cfg.Providers["codex"] = config.Provider{Monitor: true}
+	e.Configure(cfg, nil)
+	e.poll(ctx, cfg, c.t, "", false)
+	e.performDue(ctx, cfg)
+	if len(h.executed) != 2 || h.executed[1].Model != "claude-3-5-haiku-20241022" {
+		t.Fatalf("executed %+v", h.executed)
+	}
+	if ts := e.state.Target("claude:3:claude:main"); ts.LastModel != "claude-3-5-haiku-20241022" || ts.ConsecutiveFailures != 0 {
+		t.Fatalf("target state %+v", ts)
+	}
+	var noted *Event
+	for i, ev := range e.Status().Events {
+		if ev.Kind == "model_refused" {
+			noted = &e.Status().Events[i]
+		}
+	}
+	if noted == nil || noted.Params["model"] != "claude-haiku-4-5-20251001" || noted.Params["fallback"] != "claude-3-5-haiku-20241022" || noted.Params["hours"] != "24" {
+		t.Fatalf("refusal event %+v", noted)
+	}
+
+	var target target
+	for _, candidate := range e.collectTargets(cfg) {
+		if candidate.group.Key == "claude:3:claude:main" {
+			target = candidate
+		}
+	}
+	c.add(23 * time.Hour)
+	if model, _, err := e.execute(ctx, cfg, target); err != nil || model != "claude-3-5-haiku-20241022" || len(h.executed) != 3 {
+		t.Fatalf("a refused model is skipped for a day: %s %v %+v", model, err, h.executed)
+	}
+	c.add(time.Hour)
+	if model, _, err := e.execute(ctx, cfg, target); err != nil || model != "claude-haiku-4-5-20251001" {
+		t.Fatalf("a refused model is tried again after a day: %s %v", model, err)
+	}
+}
+
+func TestIgnitionFallsBackOnlyOnceForRefusedModels(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := claudeIgnitionHost(c, nil)
+	h.execute = func(pluginapi.HostModelExecutionRequest) (pluginapi.HostModelExecutionResponse, error) {
+		return pluginapi.HostModelExecutionResponse{StatusCode: 400, Body: []byte(`{"type":"error","error":{"type":"invalid_request_error"}}`)}, nil
+	}
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	cfg := e.config()
+	cfg.Providers["codex"] = config.Provider{Monitor: true}
+	e.Configure(cfg, nil)
+	e.poll(ctx, cfg, c.t, "", false)
+	e.performDue(ctx, cfg)
+	if len(h.executed) != 2 {
+		t.Fatalf("want two attempts, got %+v", h.executed)
+	}
+	ts := e.state.Target("claude:3:claude:main")
+	if ts.CircuitOpenUntilEpoch == 0 {
+		t.Fatalf("a second refusal must pause the target: %+v", ts)
+	}
+	if !strings.Contains(ts.LastError, "此前 claude-haiku-4-5-20251001 被上游拒绝（状态码 400）") {
+		t.Fatalf("the error must name the first refused model: %s", ts.LastError)
+	}
+	for _, ev := range e.Status().Events {
+		if ev.Kind == "model_refused" {
+			t.Fatalf("a refusal without a working fallback is not remembered: %+v", ev)
+		}
+	}
+}
+
+func TestStatusShowsNextAutomaticModels(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := claudeIgnitionHost(c, nil)
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	cfg := e.config()
+	cfg.Providers["codex"] = config.Provider{Monitor: true}
+	e.Configure(cfg, nil)
+	e.poll(ctx, cfg, c.t, "", false)
+	if got := e.Status().NextModels; len(got) != 0 {
+		t.Fatalf("the model list is only read for an ignition, got %v", got)
+	}
+	e.performDue(ctx, cfg)
+	got := e.Status().NextModels
+	want := map[string]string{"codex": "gpt-6-luna", "claude": "claude-haiku-4-5-20251001", "antigravity": "gemini-3.8-flash-high"}
+	if !maps.Equal(got, want) {
+		t.Fatalf("next models %v", got)
+	}
+}
+
+func TestStatusReportsNewerRelease(t *testing.T) {
+	tag, status := "v0.5.0", http.StatusOK
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		w.Write([]byte(`{"tag_name":"` + tag + `","html_url":"https://github.com/Xiuyixx/Phoenix/releases/tag/` + tag + `"}`))
+	}))
+	t.Cleanup(server.Close)
+	old := release.LatestURL
+	release.LatestURL = server.URL
+	t.Cleanup(func() { release.LatestURL = old })
+
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	e, _ := newTestEngine(t, standardHost(c), c)
+	e.version = "0.4.0"
+	ctx := context.Background()
+	if next := e.checkRelease(ctx, e.config()); !next.Equal(c.t.Add(releaseCheckPeriod)) {
+		t.Fatalf("next check %v", next)
+	}
+	got := e.Status()
+	if got.LatestVersion != "0.5.0" || got.ReleaseURL != "https://github.com/Xiuyixx/Phoenix/releases/tag/v0.5.0" {
+		t.Fatalf("latest %q %q", got.LatestVersion, got.ReleaseURL)
+	}
+
+	// A failed read keeps the known release and is retried sooner.
+	c.add(time.Minute)
+	status = http.StatusForbidden
+	if next := e.checkRelease(ctx, e.config()); !next.Equal(c.t.Add(releaseRetryPeriod)) {
+		t.Fatalf("next check after failure %v", next)
+	}
+	if got := e.Status().LatestVersion; got != "0.5.0" {
+		t.Fatalf("latest after failure %q", got)
+	}
+
+	tag, status = "v0.4.0", http.StatusOK
+	c.add(time.Minute)
+	e.checkRelease(ctx, e.config())
+	if got := e.Status(); got.LatestVersion != "" || got.ReleaseURL != "" {
+		t.Fatalf("the current release is reported as newer: %q %q", got.LatestVersion, got.ReleaseURL)
+	}
+}
+
+func TestCheckReleaseOnOpen(t *testing.T) {
+	var reads atomic.Int32
+	var status atomic.Int32
+	status.Store(http.StatusOK)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reads.Add(1)
+		w.WriteHeader(int(status.Load()))
+		w.Write([]byte(`{"tag_name":"v0.5.0","html_url":"https://github.com/Xiuyixx/Phoenix/releases/tag/v0.5.0"}`))
+	}))
+	t.Cleanup(server.Close)
+	old := release.LatestURL
+	release.LatestURL = server.URL
+	t.Cleanup(func() { release.LatestURL = old })
+
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	e, _ := newTestEngine(t, standardHost(c), c)
+	e.version = "0.4.0"
+	e.running = false
+	if err := e.CheckRelease(); !errors.Is(err, ErrNotRunning) || reads.Load() != 0 {
+		t.Fatalf("before the loop runs: %v, %d reads", err, reads.Load())
+	}
+	e.running, e.enabled = true, false
+	if err := e.CheckRelease(); !errors.Is(err, ErrNotRunning) || reads.Load() != 0 {
+		t.Fatalf("while disabled: %v, %d reads", err, reads.Load())
+	}
+	e.enabled = true
+	if err := e.CheckRelease(); err != nil || reads.Load() != 1 || e.Status().LatestVersion != "0.5.0" {
+		t.Fatalf("first open: %v, %d reads, latest %q", err, reads.Load(), e.Status().LatestVersion)
+	}
+	// Within a minute of a read, opening the page reads nothing, and the
+	// loop's read is skipped as well.
+	c.add(59 * time.Second)
+	if err := e.CheckRelease(); err != nil || reads.Load() != 1 {
+		t.Fatalf("open within a minute: %v, %d reads", err, reads.Load())
+	}
+	if next := e.checkRelease(context.Background(), e.config()); reads.Load() != 1 || !next.Equal(c.t.Add(releaseCheckPeriod)) {
+		t.Fatalf("loop within a minute: %d reads, next %v", reads.Load(), next)
+	}
+	// A failed read keeps the release, and also holds back the next read
+	// for a minute.
+	c.add(time.Second)
+	status.Store(http.StatusForbidden)
+	if err := e.CheckRelease(); err == nil || reads.Load() != 2 || e.Status().LatestVersion != "0.5.0" {
+		t.Fatalf("failed read: %v, %d reads, latest %q", err, reads.Load(), e.Status().LatestVersion)
+	}
+	status.Store(http.StatusOK)
+	if err := e.CheckRelease(); err != nil || reads.Load() != 2 {
+		t.Fatalf("open after a failure: %v, %d reads", err, reads.Load())
+	}
+	c.add(time.Minute)
+	if err := e.CheckRelease(); err != nil || reads.Load() != 3 {
+		t.Fatalf("open a minute after a failure: %v, %d reads", err, reads.Load())
+	}
+
+	// While a read is under way, neither the page nor the loop waits for it.
+	c.add(time.Hour)
+	e.releaseMu.Lock()
+	if err := e.CheckRelease(); err != nil || reads.Load() != 3 {
+		t.Fatalf("open during a read: %v, %d reads", err, reads.Load())
+	}
+	if next := e.checkRelease(context.Background(), e.config()); reads.Load() != 3 || !next.Equal(c.t.Add(releaseRetryPeriod)) {
+		t.Fatalf("loop during a read: %d reads, next %v", reads.Load(), next)
+	}
+	e.releaseMu.Unlock()
+
+	e.version = "0.0.0-dev.1a2b3c4"
+	if err := e.CheckRelease(); err != nil || reads.Load() != 3 {
+		t.Fatalf("a development build is checked: %v, %d reads", err, reads.Load())
+	}
+}
+
+func TestModelListIsReadAfterStartAndKeyChange(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	e, _ := newTestEngine(t, h, c)
+	reads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reads++
+		if reads == 1 || r.Header.Get("Authorization") == "Bearer bad" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Write([]byte(`{"data":[{"id":"claude-haiku-5-5"},{"id":"claude-haiku-4-5-20251001"}]}`))
+	}))
+	defer server.Close()
+	ctx := context.Background()
+	cfg := e.config()
+	cfg.CPABaseURL = server.URL
+
+	e.maybeReadModels(ctx, cfg, false)
+	if reads != 1 || e.Status().ModelsError == "" {
+		t.Fatalf("reads %d, status %+v", reads, e.Status())
+	}
+	e.maybeReadModels(ctx, cfg, false)
+	if reads != 1 {
+		t.Fatalf("a failed read waits for the next poll, got %d reads", reads)
+	}
+	e.maybeReadModels(ctx, cfg, true)
+	if got := e.Status().NextModels["claude"]; reads != 2 || got != "claude-haiku-5-5" {
+		t.Fatalf("reads %d, next model %q", reads, got)
+	}
+	e.maybeReadModels(ctx, cfg, true)
+	if reads != 2 {
+		t.Fatalf("a read list is not read again until the next ignition, got %d reads", reads)
+	}
+	cfg.ModelsAPIKey = "k2"
+	e.maybeReadModels(ctx, cfg, false)
+	if reads != 3 {
+		t.Fatalf("a new models key is read at once, got %d reads", reads)
+	}
+
+	cfg.ModelsAPIKey = "bad"
+	e.maybeReadModels(ctx, cfg, false)
+	if status := e.Status(); reads != 4 || status.ModelsError == "" || len(status.NextModels) != 0 {
+		t.Fatalf("a failing key shows no models: reads %d, %+v", reads, status)
+	}
+	cfg.ModelsAPIKey = "k2"
+	e.maybeReadModels(ctx, cfg, false)
+	if status := e.Status(); status.ModelsError != "" || status.NextModels["claude"] != "claude-haiku-5-5" {
+		t.Fatalf("restoring a working key reads it again: %+v", status)
+	}
+	cfg.ModelsAPIKey = ""
+	e.maybeReadModels(ctx, cfg, true)
+	if status := e.Status(); status.ModelsError != "" || len(status.NextModels) != 0 {
+		t.Fatalf("removing the key clears the models: %+v", status)
+	}
+}
+
+func TestHardIgnitionFailurePausesAndNotifiesOnce(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := claudeIgnitionHost(c, nil)
+	h.execute = func(pluginapi.HostModelExecutionRequest) (pluginapi.HostModelExecutionResponse, error) {
+		return pluginapi.HostModelExecutionResponse{}, &host.Error{Code: "host_call_failed", Message: "conflict", Status: 409}
+	}
+	e, sender := newTestEngine(t, h, c)
+	ctx := context.Background()
+	cfg := e.config()
+	cfg.Providers["codex"] = config.Provider{Monitor: true}
+	e.Configure(cfg, nil)
+	e.poll(ctx, cfg, c.t, "", false)
+	e.performDue(ctx, cfg)
+	e.performDue(ctx, cfg)
+	if len(h.executed) != 1 {
+		t.Fatalf("a paused target must not be retried today, got %d attempts", len(h.executed))
+	}
+	paused := 0
+	for _, msg := range sender.sent {
+		if strings.Contains(msg.Title, "点火已暂停") {
+			paused++
+		}
+	}
+	if paused != 1 {
+		t.Fatalf("want one pause notification, got %+v", sender.sent)
+	}
+}
+
+func TestHistoryRecordsActiveAndPassiveSamples(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	e.poll(ctx, e.config(), c.t, "", false)
+	c.add(10 * time.Second)
+	header := func(util string) http.Header {
+		return http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": {util}, "Anthropic-Ratelimit-Unified-5h-Reset": {strconv.FormatInt(c.t.Add(3*time.Hour).Unix(), 10)}}
+	}
+	e.applyUsage(ctx, usageEvent{provider: "claude", authIndex: "3", header: header("0.40")})
+	c.add(70 * time.Second)
+	e.applyUsage(ctx, usageEvent{provider: "claude", authIndex: "3", header: header("0.45")})
+	c.add(10 * time.Second)
+	e.applyUsage(ctx, usageEvent{provider: "claude", authIndex: "3", header: header("0.50")})
+	e.flushSamples(c.t, true)
+
+	resp, err := e.History(24*time.Hour, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range resp.Series {
+		if s.Group == "claude:3:claude:main" && s.Window == quota.WindowFiveHour {
+			// Active 70%, passive 60% (within the minute of the active sample,
+			// so held), passive 55% after a minute, passive 50% flushed.
+			last := s.Points[len(s.Points)-1]
+			if last[1] != 50 || last[2] != 1 {
+				t.Fatalf("points %v", s.Points)
+			}
+			return
+		}
+	}
+	t.Fatalf("claude series missing: %+v", resp.Series)
+}
+
+func TestHistoryFiltersWindowKindAndBucketsLongSpans(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	start := c.t
+	for _, offset := range []time.Duration{0, 5 * time.Minute, 10 * time.Minute, 16 * time.Minute} {
+		c.t = start.Add(offset)
+		e.poll(ctx, e.config(), c.t, "", false)
+	}
+
+	kindsOf := func(kind string) map[string]bool {
+		resp, err := e.History(24*time.Hour, kind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kinds := map[string]bool{}
+		for _, s := range resp.Series {
+			kinds[s.Kind] = true
+		}
+		return kinds
+	}
+	// No filter or an unknown value returns every window.
+	for _, kind := range []string{"", "30d"} {
+		if kinds := kindsOf(kind); !kinds[quota.KindFiveHour] || !kinds[quota.KindSevenDay] {
+			t.Fatalf("window %q: want both kinds, got %v", kind, kinds)
+		}
+	}
+	if kinds := kindsOf(quota.KindFiveHour); len(kinds) != 1 || !kinds[quota.KindFiveHour] {
+		t.Fatalf("5h history has kinds %v", kinds)
+	}
+
+	week, err := e.History(8*24*time.Hour, quota.KindSevenDay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if week.Bucket != 900 || len(week.Series) == 0 {
+		t.Fatalf("bucket %d, series %d", week.Bucket, len(week.Series))
+	}
+	for _, s := range week.Series {
+		if s.Kind != quota.KindSevenDay {
+			t.Fatalf("series of kind %q in the 7d history", s.Kind)
+		}
+		// 10:00, 10:05 and 10:10 share a 15-minute bucket, which keeps the
+		// last of them; 10:16 starts the next one.
+		if len(s.Points) != 2 || int64(s.Points[0][0]) != start.Add(10*time.Minute).Unix() {
+			t.Fatalf("points %v", s.Points)
+		}
+	}
+}
+
+func TestHistoryStartsWithTheLastSampleBeforeTheSpan(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 7, 0, 0, shanghai)}
+	e, _ := newTestEngine(t, standardHost(c), c)
+	sample := func(group string, at time.Time, remaining float64) store.Record {
+		return store.Record{Kind: "s", Time: at.Unix(), Group: group, Window: "five-hour", Remaining: remaining, Source: "active"}
+	}
+	pointsOf := func(span time.Duration) map[string][]int64 {
+		resp, err := e.History(span, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string][]int64{}
+		for _, s := range resp.Series {
+			for _, p := range s.Points {
+				out[s.Group] = append(out[s.Group], int64(p[0]))
+			}
+		}
+		return out
+	}
+
+	from := c.t.Add(-time.Hour)
+	if err := e.history.Append(
+		sample("a", from.Add(-historyLead-time.Minute), 90),
+		sample("a", from.Add(-3*time.Hour), 80),
+		sample("a", from.Add(-2*time.Minute), 70),
+		sample("a", from.Add(3*time.Minute), 60),
+		sample("a", from.Add(30*time.Minute), 50),
+		// A series without samples in the span is not returned.
+		sample("b", from.Add(-time.Minute), 40),
+	); err != nil {
+		t.Fatal(err)
+	}
+	got := pointsOf(time.Hour)
+	want := []int64{from.Add(-2 * time.Minute).Unix(), from.Add(3 * time.Minute).Unix(), from.Add(30 * time.Minute).Unix()}
+	if !slices.Equal(got["a"], want) || len(got) != 1 {
+		t.Fatalf("1h points %v, want a: %v", got, want)
+	}
+
+	// In a bucketed span the sample before it stays its own point, although
+	// it shares a 15-minute bucket with the first sample in the span.
+	week := c.t.Add(-8 * 24 * time.Hour)
+	if err := e.history.Append(sample("c", week.Add(-2*time.Minute), 30), sample("c", week.Add(3*time.Minute), 20)); err != nil {
+		t.Fatal(err)
+	}
+	got = pointsOf(8 * 24 * time.Hour)
+	if want := []int64{week.Add(-2 * time.Minute).Unix(), week.Add(3 * time.Minute).Unix()}; !slices.Equal(got["c"], want) {
+		t.Fatalf("8d points %v, want %v", got["c"], want)
+	}
+}
+
+func TestHistoryBucketKeepsAbout800Points(t *testing.T) {
+	day := 24 * time.Hour
+	for _, tc := range []struct {
+		span   time.Duration
+		bucket int64
+	}{{26 * time.Hour, 0}, {2 * day, 0}, {4 * day, 600}, {8 * day, 900}, {15 * day, 1800}, {31 * day, 3600}, {36 * day, 3600}} {
+		if got := historyBucket(tc.span); got != tc.bucket {
+			t.Errorf("historyBucket(%v) = %d, want %d", tc.span, got, tc.bucket)
+		}
+	}
+}
+
+func TestLanguageReportedByThePageIsUsedForNotifications(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := claudeIgnitionHost(c, nil)
+	h.execute = func(pluginapi.HostModelExecutionRequest) (pluginapi.HostModelExecutionResponse, error) {
+		return pluginapi.HostModelExecutionResponse{}, &host.Error{Code: "host_call_failed", Message: "conflict", Status: 409}
+	}
+	e, sender := newTestEngine(t, h, c)
+	ctx := context.Background()
+	cmd := command{kind: "language", arg: "en-US", reply: make(chan commandReply, 1)}
+	e.runCommand(ctx, cmd)
+	if err := (<-cmd.reply).err; err != nil {
+		t.Fatal(err)
+	}
+	if e.Status().Language != "en" || e.state.Language != "en" {
+		t.Fatalf("language %q, state %q", e.Status().Language, e.state.Language)
+	}
+	cfg := e.config()
+	cfg.Providers["codex"] = config.Provider{Monitor: true}
+	e.Configure(cfg, nil)
+	e.poll(ctx, cfg, c.t, "", false)
+	e.performDue(ctx, cfg)
+	var titles []string
+	for _, msg := range sender.sent {
+		titles = append(titles, msg.Title)
+	}
+	if strings.Join(titles, ",") != "⚠️ Claude ignition paused" {
+		t.Fatalf("notifications %v", titles)
+	}
+	for _, ev := range e.Status().Events {
+		if ev.Kind == "ignite_paused" && (ev.Params["until"] == "" || ev.Params["error"] == "") {
+			t.Fatalf("paused event %+v", ev)
+		}
+	}
+}
+
+func TestQueriesAroundResetRunOncePerReset(t *testing.T) {
+	start := time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)
+	c := &clock{t: start}
+	// The host's reset times follow a separate clock, so they stay fixed.
+	h := standardHost(&clock{t: start})
+	reset := start.Add(3 * time.Hour)
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	// The queries run whatever the notification settings are.
+	cfg := e.config()
+	cfg.RecoveryNotify = config.WindowModes{FiveHour: config.RecoveryOff, SevenDay: config.RecoveryOff}
+	e.Configure(cfg, nil)
+	e.poll(ctx, cfg, c.t, "", false)
+	if due, next := e.probes(c.t); len(due) != 0 || !next.Equal(reset.Add(-probeOffset)) {
+		t.Fatalf("next pre-reset query: %v %v", due, next)
+	}
+	before := h.requestsTo(providers.ClaudeUsageURL)
+	c.t = reset.Add(-20 * time.Second)
+	// Computing the next wake-up does not use up a due query.
+	if due, _ := e.probes(c.t); len(due) == 0 {
+		t.Fatal("pre-reset queries are due 30 seconds before the reset")
+	}
+	e.runProbes(ctx, cfg, c.t)
+	e.runProbes(ctx, cfg, c.t)
+	if got := h.requestsTo(providers.ClaudeUsageURL) - before; got != 1 {
+		t.Fatalf("want one pre-reset Claude query, got %d", got)
+	}
+
+	// A reset time a few seconds off is the same reset and is not queried again.
+	e.mu.Lock()
+	for _, g := range e.groups {
+		for i := range g.Windows {
+			if g.Windows[i].Reset.Sub(reset).Abs() < time.Minute {
+				g.Windows[i].Reset = g.Windows[i].Reset.Add(5 * time.Second)
+				g.Windows[i].ObservedAt = c.t.Add(-time.Minute)
+			}
+		}
+	}
+	e.mu.Unlock()
+	e.runProbes(ctx, cfg, c.t)
+	if got := h.requestsTo(providers.ClaudeUsageURL) - before; got != 1 {
+		t.Fatalf("a jittered reset time must not repeat the query, got %d", got)
+	}
+
+	// The query after the reset comes next.
+	if due, next := e.probes(c.t); len(due) != 0 || next.Sub(reset.Add(probeOffset)).Abs() > probeTolerance {
+		t.Fatalf("next query after the reset: %v %v", due, next)
+	}
+	c.t = reset.Add(40 * time.Second)
+	e.runProbes(ctx, cfg, c.t)
+	e.runProbes(ctx, cfg, c.t)
+	if got := h.requestsTo(providers.ClaudeUsageURL) - before; got != 2 {
+		t.Fatalf("want one Claude query after the reset, got %d", got-1)
+	}
+	if due, next := e.probes(c.t); len(due) != 0 || next.Before(reset.Add(time.Hour)) {
+		t.Fatalf("both queries ran; the next one belongs to a 7-day window: %v %v", due, next)
+	}
+
+	// A reset older than probeLate is left to the next poll.
+	c.t = reset.Add(probeLate + time.Minute)
+	e.mu.Lock()
+	for _, g := range e.groups {
+		for i := range g.Windows {
+			g.Windows[i].Reset = reset
+			g.Windows[i].ObservedAt = reset.Add(-time.Hour)
+		}
+	}
+	e.mu.Unlock()
+	e.probed = map[string][]time.Time{}
+	if due, _ := e.probes(c.t); len(due) != 0 {
+		t.Fatalf("a long-passed reset is not queried: %v", due)
+	}
+}
+
+func TestPassiveRelativeResetCountsFromTheRequest(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	e.poll(ctx, e.config(), c.t, "", false)
+	requested := c.t
+	c.add(3 * time.Minute)
+	e.applyUsage(ctx, usageEvent{provider: "codex", authIndex: "1", at: requested, header: http.Header{
+		"X-Codex-Primary-Used-Percent":        {"70"},
+		"X-Codex-Primary-Reset-After-Seconds": {"600"},
+		"X-Codex-Primary-Window-Minutes":      {"300"},
+	}})
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, g := range e.groups {
+		if g.AuthIndex != "1" {
+			continue
+		}
+		if w, ok := g.fiveHour(); !ok || !w.Reset.Equal(requested.Add(10*time.Minute)) {
+			t.Fatalf("reset %v, want %v", w.Reset, requested.Add(10*time.Minute))
+		}
+		return
+	}
+	t.Fatal("no Codex group")
+}
+
+func TestOlderPassiveReadingDoesNotRepeatAlert(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	e, sender := newTestEngine(t, h, c)
+	ctx := context.Background()
+	// The active query reads 60% of the 5-hour quota.
+	e.poll(ctx, e.config(), c.t, "", false)
+	usage := func(at time.Time, used string) {
+		e.applyUsage(ctx, usageEvent{provider: "codex", authIndex: "1", at: at, header: http.Header{
+			"X-Codex-Primary-Used-Percent":        {used},
+			"X-Codex-Primary-Reset-After-Seconds": {"10800"},
+			"X-Codex-Primary-Window-Minutes":      {"300"},
+		}})
+	}
+	fiveHour := func() float64 {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		w, _ := e.groups["codex:1:codex:main"].fiveHour()
+		return w.Remaining
+	}
+	longRequest := c.t.Add(10 * time.Second)
+	c.add(time.Minute)
+	usage(c.t, "80")
+	// A long request started before the 50% reading completes with 58%.
+	c.add(10 * time.Second)
+	usage(longRequest, "78")
+	if got := fiveHour(); got != 20 {
+		t.Fatalf("an older reading replaced a newer one: %v", got)
+	}
+	c.add(10 * time.Second)
+	usage(c.t, "82")
+	notices := 0
+	for _, msg := range sender.sent {
+		if strings.HasPrefix(msg.Title, "🟡") {
+			notices++
+		}
+	}
+	if notices != 1 {
+		t.Fatalf("want one threshold alert, got %+v", sender.sent)
+	}
+	if got := fiveHour(); got != 18 {
+		t.Fatalf("a newer reading was dropped: %v", got)
+	}
+}
+
+func TestStatusListsProvidersForTheSettings(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	e, _ := newTestEngine(t, standardHost(c), c)
+	status := e.Status()
+	var ids []string
+	for _, p := range status.Providers {
+		ids = append(ids, p.ID)
+	}
+	if strings.Join(ids, ",") != strings.Join(providers.IDs(), ",") {
+		t.Fatalf("providers %v", ids)
+	}
+	ag := status.Providers[2]
+	if ag.ID != "antigravity" || !ag.Ignite || strings.Join(ag.Groups, ",") != "Gemini,Claude / GPT" || ag.GroupsHint == nil || ag.ModelHint.Zh != "最新的 Flash" {
+		t.Fatalf("antigravity %+v", ag)
+	}
+	if status.Providers[0].Groups != nil || status.Providers[0].GroupsHint != nil {
+		t.Fatalf("codex offers no groups: %+v", status.Providers[0])
+	}
+	if len(status.GroupOrder) == 0 || status.GroupOrder[0] != "Claude" {
+		t.Fatalf("group order %v", status.GroupOrder)
+	}
+}
+
+func TestPassiveDataDoesNotAddWindowsTheUsageAPIOmits(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	base := h.http
+	// A ChatGPT Pro account: the usage API reports only a weekly window.
+	h.http = func(req pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+		if req.URL == providers.CodexUsageURL && req.Headers.Get("Authorization") == "Bearer t1" {
+			return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":604800,"reset_after_seconds":601888},"secondary_window":null}}`)}
+		}
+		return base(req)
+	}
+	e, _ := newTestEngine(t, h, c)
+	ctx := context.Background()
+	headers := http.Header{
+		"X-Codex-Primary-Used-Percent":     {"0"},
+		"X-Codex-Secondary-Used-Percent":   {"3"},
+		"X-Codex-Secondary-Window-Minutes": {"10080"},
+	}
+	windowsOf := func() []string {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		var ids []string
+		for _, g := range e.groups {
+			if g.AuthIndex == "1" {
+				for _, w := range g.Windows {
+					ids = append(ids, w.ID+"="+strconv.FormatFloat(w.Remaining, 'f', 0, 64))
+				}
+			}
+		}
+		return ids
+	}
+
+	// Before any active query, response headers fill the group.
+	e.loadCreds(e.config())
+	e.applyUsage(ctx, usageEvent{provider: "codex", authIndex: "1", at: c.t, header: headers})
+	if got := strings.Join(windowsOf(), ","); got != "five-hour=100,seven-day=97" {
+		t.Fatalf("before the active query: %s", got)
+	}
+
+	// The active query replaces the group; later headers only update the
+	// weekly window it reported.
+	e.poll(ctx, e.config(), c.t, "1", true)
+	c.add(time.Minute)
+	e.applyUsage(ctx, usageEvent{provider: "codex", authIndex: "1", at: c.t, header: headers})
+	if got := strings.Join(windowsOf(), ","); got != "seven-day=97" {
+		t.Fatalf("after the active query: %s", got)
+	}
+}
+
+func grokHost(c *clock) *fakeHost {
+	h := standardHost(c)
+	h.auths = append(h.auths, pluginapi.HostAuthFileEntry{ID: "xai-a.json", AuthIndex: "6", Name: "xai-a.json", Provider: "xai", Email: "grok@example.com"})
+	h.files["6"] = `{"type":"xai","access_token":"t6","sub":"u6"}`
+	base := h.http
+	h.http = func(req pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+		if req.URL == providers.XAIBillingURL {
+			start, end := c.t.Add(-2*24*time.Hour).UTC().Format(time.RFC3339), c.t.Add(5*24*time.Hour).UTC().Format(time.RFC3339)
+			return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"` + start + `","end":"` + end + `"},"creditUsagePercent":23.0}}`)}
+		}
+		return base(req)
+	}
+	return h
+}
+
+func TestGrokIsMonitoredButNeverIgnited(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := grokHost(c)
+	e, _ := newTestEngine(t, h, c)
+	cfg := e.config()
+	grok := cfg.Providers["xai"]
+	grok.Ignite = true
+	cfg.Providers["xai"] = grok
+	e.Configure(cfg, nil)
+	e.poll(context.Background(), e.config(), c.t, "", false)
+
+	status := e.Status()
+	last := status.Accounts[len(status.Accounts)-1]
+	if last.Provider != "xai" || last.Title != "Grok" || len(last.Groups) != 1 {
+		t.Fatalf("grok account %+v", last)
+	}
+	w := last.Groups[0].Windows[0]
+	if w.Kind != "7d" || w.Remaining != 77 {
+		t.Fatalf("grok window %+v", w)
+	}
+	for _, target := range e.collectTargets(e.config()) {
+		if target.group.Provider == "xai" {
+			t.Fatal("Grok has no ignition")
+		}
+	}
+	if h.requestsTo(providers.XAIBillingURL) != 1 {
+		t.Fatal("Grok billing must be queried once")
+	}
+}
+
+func TestKimiAliasIsMonitoredButNeverIgnited(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := &fakeHost{
+		auths: []pluginapi.HostAuthFileEntry{{ID: "kimi-a.json", AuthIndex: "7", Name: "kimi-a.json", Provider: "kimi-ai", Email: "k@example.com"}},
+		files: map[string]string{"7": `{"access_token":"t7","type":"kimi-ai"}`},
+		http: func(req pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+			if req.URL != providers.KimiAIUsageURL {
+				return pluginapi.HTTPResponse{StatusCode: 404}
+			}
+			return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"limits":[{"detail":{"limit":"100","remaining":"60","resetTime":"` +
+				c.t.Add(time.Hour).UTC().Format(time.RFC3339) + `"},"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"}}]}`)}
+		},
+	}
+	e, _ := newTestEngine(t, h, c)
+	cfg := e.config()
+	// A config key written with the alias still configures Kimi.
+	cfg.Providers["kimi"] = config.Provider{Monitor: true, Ignite: true}
+	e.Configure(cfg, nil)
+	e.poll(context.Background(), e.config(), c.t, "", false)
+
+	account := e.Status().Accounts[0]
+	if account.Provider != "kimi" || account.Title != "Kimi" || len(account.Groups) != 1 {
+		t.Fatalf("account %+v", account)
+	}
+	if w := account.Groups[0].Windows[0]; w.Kind != "5h" || w.Remaining != 60 {
+		t.Fatalf("window %+v", w)
+	}
+	if targets := e.collectTargets(e.config()); len(targets) != 0 {
+		t.Fatalf("Kimi has no ignition, got %d targets", len(targets))
+	}
+}
+
+func TestPlansComeFromTheUsageResponseAndADailyProfile(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 20, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	usage := h.http
+	profileStatus := 500
+	h.http = func(req pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+		switch req.URL {
+		case providers.CodexUsageURL:
+			resp := usage(req)
+			resp.Body = append([]byte(`{"plan_type":"pro",`), resp.Body[1:]...)
+			return resp
+		case providers.ClaudeProfileURL:
+			if req.Headers.Get("anthropic-beta") != "oauth-2025-04-20" || req.Headers.Get("Authorization") != "Bearer t3" {
+				t.Errorf("profile request headers %v", req.Headers)
+			}
+			if profileStatus != 200 {
+				return pluginapi.HTTPResponse{StatusCode: profileStatus}
+			}
+			return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_20x"}}`)}
+		}
+		return usage(req)
+	}
+	e, _ := newTestEngine(t, h, c)
+	accounts := func() map[string]AccountStatus {
+		out := map[string]AccountStatus{}
+		for _, a := range e.Status().Accounts {
+			out[a.AuthIndex] = a
+		}
+		return out
+	}
+
+	e.poll(context.Background(), e.config(), c.t, "", false)
+	got := accounts()
+	if got["1"].Plan != "Pro $200" || got["1"].DefaultWeight != 10 {
+		t.Fatalf("codex plan %q weight %v", got["1"].Plan, got["1"].DefaultWeight)
+	}
+	// A failed profile request leaves the plan unknown and the quota read.
+	if got["3"].Plan != "" || got["3"].DefaultWeight != 1 || got["3"].Error != "" || len(got["3"].Groups) == 0 {
+		t.Fatalf("claude account after a failed profile %+v", got["3"])
+	}
+	if got["4"].Plan != "" || got["4"].DefaultWeight != 1 || h.requestsTo(providers.ClaudeProfileURL) != 1 {
+		t.Fatalf("the antigravity plan read fails; one Claude profile request, got %d", h.requestsTo(providers.ClaudeProfileURL))
+	}
+
+	profileStatus = 200
+	c.add(time.Hour)
+	e.poll(context.Background(), e.config(), c.t, "", false)
+	if n := h.requestsTo(providers.ClaudeProfileURL); n != 1 {
+		t.Fatalf("the profile is read at most once a day, got %d requests", n)
+	}
+	c.add(24 * time.Hour)
+	e.poll(context.Background(), e.config(), c.t, "", false)
+	got = accounts()
+	if n := h.requestsTo(providers.ClaudeProfileURL); n != 2 || got["3"].Plan != "Max 20x" || got["3"].DefaultWeight != 20 {
+		t.Fatalf("after a day: %d requests, plan %q weight %v", n, got["3"].Plan, got["3"].DefaultWeight)
+	}
+	if e.state.Plans["3"].Plan != "claude_max default_claude_max_20x" {
+		t.Fatalf("stored plan %+v", e.state.Plans["3"])
+	}
+
+	// A later failure keeps the plan read before.
+	profileStatus = 500
+	c.add(25 * time.Hour)
+	e.poll(context.Background(), e.config(), c.t, "", false)
+	if n, plan := h.requestsTo(providers.ClaudeProfileURL), accounts()["3"].Plan; n != 3 || plan != "Max 20x" {
+		t.Fatalf("after a failed read: %d requests, plan %q", n, plan)
+	}
+
+	// The plans are read back from state.json after a restart.
+	e.dirty = true
+	e.saveState()
+	restarted := New(Options{Host: h, Version: "test", Now: c.now})
+	if err := restarted.openStores(e.config()); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.plans["3"] != "claude_max default_claude_max_20x" || restarted.plans["1"] != "pro" {
+		t.Fatalf("plans after a restart %v", restarted.plans)
+	}
+}
+
+// planWorld is an Antigravity account whose Google AI Pro plan can expire.
+// The expired plan reports a fresh weekly quota and no 5-hour window.
+type planWorld struct {
+	paid          bool
+	profileStatus int
+}
+
+func planHost(c *clock, world *planWorld) *fakeHost {
+	h := standardHost(c)
+	h.auths = []pluginapi.HostAuthFileEntry{h.auths[0], h.auths[4]}
+	weeklyReset := c.t.Add(40 * time.Hour)
+	usage := h.http
+	h.http = func(req pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+		switch {
+		case req.URL == providers.AntigravityLoadCodeAssistURL:
+			if world.profileStatus != 0 {
+				return pluginapi.HTTPResponse{StatusCode: world.profileStatus}
+			}
+			if world.paid {
+				return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"currentTier":{"id":"free-tier"},"paidTier":{"id":"g1-pro-tier"}}`)}
+			}
+			return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"currentTier":{"id":"free-tier"}}`)}
+		case strings.Contains(req.URL, "retrieveUserQuotaSummary"):
+			buckets := `{"bucketId":"gemini-5h","window":"5h","remainingFraction":1,"resetTime":"` + c.t.Add(2*time.Hour).UTC().Format(time.RFC3339) + `"},` +
+				`{"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.4,"resetTime":"` + weeklyReset.UTC().Format(time.RFC3339) + `"}`
+			if !world.paid {
+				buckets = `{"bucketId":"gemini-weekly","window":"weekly","remainingFraction":1,"resetTime":"` + c.t.Add(7*24*time.Hour).UTC().Format(time.RFC3339) + `"}`
+			}
+			return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"groups":[{"displayName":"Gemini Models","buckets":[` + buckets + `]}]}`)}
+		}
+		return usage(req)
+	}
+	return h
+}
+
+// switchSender records messages and fails while fail is set.
+type switchSender struct {
+	fakeSender
+	fail bool
+}
+
+func (s *switchSender) Send(ctx context.Context, msg notify.Message) error {
+	if s.fail {
+		return errors.New("offline")
+	}
+	return s.fakeSender.Send(ctx, msg)
+}
+
+// titles returns the Antigravity titles sent since the last call.
+func (s *switchSender) titles() []string {
+	var out []string
+	for _, msg := range s.sent {
+		if strings.Contains(msg.Title, "Antigravity") || strings.Contains(msg.Title, "Gemini") {
+			out = append(out, msg.Title)
+		}
+	}
+	s.sent = nil
+	return out
+}
+
+func agPlan(e *Engine) string {
+	for _, a := range e.Status().Accounts {
+		if a.AuthIndex == "4" {
+			return a.Plan
+		}
+	}
+	return ""
+}
+
+func TestPlanChangeIsNotifiedInsteadOfQuotaAlerts(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 22, 15, 0, 0, 0, shanghai)}
+	world := &planWorld{paid: true}
+	h := planHost(c, world)
+	e, _ := newTestEngine(t, h, c)
+	sender := &switchSender{}
+	e.alerts.Sender = sender
+	poll := func() {
+		c.add(5 * time.Minute)
+		e.poll(context.Background(), e.config(), c.t, "", false)
+	}
+
+	// The first plan read only records the plan.
+	poll()
+	if got := sender.titles(); agPlan(e) != "Pro" || len(got) != 0 || h.requestsTo(providers.AntigravityLoadCodeAssistURL) != 1 {
+		t.Fatalf("plan %q, sent %v", agPlan(e), got)
+	}
+
+	// The 5-hour window disappears: the plan is read again at once, and the
+	// fresh weekly quota of the new plan is no recovery.
+	world.paid = false
+	poll()
+	if got := sender.titles(); agPlan(e) != "Free" || len(got) != 1 || got[0] != "🎫 🎫 🎫 Antigravity · 套餐 Pro → Free" {
+		t.Fatalf("after the expiry: plan %q, sent %v", agPlan(e), got)
+	}
+	var found bool
+	for _, ev := range e.Status().Events {
+		if ev.Kind == "plan_change" && ev.Params["from"] == "Pro" && ev.Params["to"] == "Free" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no plan_change event in %+v", e.Status().Events)
+	}
+	// The baselines of other accounts stay.
+	for key, group := range e.state.Groups {
+		for id, ws := range group.Windows {
+			if strings.HasPrefix(key, "codex:") && ws.Rebase {
+				t.Fatalf("%s %s marked for a new baseline", key, id)
+			}
+		}
+	}
+
+	// Unchanged windows wait a day for the next read.
+	poll()
+	if got := sender.titles(); h.requestsTo(providers.AntigravityLoadCodeAssistURL) != 2 || len(got) != 0 {
+		t.Fatalf("%d plan reads, sent %v", h.requestsTo(providers.AntigravityLoadCodeAssistURL), got)
+	}
+
+	// The renewal brings back the old weekly quota, below the notice
+	// threshold, without a drop alert. The first delivery fails and is
+	// retried with the next query.
+	world.paid = true
+	sender.fail = true
+	poll()
+	sender.fail = false
+	if got := sender.titles(); agPlan(e) != "Pro" || len(got) != 0 {
+		t.Fatalf("after the renewal: plan %q, sent %v", agPlan(e), got)
+	}
+	poll()
+	if got := sender.titles(); len(got) != 1 || got[0] != "🎫 🎫 🎫 Antigravity · 套餐 Free → Pro" {
+		t.Fatalf("retry: sent %v", got)
+	}
+
+	// Later alerts compare with the baseline of the new plan.
+	poll()
+	if got := sender.titles(); len(got) != 0 {
+		t.Fatalf("sent %v", got)
+	}
+}
+
+func TestPlanIsRecheckedAfterARestartAndAFailedRead(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 22, 15, 0, 0, 0, shanghai)}
+	world := &planWorld{paid: true}
+	h := planHost(c, world)
+	e, _ := newTestEngine(t, h, c)
+	e.poll(context.Background(), e.config(), c.t, "", false)
+	e.dirty = true
+	e.saveState()
+
+	// The plan expires while the plugin is stopped, and the first plan read
+	// after the restart fails. The quota alerts wait for the plan.
+	world.paid = false
+	world.profileStatus = 503
+	c.add(time.Hour)
+	e, _ = newTestEngineIn(t, h, c, e.config().DataDir)
+	sender := &switchSender{}
+	e.alerts.Sender = sender
+	e.poll(context.Background(), e.config(), c.t, "", false)
+	if got := sender.titles(); agPlan(e) != "Pro" || len(got) != 0 || h.requestsTo(providers.AntigravityLoadCodeAssistURL) != 2 {
+		t.Fatalf("after the restart: plan %q, sent %v", agPlan(e), got)
+	}
+
+	// The plan is read with every query until it changes.
+	world.profileStatus = 0
+	c.add(5 * time.Minute)
+	e.poll(context.Background(), e.config(), c.t, "", false)
+	if got := sender.titles(); agPlan(e) != "Free" || len(got) != 1 || got[0] != "🎫 🎫 🎫 Antigravity · 套餐 Pro → Free" {
+		t.Fatalf("plan %q, sent %v", agPlan(e), got)
+	}
+	c.add(5 * time.Minute)
+	e.poll(context.Background(), e.config(), c.t, "", false)
+	if n := h.requestsTo(providers.AntigravityLoadCodeAssistURL); n != 3 {
+		t.Fatalf("%d plan reads after the change was seen", n)
+	}
+}
+
+func TestPlanNoticeIsCancelledByAChangeBackAndDroppedAfterAnHour(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 22, 15, 0, 0, 0, shanghai)}
+	world := &planWorld{paid: true}
+	h := planHost(c, world)
+	e, _ := newTestEngine(t, h, c)
+	sender := &switchSender{}
+	e.alerts.Sender = sender
+	poll := func(d time.Duration) {
+		c.add(d)
+		e.poll(context.Background(), e.config(), c.t, "", false)
+	}
+	poll(5 * time.Minute)
+
+	// The plan expires and is renewed before the notification is delivered.
+	sender.fail = true
+	world.paid = false
+	poll(5 * time.Minute)
+	world.paid = true
+	poll(5 * time.Minute)
+	sender.fail = false
+	poll(5 * time.Minute)
+	if got := sender.titles(); agPlan(e) != "Pro" || len(got) != 0 || e.state.Plans["4"].Notice != nil {
+		t.Fatalf("after a change back: plan %q, sent %v, notice %+v", agPlan(e), got, e.state.Plans["4"].Notice)
+	}
+
+	// An undelivered notification is dropped after planNoticeAge.
+	sender.fail = true
+	world.paid = false
+	poll(5 * time.Minute)
+	sender.fail = false
+	poll(planNoticeAge + time.Minute)
+	if got := sender.titles(); agPlan(e) != "Free" || len(got) != 0 || e.state.Plans["4"].Notice != nil {
+		t.Fatalf("after an hour: plan %q, sent %v, notice %+v", agPlan(e), got, e.state.Plans["4"].Notice)
+	}
+}
+
+func TestQuotaAlertsResumeWhenThePlanCannotBeRead(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 22, 15, 0, 0, 0, shanghai)}
+	world := &planWorld{paid: true}
+	h := planHost(c, world)
+	e, _ := newTestEngine(t, h, c)
+	sender := &switchSender{}
+	e.alerts.Sender = sender
+	poll := func() {
+		c.add(5 * time.Minute)
+		e.poll(context.Background(), e.config(), c.t, "", false)
+	}
+
+	// Without a plan read before, a failed recheck does not hold the alerts.
+	world.profileStatus = 503
+	poll()
+	world.paid = false
+	poll()
+	if got := sender.titles(); agPlan(e) != "" || len(got) != 1 || got[0] != "🟢 🟢 🟢 Gemini 额度状态通知" {
+		t.Fatalf("without a plan: plan %q, sent %v", agPlan(e), got)
+	}
+}
+
+func TestPlanIsReadSoonAfterARecheckThatKeptFailing(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 22, 15, 0, 0, 0, shanghai)}
+	world := &planWorld{paid: true}
+	h := planHost(c, world)
+	e, _ := newTestEngine(t, h, c)
+	sender := &switchSender{}
+	e.alerts.Sender = sender
+	poll := func() {
+		c.add(5 * time.Minute)
+		e.poll(context.Background(), e.config(), c.t, "", false)
+	}
+	poll()
+
+	// The plan cannot be read for the whole recheck. The alerts wait for it
+	// until the recheck ends, and then compare with the old baselines.
+	world.paid = false
+	world.profileStatus = 503
+	end := c.t.Add(5*time.Minute + planRecheckPeriod)
+	for c.t.Add(5 * time.Minute).Before(end) {
+		poll()
+		if got := sender.titles(); len(got) != 0 {
+			t.Fatalf("during the recheck at %s: sent %v", c.t, got)
+		}
+	}
+	poll()
+	if got := sender.titles(); agPlan(e) != "Pro" || len(got) != 1 || got[0] != "🟢 🟢 🟢 Gemini 额度状态通知" {
+		t.Fatalf("after the recheck: plan %q, sent %v", agPlan(e), got)
+	}
+
+	// The plan is read again within planRetryPeriod of the last failure.
+	world.profileStatus = 0
+	reads := h.requestsTo(providers.AntigravityLoadCodeAssistURL)
+	for i := 0; i < 3 && agPlan(e) == "Pro"; i++ {
+		poll()
+	}
+	if got := sender.titles(); agPlan(e) != "Free" || h.requestsTo(providers.AntigravityLoadCodeAssistURL) != reads+1 || len(got) != 1 || got[0] != "🎫 🎫 🎫 Antigravity · 套餐 Pro → Free" {
+		t.Fatalf("after the retry: plan %q, sent %v", agPlan(e), got)
+	}
+}

@@ -1,0 +1,159 @@
+package notify
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// Notification languages. The management page reports the language of the
+// Management Center, and notifications use the last one reported; Chinese
+// is used until a page has reported one.
+const (
+	LangZH = "zh"
+	LangEN = "en"
+)
+
+// NormalizeLang maps a Management Center language such as "zh-CN" or "en"
+// to a notification language. Chinese variants map to Chinese and every
+// other language to English, the languages the texts exist in.
+func NormalizeLang(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || strings.HasPrefix(value, "zh") {
+		return LangZH
+	}
+	return LangEN
+}
+
+// weekdays holds the short weekday names per language, Sunday first, as
+// the page shows them.
+var weekdays = map[string][7]string{
+	LangZH: {"周日", "周一", "周二", "周三", "周四", "周五", "周六"},
+	LangEN: {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"},
+}
+
+// FormatTime formats t in loc as every notification shows a date and
+// time: month/day, weekday and time, such as "11/23 周一 03:00" or
+// "11/23 Mon 03:00", the way the page shows them. A language without
+// weekday names uses Chinese, like T.
+func FormatTime(t time.Time, loc *time.Location, lang string) string {
+	names, ok := weekdays[lang]
+	if !ok {
+		names = weekdays[LangZH]
+	}
+	local := t.In(loc)
+	return local.Format("01/02") + " " + names[local.Weekday()] + " " + local.Format("15:04")
+}
+
+// texts holds every notification text per language. A new language adds a
+// column here and a dictionary on the page.
+var texts = map[string]map[string]string{
+	LangZH: {
+		"due":                  "可刷新",
+		"window_line":          "%s：%s",
+		"window_line_reset":    "%s：%s | %s | %s",
+		"recovered":            "✅ %s · %s 已恢复",
+		"previous_cycle":       "上周期剩余：%s",
+		"reset_reminder":       "⏰ %s · %s 重置提醒",
+		"cooldown_title":       "⚠️ %s 额度已恢复，CPA 仍在冷却",
+		"cooldown_body":        "CPA 把这个账号冷却到 %s，期间的请求和点火都会被拒绝。在 CPA 管理中心清除这个账号的冷却后恢复。",
+		"circuit_title":        "⚠️ %s 点火已暂停",
+		"circuit_body":         "连续或高风险错误触发保护，停止自动重试到 %s。\n%s",
+		"plan_title":           "🎫 🎫 🎫 %s · 套餐 %s → %s",
+		"plan_body":            "这个账号的额度提醒按新套餐的额度重新开始。",
+		"credential_title":     "🔑 %s 凭证失效",
+		"credential_fix":       "重新登录或更新凭证后自动恢复。",
+		"suspended_title":      "⛔ ⛔ ⛔ %s 账号已停用",
+		"suspended_reason":     "账号已被停用，需要申诉",
+		"rate_limited_title":   "⏳ ⏳ ⏳ %s 被限流",
+		"rate_limited_until":   "自动点火暂停到 %s。",
+		"credential_ok_title":  "✅ ✅ ✅ %s 凭证已恢复",
+		"credential_ok_query":  "额度查询恢复正常。",
+		"credential_ok_ignite": "点火成功，自动点火已恢复。",
+		"line_source":          "来源：%s",
+		"line_appeal":          "申诉：%s",
+		"source_ignite":        "点火",
+		"source_query":         "额度查询",
+		"test_title":           "🧪 🧪 🧪 Phoenix 测试推送",
+		"test_body":            "Telegram 通知配置测试成功。",
+		"reset_global":         "全局重置",
+		"reset_banked":         "重置卡",
+		"reset_both":           "全局重置 + 重置卡",
+		"reset_other":          "Codex 重置",
+		"plans_all":            "全部套餐",
+		"reset_scheduled":      "📅 📅 📅 Codex %s已排期",
+		"reset_rescheduled":    "📅 📅 📅 Codex %s排期更新",
+		"reset_done":           "✅ ✅ ✅ Codex %s已完成",
+		"reset_credited":       "✅ ✅ ✅ Codex %s已到账",
+		"line_expected":        "预计：%s",
+		"schedule_range":       "%s～%s",
+		"schedule_before":      "%s 前",
+		"line_time":            "时间：%s",
+		"line_confidence":      "置信度：%s",
+		"line_scope":           "范围：%s",
+		"reset_signal":         "Did Codex Reset 发布了新的重置信号",
+		"reset_history_link":   "https://didcodexreset.com/zh/history/%d.html",
+	},
+	LangEN: {
+		"due":                  "due",
+		"window_line":          "%s: %s",
+		"window_line_reset":    "%s: %s | %s | %s",
+		"recovered":            "✅ %s · %s recovered",
+		"previous_cycle":       "Left last cycle: %s",
+		"reset_reminder":       "⏰ %s · %s resets soon",
+		"cooldown_title":       "⚠️ %s quota is back, CPA still cooling down",
+		"cooldown_body":        "CPA cools this account down until %s and rejects requests and ignition until then. Clear the cooldown of this account in the CPA Management Center.",
+		"circuit_title":        "⚠️ %s ignition paused",
+		"circuit_body":         "Repeated or high-risk errors tripped the protection; automatic retries stop until %s.\n%s",
+		"plan_title":           "🎫 %s · plan %s → %s",
+		"plan_body":            "Quota alerts of this account start over with the quota of the new plan.",
+		"credential_title":     "🔑 %s credential invalid",
+		"credential_fix":       "Monitoring and ignition resume after you log in again or update the credential.",
+		"suspended_title":      "⛔ %s account suspended",
+		"suspended_reason":     "the account was suspended; an appeal is required",
+		"rate_limited_title":   "⏳ %s rate limited",
+		"rate_limited_until":   "Automatic ignition paused until %s.",
+		"credential_ok_title":  "✅ %s credential works again",
+		"credential_ok_query":  "Quota queries work again.",
+		"credential_ok_ignite": "Ignition succeeded; automatic ignition resumed.",
+		"line_source":          "Source: %s",
+		"line_appeal":          "Appeal: %s",
+		"source_ignite":        "ignition",
+		"source_query":         "quota query",
+		"test_title":           "🕯️ Phoenix test notification",
+		"test_body":            "Bark notifications are set up correctly.",
+		"reset_global":         "global reset",
+		"reset_banked":         "reset card",
+		"reset_both":           "global reset + reset card",
+		"reset_other":          "reset",
+		"plans_all":            "all plans",
+		"reset_scheduled":      "📅 Codex %s scheduled",
+		"reset_rescheduled":    "📅 Codex %s schedule updated",
+		"reset_done":           "✅ Codex %s done",
+		"reset_credited":       "✅ Codex %s credited",
+		"line_expected":        "Expected: %s",
+		"schedule_range":       "%s–%s",
+		"schedule_before":      "by %s",
+		"line_time":            "Time: %s",
+		"line_confidence":      "Confidence: %s",
+		"line_scope":           "Plans: %s",
+		"reset_signal":         "Did Codex Reset published a new reset signal",
+		"reset_history_link":   "https://didcodexreset.com/history/%d.html",
+	},
+}
+
+// T returns the text for key in lang, formatted with args.
+func T(lang, key string, args ...any) string {
+	table, ok := texts[lang]
+	if !ok {
+		table = texts[LangZH]
+	}
+	format, ok := table[key]
+	if !ok {
+		format = texts[LangZH][key]
+	}
+	if len(args) == 0 {
+		return format
+	}
+	return fmt.Sprintf(format, args...)
+}
