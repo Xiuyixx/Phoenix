@@ -1,4 +1,4 @@
-// Tests for the Phoenix notification style (v0.0.18): triple-emoji
+// Tests for the Phoenix notification style (v0.0.18): single-emoji
 // quota-status templates with one line per field, email instead of the raw
 // auth index. TestQuotaStatusMessage pins the exact messages the user
 // specified; TestNotificationExamples renders one example of every
@@ -43,7 +43,7 @@ func TestQuotaStatusMessage(t *testing.T) {
 			seven:    78,
 			severity: "normal",
 			trigger:  "5h",
-			title:    "🟢 🟢 🟢 GPT 额度状态通知",
+			title:    "🟢 GPT 额度状态通知",
 			body: "账号：user@example.com\n" +
 				"模型：Codex / GPT\n" +
 				"5H：85% ｜ 23:22 恢复（剩余 03h33m）\n" +
@@ -57,7 +57,7 @@ func TestQuotaStatusMessage(t *testing.T) {
 			seven:    68,
 			severity: "low",
 			trigger:  "5h",
-			title:    "🟡 🟡 🟡 GPT 额度不足预警",
+			title:    "🟡 GPT 额度不足预警",
 			body: "账号：user@example.com\n" +
 				"模型：Codex / GPT\n" +
 				"5H：15% ｜ 23:22 恢复（剩余 03h33m）\n" +
@@ -71,7 +71,7 @@ func TestQuotaStatusMessage(t *testing.T) {
 			seven:    65,
 			severity: "exhausted",
 			trigger:  "5h",
-			title:    "🔴 🔴 🔴 GPT 额度耗尽警报",
+			title:    "🔴 GPT 额度耗尽警报",
 			body: "账号：user@example.com\n" +
 				"模型：Codex / GPT\n" +
 				"5H：0% ｜ 23:22 恢复（剩余 03h33m）\n" +
@@ -85,7 +85,7 @@ func TestQuotaStatusMessage(t *testing.T) {
 			seven:    0,
 			severity: "exhausted",
 			trigger:  "7d",
-			title:    "🔴 🔴 🔴 GPT 额度耗尽警报",
+			title:    "🔴 GPT 额度耗尽警报",
 			body: "账号：user@example.com\n" +
 				"模型：Codex / GPT\n" +
 				"5H：60% ｜ 23:22 恢复（剩余 03h33m）\n" +
@@ -134,7 +134,7 @@ func TestNotifyBodyVariants(t *testing.T) {
 	// Reset reminder: same layout, countdown as the status.
 	g := exampleGroup(74, 80, now)
 	title, body := quotaReminderMessage(g, "5h", 57*time.Minute, now)
-	if title != "⏰ ⏰ ⏰ GPT 重置提醒" {
+	if title != "⏰ GPT 重置提醒" {
 		t.Errorf("reminder title = %q", title)
 	}
 	if !strings.Contains(body, "状态：Reminder（5H 窗口将于 57m 后重置）") {
@@ -163,7 +163,7 @@ func TestNotifyBodyVariants(t *testing.T) {
 		},
 	}
 	title, body = quotaStatusMessage(anti, "7d", "normal", now)
-	if title != "🟢 🟢 🟢 Gemini 额度状态通知" {
+	if title != "🟢 Gemini 额度状态通知" {
 		t.Errorf("antigravity title = %q", title)
 	}
 	if !strings.Contains(body, "模型：Antigravity / Gemini\n") {
@@ -206,7 +206,7 @@ func TestNotificationExamples(t *testing.T) {
 	show("重置提醒", title, body)
 
 	cooldown := CooldownMessage(LangZH, g, time.Date(2026, 11, 23, 20, 10, 0, 0, time.Local), time.Local, now)
-	if cooldown.Title != "⚠️ ⚠️ ⚠️ GPT 冷却过期提醒" {
+	if cooldown.Title != "⚠️ GPT 冷却过期提醒" {
 		t.Errorf("cooldown title = %q", cooldown.Title)
 	}
 	if !strings.Contains(cooldown.Body, "额度已恢复，但 CPA 仍冷却到 2026-11-23 20:10，请手动解除冷却") {
@@ -215,7 +215,7 @@ func TestNotificationExamples(t *testing.T) {
 	show("冷却过期提醒", cooldown.Title, cooldown.Body)
 
 	credential := CredentialMessage(LangZH, g, Problem{Kind: KindCredential, Status: "401"}, time.Local, now)
-	if credential.Title != "🔴 🔴 🔴 GPT 账号异常" {
+	if credential.Title != "🔴 GPT 账号异常" {
 		t.Errorf("credential title = %q", credential.Title)
 	}
 	if !strings.Contains(credential.Body, "认证失败（HTTP 401），请检查凭证。") {
@@ -224,7 +224,7 @@ func TestNotificationExamples(t *testing.T) {
 	show("账号异常", credential.Title, credential.Body)
 
 	suspended := CredentialMessage(LangZH, g, Problem{Kind: KindSuspended}, time.Local, now)
-	if suspended.Title != "🔴 🔴 🔴 GPT 账号已停用" {
+	if suspended.Title != "🔴 GPT 账号已停用" {
 		t.Errorf("suspended title = %q", suspended.Title)
 	}
 	if !strings.Contains(suspended.Body, "账号已被停用，请检查凭证。") {
@@ -234,11 +234,11 @@ func TestNotificationExamples(t *testing.T) {
 
 	// Ignition failures have no dedicated constructor: they reuse the
 	// Phoenix body with the failure as the status line.
-	show("点火失败", "❌ ❌ ❌ GPT 点火失败",
+	show("点火失败", "❌ GPT 点火失败",
 		phoenixBody(g, "点火失败：model_execution_failed: invalid model (HTTP 400)", false, now))
 
 	circuit := CircuitMessage(LangZH, g, time.Date(2026, 11, 24, 8, 0, 0, 0, time.Local), "model_execution_failed: invalid model (HTTP 400)", time.Local, now)
-	if circuit.Title != "⏸️ ⏸️ ⏸️ GPT 点火已暂停" {
+	if circuit.Title != "⏸️ GPT 点火已暂停" {
 		t.Errorf("circuit title = %q", circuit.Title)
 	}
 	if !strings.Contains(circuit.Body, "点火失败已触发熔断，将暂停到 2026-11-24 08:00：model_execution_failed: invalid model (HTTP 400)") {
@@ -246,10 +246,10 @@ func TestNotificationExamples(t *testing.T) {
 	}
 	show("点火已暂停（熔断）", circuit.Title, circuit.Body)
 
-	show("已完成重置", "✅ ✅ ✅ GPT 已完成重置",
+	show("已完成重置", "✅ GPT 已完成重置",
 		phoenixBody(g, "已消耗 reset credit，并清除 CPA 本地冷却。", false, now))
 
-	show("重置未完全成功", "⚠️ ⚠️ ⚠️ GPT 重置未完全成功",
+	show("重置未完全成功", "⚠️ GPT 重置未完全成功",
 		phoenixBody(g, "已消耗 reset credit，但清除 CPA 本地冷却失败，请检查 CPA 日志。", false, now))
 
 	show("测试推送", T(LangZH, "test_title"), T(LangZH, "test_body"))
@@ -265,7 +265,7 @@ func TestNotificationExamples(t *testing.T) {
 		"announcedAt": now.Add(-time.Hour).Format(time.RFC3339),
 	}
 	msg := ResetMessage(rec, time.Local, LangZH)
-	if msg.Title != "✅ ✅ ✅ Codex 全局重置已完成" {
+	if msg.Title != "✅ Codex 全局重置已完成" {
 		t.Errorf("Did Codex Reset title = %q", msg.Title)
 	}
 	if !strings.Contains(msg.Body, "置信度：90%") || !strings.Contains(msg.Body, "范围：全部套餐") {
