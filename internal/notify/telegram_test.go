@@ -225,3 +225,166 @@ func TestFanoutReportsPartialChannelFailure(t *testing.T) {
 		t.Fatalf("channel errors %+v", failed)
 	}
 }
+
+// telegramRawRequests records raw sendMessage request bodies, so the
+// entities field can be inspected as JSON.
+type telegramRawRequests struct {
+	mu     sync.Mutex
+	bodies [][]byte
+}
+
+type telegramRequest struct {
+	ChatID   string `json:"chat_id"`
+	Text     string `json:"text"`
+	Entities []struct {
+		Type   string `json:"type"`
+		Offset int    `json:"offset"`
+		Length int    `json:"length"`
+	} `json:"entities"`
+}
+
+func newTelegramRawServer(t *testing.T) (*httptest.Server, *telegramRawRequests) {
+	t.Helper()
+	got := &telegramRawRequests{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		got.mu.Lock()
+		got.bodies = append(got.bodies, raw)
+		got.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(server.Close)
+	return server, got
+}
+
+func (g *telegramRawRequests) first(t *testing.T) telegramRequest {
+	t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.bodies) != 1 {
+		t.Fatalf("want 1 request, got %d", len(g.bodies))
+	}
+	var req telegramRequest
+	if err := json.Unmarshal(g.bodies[0], &req); err != nil {
+		t.Fatalf("request is not JSON: %v", err)
+	}
+	return req
+}
+
+func (g *telegramRawRequests) firstRaw(t *testing.T) map[string]json.RawMessage {
+	t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.bodies) != 1 {
+		t.Fatalf("want 1 request, got %d", len(g.bodies))
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(g.bodies[0], &raw); err != nil {
+		t.Fatalf("request is not JSON: %v", err)
+	}
+	return raw
+}
+
+func sendTelegramRaw(t *testing.T, server *httptest.Server, msg Message) {
+	t.Helper()
+	telegram, err := NewTelegram(config.Telegram{Enabled: true, BotToken: "tok", ChatIDs: "111"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	telegram.BaseURL = server.URL
+	if err := telegram.Send(context.Background(), msg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTelegramEmailEntitiesUseUTF16Offsets pins the reported bug: the
+// message carries emoji and CJK text, so byte and rune offsets both point
+// at the wrong place. The 账号 line is "账号：user@example.com" after the
+// "🟢 🟢 🟢 GPT 额度状态通知" title: 19 UTF-16 units of title, 2 of the
+// blank line, 3 of "账号：", so the address starts at 24 and is 16 long.
+func TestTelegramEmailEntitiesUseUTF16Offsets(t *testing.T) {
+	server, got := newTelegramRawServer(t)
+	sendTelegramRaw(t, server, Message{
+		Title: "🟢 🟢 🟢 GPT 额度状态通知",
+		Body:  "账号：user@example.com\n模型：Codex / GPT\n时间：2026-11-23 19:49:00",
+	})
+	req := got.first(t)
+	if req.Text != "🟢 🟢 🟢 GPT 额度状态通知\n\n账号：user@example.com\n模型：Codex / GPT\n时间：2026-11-23 19:49:00" {
+		t.Fatalf("text changed: %q", req.Text)
+	}
+	if len(req.Entities) != 1 || req.Entities[0].Type != "email" || req.Entities[0].Offset != 24 || req.Entities[0].Length != 16 {
+		t.Fatalf("entities %+v", req.Entities)
+	}
+}
+
+// TestTelegramEmailEntitiesCoverTitleAndBody checks that addresses in the
+// title and in the body each get an entity, and that an emoji between two
+// addresses shifts the second offset by two UTF-16 units.
+func TestTelegramEmailEntitiesCoverTitleAndBody(t *testing.T) {
+	server, got := newTelegramRawServer(t)
+	sendTelegramRaw(t, server, Message{
+		Title: "通知 user@example.com",
+		Body:  "账号：other@example.com",
+	})
+	req := got.first(t)
+	if len(req.Entities) != 2 ||
+		req.Entities[0].Type != "email" || req.Entities[0].Offset != 3 || req.Entities[0].Length != 16 ||
+		req.Entities[1].Type != "email" || req.Entities[1].Offset != 24 || req.Entities[1].Length != 17 {
+		t.Fatalf("entities %+v", req.Entities)
+	}
+
+	server, got = newTelegramRawServer(t)
+	sendTelegramRaw(t, server, Message{
+		Title: "t",
+		Body:  "账号：user@example.com\n🧪 抄送：other@example.net",
+	})
+	req = got.first(t)
+	if len(req.Entities) != 2 ||
+		req.Entities[0].Type != "email" || req.Entities[0].Offset != 6 || req.Entities[0].Length != 16 ||
+		req.Entities[1].Type != "email" || req.Entities[1].Offset != 29 || req.Entities[1].Length != 17 {
+		t.Fatalf("entities %+v", req.Entities)
+	}
+}
+
+// TestTelegramNoEmailSendsNoEntities checks that a message without an
+// address sends no entities field at all, and the text is untouched.
+func TestTelegramNoEmailSendsNoEntities(t *testing.T) {
+	server, got := newTelegramRawServer(t)
+	sendTelegramRaw(t, server, Message{Title: "t", Body: "b"})
+	raw := got.firstRaw(t)
+	if _, ok := raw["entities"]; ok {
+		t.Fatalf("entities must be absent, got %s", raw["entities"])
+	}
+	if req := got.first(t); req.Text != "t\n\nb" {
+		t.Fatalf("text %q", req.Text)
+	}
+}
+
+// TestEmailEntities scans addresses directly: trailing punctuation (a
+// Chinese full stop, an ASCII period) is never part of the link, and
+// offsets count UTF-16 code units.
+func TestEmailEntities(t *testing.T) {
+	cases := []struct {
+		text string
+		want []messageEntity
+	}{
+		{"账号：user@example.com。", []messageEntity{{Type: "email", Offset: 3, Length: 16}}},
+		{"user@example.com.", []messageEntity{{Type: "email", Offset: 0, Length: 16}}},
+		{"a@b.co and c@d.org", []messageEntity{{Type: "email", Offset: 0, Length: 6}, {Type: "email", Offset: 11, Length: 7}}},
+		{"🟢 user@example.com", []messageEntity{{Type: "email", Offset: 3, Length: 16}}},
+		{"no email here", nil},
+		{"", nil},
+	}
+	for _, tc := range cases {
+		got := emailEntities(tc.text)
+		if len(got) != len(tc.want) {
+			t.Fatalf("%q: got %+v, want %+v", tc.text, got, tc.want)
+		}
+		for i := range tc.want {
+			if got[i] != tc.want[i] {
+				t.Fatalf("%q: entity %d = %+v, want %+v", tc.text, i, got[i], tc.want[i])
+			}
+		}
+	}
+}
