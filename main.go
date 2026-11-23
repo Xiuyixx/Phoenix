@@ -46,7 +46,7 @@ import (
 
 const (
 	pluginID       = "phoenix"
-	pluginVersion  = "0.0.9"
+	pluginVersion  = "0.0.10"
 	repository     = "https://github.com/Xiuyixx/Phoenix"
 	managementBase = "/v0/management/phoenix"
 	resourcePath   = "/page"
@@ -100,6 +100,9 @@ type runtime struct {
 	modelsCache   []string
 	modelsFetched time.Time
 	modelsKey     string
+	// lang is the notification language the panel reported ("zh" | "en");
+	// the page POSTs /language when the management-center language changes.
+	lang string
 	// confirmDelays / sleep override the ignition-confirmation timing in
 	// tests; nil means the defaults / time.Sleep.
 	confirmDelays []time.Duration
@@ -137,13 +140,19 @@ type resetGuard struct {
 const resetSuppressWindow = 5 * time.Minute
 
 type Config struct {
-	Enabled              bool           `yaml:"enabled" json:"enabled"`
-	Telegram             TelegramConfig `yaml:"telegram" json:"telegram"`
-	Alerts               AlertConfig    `yaml:"alerts" json:"alerts"`
-	Reset                ResetConfig    `yaml:"reset" json:"reset"`
-	Ignition             IgnitionConfig `yaml:"ignition" json:"ignition"`
-	PollIntervalSeconds  int            `yaml:"poll_interval_seconds" json:"poll_interval_seconds"`
-	HistoryRetentionDays int            `yaml:"history_retention_days" json:"history_retention_days"`
+	Enabled              bool            `yaml:"enabled" json:"enabled"`
+	Telegram             TelegramConfig  `yaml:"telegram" json:"telegram"`
+	Alerts               AlertConfig     `yaml:"alerts" json:"alerts"`
+	Reset                ResetConfig     `yaml:"reset" json:"reset"`
+	Ignition             IgnitionConfig  `yaml:"ignition" json:"ignition"`
+	Providers            ProvidersConfig `yaml:"providers" json:"providers"`
+	PollIntervalSeconds  int             `yaml:"poll_interval_seconds" json:"poll_interval_seconds"`
+	HistoryRetentionDays int             `yaml:"history_retention_days" json:"history_retention_days"`
+	// RememberChartFilters/RememberChartExpanded mirror Lamplighter's
+	// chart-preference switches: whether the panel keeps the chart window,
+	// range and sort (and the expanded groups) in this browser.
+	RememberChartFilters  bool `yaml:"remember_chart_filters" json:"remember_chart_filters"`
+	RememberChartExpanded bool `yaml:"remember_chart_expanded" json:"remember_chart_expanded"`
 	// ConfigToken is the 16-hex-char token the page sends with every CPA
 	// PATCH save. It is stored and echoed as status.config_applied_token
 	// so the page can confirm the save was applied. It is never a secret
@@ -151,6 +160,20 @@ type Config struct {
 	ConfigToken string `yaml:"config_token" json:"-"`
 	// DataDir overrides the resolved data directory (<plugins.dir>/data/phoenix).
 	DataDir string `yaml:"data_dir" json:"-"`
+}
+
+// ProvidersConfig holds the per-provider ignition switches, in the same
+// shape the panel sends (providers.<id>.ignite/.model). Phoenix is
+// Codex-only, so only the codex entry is used; its model is a view onto
+// Ignition.Model (single source of truth, see parseYAML).
+type ProvidersConfig struct {
+	Codex ProviderOverride `yaml:"codex" json:"codex"`
+}
+
+// ProviderOverride is the per-provider ignition switch for one provider.
+type ProviderOverride struct {
+	Ignite bool   `yaml:"ignite" json:"ignite"`
+	Model  string `yaml:"model" json:"model"`
 }
 type TelegramConfig struct {
 	BotToken string `yaml:"bot_token" json:"bot_token"`
@@ -344,6 +367,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		active = rt
 		hostMu.Unlock()
 		go rt.pollLoop()
+		go rt.warmModelsCache()
 		return okEnvelope(registration()), nil
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistration()), nil
@@ -359,12 +383,26 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func defaultConfig() Config {
-	return Config{Enabled: true, Alerts: AlertConfig{Thresholds: []int{50, 20, 10}, NotifyErrors: true, RecoveryNotify: WindowModes{FiveHour: "after_exhausted", SevenDay: "all"}, ResetReminder: WindowModes{FiveHour: "all", SevenDay: "has_remaining"}}, Reset: ResetConfig{Enabled: true, WeeklyOnly: true, MinimumResetSeconds: 86400}, Ignition: IgnitionConfig{Enabled: true, StartHour: 7, EndHour: 22, EndGraceMinutes: 30, GraceSeconds: 3, FailureRetrySeconds: 300, MaxTransientFailures: 3, Model: "gpt-5-codex", CPABaseURL: "http://127.0.0.1:8317"}, PollIntervalSeconds: 300, HistoryRetentionDays: 40}
+	return Config{Enabled: true, Alerts: AlertConfig{Thresholds: []int{50, 20, 10}, NotifyErrors: true, RecoveryNotify: WindowModes{FiveHour: "after_exhausted", SevenDay: "all"}, ResetReminder: WindowModes{FiveHour: "all", SevenDay: "has_remaining"}}, Reset: ResetConfig{Enabled: true, WeeklyOnly: true, MinimumResetSeconds: 86400}, Ignition: IgnitionConfig{Enabled: true, StartHour: 7, EndHour: 22, EndGraceMinutes: 30, GraceSeconds: 3, FailureRetrySeconds: 300, MaxTransientFailures: 3, Model: "gpt-5-codex", CPABaseURL: "http://127.0.0.1:8317"}, Providers: ProvidersConfig{Codex: ProviderOverride{Ignite: true}}, PollIntervalSeconds: 300, HistoryRetentionDays: 40, RememberChartFilters: true, RememberChartExpanded: true}
 }
 func parseYAML(b []byte, c *Config) {
 	lines := strings.Split(string(b), "\n")
 	section := ""
 	sub := ""
+	// Top-level models_api_key / cpa_base_url (the Lamplighter layout) win
+	// over the legacy ignition.* locations when present, even when empty
+	// (clearing the key must stick). Track presence separately so an old
+	// ignition.models_api_key is kept only when no top-level key exists.
+	var topModelsKey string
+	topModelsKeySet := false
+	var topCPAURL string
+	topCPAURLSet := false
+	setThreshold := func(i, v int) {
+		for len(c.Alerts.Thresholds) <= i {
+			c.Alerts.Thresholds = append(c.Alerts.Thresholds, 0)
+		}
+		c.Alerts.Thresholds[i] = v
+	}
 	// listTarget collects "- item" lines, e.g. reset.credentials.
 	listTarget := func() *[]string {
 		if section == "reset" && sub == "credentials" {
@@ -423,6 +461,28 @@ func parseYAML(b []byte, c *Config) {
 				c.ConfigToken = v
 			case "data_dir":
 				c.DataDir = v
+			case "notice_threshold":
+				var n int
+				fmt.Sscanf(v, "%d", &n)
+				setThreshold(0, n)
+			case "low_threshold":
+				var n int
+				fmt.Sscanf(v, "%d", &n)
+				setThreshold(1, n)
+			case "critical_threshold":
+				var n int
+				fmt.Sscanf(v, "%d", &n)
+				setThreshold(2, n)
+			case "models_api_key":
+				topModelsKey = v
+				topModelsKeySet = true
+			case "cpa_base_url":
+				topCPAURL = strings.TrimRight(v, "/")
+				topCPAURLSet = true
+			case "remember_chart_filters":
+				c.RememberChartFilters = v == "true"
+			case "remember_chart_expanded":
+				c.RememberChartExpanded = v == "true"
 			}
 			continue
 		}
@@ -443,13 +503,13 @@ func parseYAML(b []byte, c *Config) {
 			c.Alerts.NotifyErrors = v == "true"
 		case "alerts.thresholds":
 			c.Alerts.Thresholds = parseInts(v)
-		case "alerts.recovery_notify.five_hour", "alerts.recovery_5h":
+		case "alerts.recovery_notify.five_hour", "alerts.recovery_5h", "recovery_notify.five_hour":
 			c.Alerts.RecoveryNotify.FiveHour = v
-		case "alerts.recovery_notify.seven_day", "alerts.recovery_7d":
+		case "alerts.recovery_notify.seven_day", "alerts.recovery_7d", "recovery_notify.seven_day":
 			c.Alerts.RecoveryNotify.SevenDay = v
-		case "alerts.reset_reminder.five_hour", "alerts.reminder_5h":
+		case "alerts.reset_reminder.five_hour", "alerts.reminder_5h", "reset_reminder.five_hour":
 			c.Alerts.ResetReminder.FiveHour = v
-		case "alerts.reset_reminder.seven_day", "alerts.reminder_7d":
+		case "alerts.reset_reminder.seven_day", "alerts.reminder_7d", "reset_reminder.seven_day":
 			c.Alerts.ResetReminder.SevenDay = v
 		case "reset.enabled":
 			c.Reset.Enabled = v != "false"
@@ -480,7 +540,20 @@ func parseYAML(b []byte, c *Config) {
 			c.Ignition.CPABaseURL = strings.TrimRight(v, "/")
 		case "ignition.model":
 			c.Ignition.Model = v
+		case "providers.codex.ignite":
+			c.Providers.Codex.Ignite = v == "true"
+		case "providers.codex.model":
+			// The panel's per-provider model input writes here; it is the
+			// same single value as ignition.model.
+			c.Ignition.Model = v
 		}
+	}
+	// Top-level keys win over the legacy ignition.* locations.
+	if topModelsKeySet {
+		c.Ignition.ModelsAPIKey = topModelsKey
+	}
+	if topCPAURLSet {
+		c.Ignition.CPABaseURL = topCPAURL
 	}
 	// Validate/normalize: thresholds notice >= low >= critical, recovery
 	// and reminder modes restricted to their allowed sets, retention
@@ -694,7 +767,7 @@ func handleUsage(request []byte) ([]byte, error) {
 		if rt.beginReset(index) {
 			go func() {
 				defer rt.finishReset(index, "done")
-				rt.resetFor(index, false)
+				_ = rt.resetFor(index, false)
 			}()
 		}
 	}
@@ -960,22 +1033,22 @@ type resetCredit struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
-func (rt *runtime) resetFor(index string, manual bool) {
+func (rt *runtime) resetFor(index string, manual bool) error {
 	if index == "" {
 		rt.host.log("warn", "Phoenix reset skipped: missing auth index", nil)
-		return
+		return fmt.Errorf("缺少凭证序号")
 	}
 	a, err := rt.host.authGet(index)
 	if err != nil {
 		rt.host.log("warn", "Phoenix reset skipped: credential unavailable", map[string]any{"error": err.Error()})
 		rt.addEventFor("error", fmt.Sprintf("重置跳过：凭证 %s 不可用", index), index, windowSevenDay, "reset", nil)
-		return
+		return fmt.Errorf("凭证不可用")
 	}
 	creds := extractCredentials(a.JSON)
 	if creds.AccessToken == "" {
 		rt.host.log("warn", "Phoenix reset skipped: access token unavailable", nil)
 		rt.addEventFor("error", fmt.Sprintf("重置跳过：凭证 %s 无 access token", index), index, windowSevenDay, "reset", nil)
-		return
+		return fmt.Errorf("凭证无 access token")
 	}
 	// The credit list is a read-only call: retry up to 3 times, 1s apart;
 	// a 401/403 means the token is dead, so stop immediately (mrchi).
@@ -1012,7 +1085,7 @@ func (rt *runtime) resetFor(index string, manual bool) {
 		rt.listErr = listErr.Error()
 		rt.mu.Unlock()
 		rt.addEventFor("error", fmt.Sprintf("重置失败：凭证 %s 查询 credit 列表失败", index), index, windowSevenDay, "reset", nil)
-		return
+		return fmt.Errorf("查询 credit 列表失败：%v", listErr)
 	}
 	rt.mu.Lock()
 	rt.listErr = ""
@@ -1030,7 +1103,7 @@ func (rt *runtime) resetFor(index string, manual bool) {
 	if pick.ID == "" {
 		rt.host.log("info", "Phoenix reset skipped: no available credit", nil)
 		rt.addEventFor("info", fmt.Sprintf("重置跳过：凭证 %s 无可用 credit", index), index, windowSevenDay, "reset", nil)
-		return
+		return fmt.Errorf("无可用 credit")
 	}
 	// One UUIDv4 per flow, never retried once issued: a consume that has
 	// been sent is decided, so a retry could burn a second credit.
@@ -1043,13 +1116,13 @@ func (rt *runtime) resetFor(index string, manual bool) {
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 || json.Unmarshal(resp.Body, &result) != nil || (result.Code != "reset" && result.Code != "already_redeemed") {
 		rt.host.log("warn", "Phoenix reset credit consume failed", map[string]any{"error": fmt.Sprint(err), "status": resp.StatusCode})
 		rt.addEventFor("error", fmt.Sprintf("重置失败：凭证 %s 消耗 credit 失败", index), index, windowSevenDay, "reset", nil)
-		return
+		return fmt.Errorf("消耗 credit 失败")
 	}
 	if err = rt.host.resetCooldown(index); err != nil {
 		rt.host.log("warn", "Phoenix reset succeeded but cooldown clear failed", map[string]any{"error": err.Error()})
 		rt.addEventFor("error", fmt.Sprintf("重置已完成但清除冷却失败：凭证 %s", index), index, windowSevenDay, "reset", nil)
 		go rt.notify("Phoenix 重置未完全成功", fmt.Sprintf("凭证 %s 已消耗 reset credit，但清除 CPA 本地冷却失败，请检查 CPA 日志。", index))
-		return
+		return fmt.Errorf("清除冷却失败")
 	}
 	rt.host.log("info", "Phoenix reset completed", map[string]any{"auth_index": index, "credit_id": pick.ID, "manual": manual})
 	// One call records both the panel event and the history "reset" event
@@ -1072,6 +1145,7 @@ func (rt *runtime) resetFor(index string, manual bool) {
 			rt.igniteFor(index, false)
 		}()
 	}
+	return nil
 }
 
 // creditExpiry sorts credits by expiry; no-expiry credits sort last.
@@ -1175,6 +1249,20 @@ func jsonManagementResponse(status int, v any) ([]byte, error) {
 	return managementResponse(status, "application/json; charset=utf-8", body)
 }
 
+// targetAuthIndex resolves a panel ignition target to an auth index: the
+// Lamplighter group key "codex:<auth_index>:codex:main" carries the index
+// in its second segment; a bare auth_index passes through unchanged.
+func targetAuthIndex(target, authIndex string) string {
+	if authIndex != "" {
+		return authIndex
+	}
+	parts := strings.Split(target, ":")
+	if len(parts) >= 2 && parts[0] == "codex" {
+		return parts[1]
+	}
+	return target
+}
+
 func handleManagement(request []byte) ([]byte, error) {
 	var req pluginapi.ManagementRequest
 	if err := json.Unmarshal(request, &req); err != nil {
@@ -1210,6 +1298,7 @@ func handleManagement(request []byte) ([]byte, error) {
 	case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/refresh"):
 		// Synchronous refresh: run one poll and return the fresh status,
 		// with a 30s guard so a stuck upstream call cannot hang the page.
+		// The body follows Lamplighter's action convention {ok, status}.
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -1219,24 +1308,68 @@ func handleManagement(request []byte) ([]byte, error) {
 		case <-done:
 		case <-time.After(30 * time.Second):
 		}
-		return jsonManagementResponse(http.StatusOK, rt.status())
+		return jsonManagementResponse(http.StatusOK, map[string]any{"ok": true, "status": rt.status()})
 	case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/reset"):
 		var in struct {
 			AuthIndex string `json:"auth_index"`
 		}
 		_ = json.Unmarshal(req.Body, &in)
 		if !rt.cfg.Reset.Enabled {
-			return jsonManagementResponse(http.StatusConflict, map[string]any{"error": "reset disabled"})
+			return jsonManagementResponse(http.StatusOK, map[string]any{"ok": false, "error": "reset disabled", "status": rt.status()})
 		}
-		go rt.reset(in.AuthIndex)
-		return jsonManagementResponse(http.StatusOK, map[string]any{"accepted": true, "action": "reset"})
+		if err := rt.reset(in.AuthIndex); err != nil {
+			return jsonManagementResponse(http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "status": rt.status()})
+		}
+		return jsonManagementResponse(http.StatusOK, map[string]any{"ok": true, "status": rt.status()})
 	case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/ignite"):
 		var in struct {
 			AuthIndex string `json:"auth_index"`
+			Target    string `json:"target"`
 		}
 		_ = json.Unmarshal(req.Body, &in)
-		go rt.ignite(in.AuthIndex)
-		return jsonManagementResponse(http.StatusOK, map[string]any{"accepted": true, "action": "ignite"})
+		index := targetAuthIndex(in.Target, in.AuthIndex)
+		if index == "" {
+			// No credential named: fall back to the first Codex credential
+			// the host knows about, like igniteFor does.
+			if entries, err := rt.host.authList(); err == nil {
+				for _, e := range entries {
+					if isCodexEntry(e) {
+						index = e.AuthIndex
+						break
+					}
+				}
+			}
+		}
+		if !rt.cfg.Ignition.Enabled {
+			return jsonManagementResponse(http.StatusOK, map[string]any{"ok": false, "error": "ignition disabled", "status": rt.status()})
+		}
+		if !rt.cfg.Providers.Codex.Ignite {
+			return jsonManagementResponse(http.StatusOK, map[string]any{"ok": false, "error": "codex ignition not enabled", "status": rt.status()})
+		}
+		// Synchronous like Lamplighter (up to the confirmation delays):
+		// success is a LastSuccess that moved during this call.
+		var before time.Time
+		if index != "" {
+			rt.mu.Lock()
+			before = rt.state.target(index).LastSuccess
+			rt.mu.Unlock()
+		}
+		rt.ignite(index)
+		ok := false
+		errStr := ""
+		if index != "" {
+			rt.mu.Lock()
+			ts := rt.state.target(index)
+			ok = ts.LastSuccess.After(before)
+			if !ok {
+				errStr = ts.LastError
+			}
+			rt.mu.Unlock()
+		}
+		if errStr == "" && !ok {
+			errStr = "ignition failed"
+		}
+		return jsonManagementResponse(http.StatusOK, map[string]any{"ok": ok, "error": errStr, "status": rt.status()})
 	case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/test-notify"):
 		results := rt.testNotifyResults()
 		ok := false
@@ -1245,10 +1378,20 @@ func handleManagement(request []byte) ([]byte, error) {
 				ok = true
 			}
 		}
-		if !ok {
-			return jsonManagementResponse(http.StatusBadGateway, map[string]any{"results": results})
+		return jsonManagementResponse(http.StatusOK, map[string]any{"ok": ok, "results": results, "status": rt.status()})
+	case req.Method == http.MethodPost && strings.HasSuffix(req.Path, "/language"):
+		var in struct {
+			Language string `json:"language"`
 		}
-		return jsonManagementResponse(http.StatusOK, map[string]any{"accepted": true, "results": results})
+		_ = json.Unmarshal(req.Body, &in)
+		lang := strings.ToLower(strings.TrimSpace(in.Language))
+		if lang != "en" {
+			lang = "zh"
+		}
+		rt.mu.Lock()
+		rt.lang = lang
+		rt.mu.Unlock()
+		return jsonManagementResponse(http.StatusOK, map[string]any{"ok": true, "status": rt.status()})
 	case req.Method == http.MethodPut && strings.HasSuffix(req.Path, "/settings"):
 		// Merge per section instead of replacing the whole config, so a
 		// save from the settings page cannot wipe fields the page does
@@ -1270,15 +1413,55 @@ func handleManagement(request []byte) ([]byte, error) {
 			case "alerts":
 				_ = json.Unmarshal(raw, &rt.cfg.Alerts)
 			case "reset":
+				// The panel sends credentials as a comma-separated string
+				// (text input); the struct wants []string, so normalize
+				// it first instead of silently dropping the field.
+				var resetPatch map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &resetPatch); err == nil {
+					if credRaw, ok := resetPatch["credentials"]; ok {
+						var credStr string
+						if err := json.Unmarshal(credRaw, &credStr); err == nil {
+							resetPatch["credentials"], _ = json.Marshal(parseStrings(credStr))
+							raw, _ = json.Marshal(resetPatch)
+						}
+					}
+				}
 				_ = json.Unmarshal(raw, &rt.cfg.Reset)
 			case "ignition":
 				_ = json.Unmarshal(raw, &rt.cfg.Ignition)
+			case "providers":
+				_ = json.Unmarshal(raw, &rt.cfg.Providers)
+				// The panel's per-provider model input is a view onto
+				// ignition.model (single source of truth).
+				if rt.cfg.Providers.Codex.Model != "" {
+					rt.cfg.Ignition.Model = rt.cfg.Providers.Codex.Model
+				}
 			case "poll_interval_seconds":
 				_ = json.Unmarshal(raw, &rt.cfg.PollIntervalSeconds)
 			case "history_retention_days":
 				_ = json.Unmarshal(raw, &rt.cfg.HistoryRetentionDays)
 			case "enabled":
 				_ = json.Unmarshal(raw, &rt.cfg.Enabled)
+			case "notice_threshold", "low_threshold", "critical_threshold":
+				var n int
+				_ = json.Unmarshal(raw, &n)
+				idx := map[string]int{"notice_threshold": 0, "low_threshold": 1, "critical_threshold": 2}[key]
+				for len(rt.cfg.Alerts.Thresholds) <= idx {
+					rt.cfg.Alerts.Thresholds = append(rt.cfg.Alerts.Thresholds, 0)
+				}
+				rt.cfg.Alerts.Thresholds[idx] = n
+			case "recovery_notify":
+				_ = json.Unmarshal(raw, &rt.cfg.Alerts.RecoveryNotify)
+			case "reset_reminder":
+				_ = json.Unmarshal(raw, &rt.cfg.Alerts.ResetReminder)
+			case "models_api_key":
+				_ = json.Unmarshal(raw, &rt.cfg.Ignition.ModelsAPIKey)
+			case "cpa_base_url":
+				_ = json.Unmarshal(raw, &rt.cfg.Ignition.CPABaseURL)
+			case "remember_chart_filters":
+				_ = json.Unmarshal(raw, &rt.cfg.RememberChartFilters)
+			case "remember_chart_expanded":
+				_ = json.Unmarshal(raw, &rt.cfg.RememberChartExpanded)
 			}
 		}
 		rt.cfg.Alerts.Thresholds = validateThresholds(rt.cfg.Alerts.Thresholds)
@@ -1300,7 +1483,7 @@ func handleManagement(request []byte) ([]byte, error) {
 	}
 	return jsonManagementResponse(http.StatusNotFound, map[string]any{"error": "route not found"})
 }
-func (rt *runtime) reset(index string) {
+func (rt *runtime) reset(index string) error {
 	rt.host.log("info", "Phoenix manual reset requested", nil)
 	if index == "" {
 		index = firstCredential(rt.cfg.Reset.Credentials)
@@ -1320,16 +1503,14 @@ func (rt *runtime) reset(index string) {
 	if index == "" {
 		rt.host.log("warn", "Phoenix manual reset skipped: no credential available", nil)
 		rt.addEvent("error", "手动重置跳过：没有可用的凭证")
-		return
+		return fmt.Errorf("没有可用的凭证")
 	}
 	if !rt.beginReset(index) {
 		rt.addEventFor("info", fmt.Sprintf("手动重置跳过：凭证 %s 已有进行中的重置", index), index, windowSevenDay, "reset", nil)
-		return
+		return fmt.Errorf("已有进行中的重置")
 	}
-	go func() {
-		defer rt.finishReset(index, "done")
-		rt.resetFor(index, true)
-	}()
+	defer rt.finishReset(index, "done")
+	return rt.resetFor(index, true)
 }
 
 // codexProvider normalizes a host auth entry's provider the way Lamplighter
@@ -1482,14 +1663,36 @@ func (rt *runtime) pollOnce() {
 		codexCount++
 		rt.pollCredential(e.AuthIndex, e)
 	}
-	if codexCount == 0 && len(entries) > 0 {
+	if codexCount == 0 {
 		// Loud failure instead of a silent empty panel: the poller ran,
-		// the host listed credentials, but none matched as Codex.
-		msg := fmt.Sprintf("auth list has %d entries but no Codex credential matched (checked Provider, fell back to Type)", len(entries))
+		// the host listed credentials, but none matched as Codex. Log the
+		// distinct provider/type values seen so the mismatch is diagnosable
+		// from the CPA journal instead of guessable.
+		seen := map[string]bool{}
+		var kinds []string
+		for _, e := range entries {
+			k := codexProvider(e)
+			if k == "" {
+				k = "(empty provider/type)"
+			} else {
+				k = "provider=" + k
+			}
+			if !seen[k] {
+				seen[k] = true
+				kinds = append(kinds, k)
+			}
+			if len(kinds) >= 10 {
+				break
+			}
+		}
+		msg := fmt.Sprintf("auth list has %d entries but no Codex credential matched (checked Provider, fell back to Type); saw: %s", len(entries), strings.Join(kinds, ", "))
+		if len(entries) == 0 {
+			msg = "auth list is empty, no credentials to poll"
+		}
 		rt.mu.Lock()
 		rt.listErr = msg
 		rt.mu.Unlock()
-		rt.host.log("warn", "Phoenix quota poll found no Codex credential", map[string]any{"entries": len(entries)})
+		rt.host.log("warn", fmt.Sprintf("Phoenix quota poll found no Codex credential (entries=%d; saw: %s)", len(entries), strings.Join(kinds, ", ")), nil)
 	}
 	now := time.Now()
 	rt.mu.Lock()
@@ -1546,11 +1749,19 @@ func (rt *runtime) pollCredential(index string, entry pluginapi.HostAuthFileEntr
 	if acct.AuthID == "" {
 		acct.AuthID = index
 	}
+	// Host entry metadata for the panel's account card (Lamplighter
+	// AccountStatus). The display title is computed in statusLocked from
+	// these plus the note/email; the file name itself is never the title.
 	if entry.Name != "" {
-		acct.Title = entry.Name
-	} else if a.Name != "" {
-		acct.Title = a.Name
+		acct.Name = entry.Name
 	}
+	if entry.Email != "" {
+		acct.Email = entry.Email
+	}
+	if entry.Note != "" {
+		acct.Note = entry.Note
+	}
+	acct.Unavailable = entry.Unavailable
 	if plan != "" {
 		acct.Plan = plan
 	}
@@ -1705,6 +1916,10 @@ func windowResetAt(w map[string]any) time.Time {
 func (rt *runtime) igniteFor(index string, manual bool) {
 	if !rt.cfg.Ignition.Enabled {
 		rt.host.log("info", "Phoenix ignition skipped: disabled", nil)
+		return
+	}
+	if !rt.cfg.Providers.Codex.Ignite {
+		rt.host.log("info", "Phoenix ignition skipped: codex ignition not enabled", nil)
 		return
 	}
 	authID := index
@@ -1879,6 +2094,30 @@ func (rt *runtime) executeIgnition(index, authID, model string) (int, error) {
 		return resp.StatusCode, fmt.Errorf("upstream status %d", resp.StatusCode)
 	}
 	return resp.StatusCode, nil
+}
+
+// warmModelsCache pre-reads the CPA model list in the background (like
+// Lamplighter's maybeReadModels) so status can report next_models from the
+// cache without blocking the page on a /v1/models fetch. Failures land in
+// modelsErr, surfaced by status as models_error.
+func (rt *runtime) warmModelsCache() {
+	if strings.TrimSpace(rt.cfg.Ignition.ModelsAPIKey) == "" {
+		return
+	}
+	_ = rt.ignitionCandidates()
+}
+
+// cachedNextModelLocked returns the first ignition candidate from the warm
+// cache only (no fetch), for status.next_models. Empty when the list has
+// never been read. The caller must hold rt.mu.
+func (rt *runtime) cachedNextModelLocked() string {
+	if rt.modelsKey != strings.TrimSpace(rt.cfg.Ignition.ModelsAPIKey) || time.Since(rt.modelsFetched) >= 10*time.Minute || len(rt.modelsCache) == 0 {
+		return ""
+	}
+	if c := pickIgnitionCandidates(append([]string(nil), rt.modelsCache...)); len(c) > 0 {
+		return c[0]
+	}
+	return ""
 }
 
 // ignitionCandidates returns the ordered candidate models for ignition

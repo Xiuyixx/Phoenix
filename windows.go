@@ -47,7 +47,15 @@ type accountState struct {
 	Plan          string
 	Error         string
 	CooldownUntil time.Time
-	Windows       map[string]*windowState
+	// Name/Email/Note/Unavailable come from the host auth entry (Lamplighter
+	// AccountStatus). They are only filled when the host lists the
+	// credential; kv-stored credentials are invisible to AuthList, so these
+	// stay empty for them and the panel falls back to the auth id.
+	Name        string
+	Email       string
+	Note        string
+	Unavailable bool
+	Windows     map[string]*windowState
 	// ActiveWindows lists the window kinds the last successful active poll
 	// confirmed for this credential. nil means no active poll has run yet;
 	// passive updates are only accepted for confirmed windows once set, so

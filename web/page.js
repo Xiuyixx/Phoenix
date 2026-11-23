@@ -5,6 +5,21 @@
   var CONFIG_API = "/v0/management/plugins/phoenix/config";
   var KEY_STORE = "phoenix-mgmt-key";
 
+  var key = "";
+  var status = null;
+  var settingsFilled = false;
+  var rawConfig = {};
+  var chartWindow = "5h";
+  var range = "6h";
+  var chartSort = "default";
+  var chartExpanded = {};
+  var chartSelected = null;
+  var history = null;
+  // The window kind of the series in history. The chart keeps drawing it
+  // until the history of a newly chosen window arrives.
+  var historyWindow = "";
+  var refreshTimer = null;
+
   function $(id) { return document.getElementById(id); }
 
   function el(tag, attrs, children) {
@@ -29,10 +44,499 @@
 
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
-  // ---- Management key (kept exactly as in v0.0.7) ----
-  // The Management Center stores the key in localStorage ("cli-proxy-auth"),
-  // XOR-obfuscated with the host (v2) or host and user agent (v1). Fall back
-  // to asking the user for the key, kept only in this tab's sessionStorage.
+  // The page runs in a same-origin iframe of the Management Center, so it
+  // reads the theme from the parent document: data-theme is "dark", "white"
+  // or absent for the default light theme. Opened on its own, it falls back
+  // to the theme the Management Center stored in localStorage.
+  function parentRoot() {
+    try {
+      if (window.parent !== window) return window.parent.document.documentElement;
+    } catch (e) { /* cross-origin */ }
+    return null;
+  }
+
+  function applyTheme() {
+    var theme = "light";
+    var root = parentRoot();
+    if (root) {
+      var value = root.getAttribute("data-theme");
+      if (value === "dark" || value === "white") theme = value;
+    } else {
+      var stored = "auto";
+      try {
+        var parsed = JSON.parse(localStorage.getItem("cli-proxy-theme") || "null");
+        stored = (parsed && parsed.state && parsed.state.theme) || (parsed && parsed.theme) || stored;
+      } catch (e) { /* use auto */ }
+      if (stored === "dark" || stored === "white") theme = stored;
+      if (stored === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) theme = "dark";
+    }
+    if (theme === "light") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", theme);
+  }
+
+  function watchParent() {
+    var root = parentRoot();
+    if (!root || !window.MutationObserver) return;
+    new MutationObserver(function () { applyTheme(); applyLanguage(); renderChart(); })
+      .observe(root, { attributes: true, attributeFilter: ["data-theme", "lang"] });
+  }
+
+  // ---- Language ----
+
+  // Every visible text, per language. Keys are used by data-i18n attributes
+  // in page.html and by translate() below; {0}, {1} are arguments. A new language
+  // adds a dictionary here and a column in internal/notify/text.go.
+  var I18N = {
+    zh: {
+      app_sub: "凤凰", repo_hint: "在 GitHub 上查看",
+      update_hint: "有新版本 v{0}，可在 CPA 插件商店更新",
+      key_title: "需要管理密钥",
+      key_hint: "在管理中心登录时勾选“记住密码”，此页面会直接使用该密钥；否则请在这里输入，密钥只保存在当前标签页。",
+      key_placeholder: "CPA 管理密钥",
+      key_submit: "确定",
+      key_invalid: "管理密钥无效，请重新输入。",
+      refresh_all: "立即刷新全部",
+      quota: "额度",
+      ignition: "自动点火",
+      col_group: "额度组", col_next: "下次点火", col_reset: "当前重置", col_last: "最近成功", col_model: "模型", col_status: "状态",
+      chart_title: "额度变化", chart_window: "额度窗口", chart_range: "时间范围", chart_sort: "排序",
+      quota_5h: "5 小时额度", quota_7d: "7 天额度",
+      sort_default: "默认排序", sort_low: "最低优先",
+      no_data: "无数据",
+      legend_ignited: "● 点火成功，×n 为同一时刻的多个目标",
+      legend_failed: "✕ 含点火失败",
+      legend_reset: "↻ 重置",
+      pace_reference: "匀速参考",
+      pace_extended: "匀速参考（往回延长）",
+      legend_pace_extended: "匀速参考往回延长到本周期起点（周期中途预定重置变了）",
+      legend_pooled: "多账号的服务显示合计额度，点击行查看详情，再点一次展开各账号",
+      legend_estimated: "合计中有账号缺数据，按它已有的读数和重置时间估算",
+      data_table: "数据表",
+      col_quota: "额度", col_account: "账号", col_latest: "最新", col_min: "最低", col_max: "最高", col_samples: "样本", col_to_reset: "距重置",
+      events: "事件",
+      settings: "设置",
+      bark_url: "Bark 推送地址", bark_group: "Bark 分组",
+      webhook_url: "Webhook 地址", webhook_method: "请求方法", webhook_headers: "请求头（每行一个）", webhook_body: "请求体",
+      webhook_body_placeholder: "留空时发送内置的 JSON 消息",
+      webhook_success: "成功条件（可选）", webhook_success_hint: "JSON 响应必须包含这些字段和值才算发送成功；留空时只检查 HTTP 状态码",
+      webhook_hint: "地址、请求头和请求体中可以使用占位符：{{title}} {{body}} {{text}} {{url}} {{priority}} {{kind}} {{label}} {{time}}。各服务的写法见 README。",
+      headers_invalid: "每行写一个请求头，格式为 名称: 值", json_invalid: "请填写 JSON 对象，例如 {\"code\":0}",
+      test_notify: "测试推送", test_notify_hint: "发送到所有已配置的渠道；刚修改的设置生效后才发送",
+      test_waiting: "等待插件应用新设置…", test_not_applied: "配置尚未生效，未发送测试",
+      test_ok: "{0}：已发送", test_failed: "{0}：失败，{1}", test_response: "响应：{0}",
+      test_unchecked: "只检查了 HTTP 状态码。飞书、钉钉、企业微信等服务失败时也返回 200，请到客户端确认是否收到，或设置成功条件。",
+      test_some_failed: "部分渠道测试失败", test_all_failed: "测试推送失败",
+      thresholds: "提醒阈值", remaining_le: "剩余 ≤",
+      threshold_notice: "提醒", threshold_low: "偏低", threshold_critical: "告急",
+      thresholds_hint: "额度降到每一档时推送一次，耗尽时再推送一次。三档须从高到低，可以相等；前两档也决定额度条和图表的颜色。",
+      thresholds_order: "阈值须满足：提醒 ≥ 偏低 ≥ 告急，未保存",
+      window_5h: "5 小时窗口", window_7d: "7 天窗口",
+      recovery_notify: "额度恢复时通知", reset_reminder: "重置前提醒",
+      recovery_notify_5h: "额度恢复时通知 · 5 小时窗口", recovery_notify_7d: "额度恢复时通知 · 7 天窗口",
+      reset_reminder_5h: "重置前提醒 · 5 小时窗口", reset_reminder_7d: "重置前提醒 · 7 天窗口",
+      mode_off: "关闭", recovery_all: "每次", recovery_after_exhausted: "用完后",
+      reminder_all: "每次", reminder_has_remaining: "有余量",
+      mode_off_title: "关闭", recovery_all_title: "每次重置都通知", recovery_after_exhausted_title: "窗口用完后，在下一次重置时通知一次",
+      reminder_all_title: "每次重置前都提醒", reminder_has_remaining_title: "剩余高于告急阈值时才提醒",
+      notify_modes_hint: "“用完后”：窗口用完后，在下一次重置时通知一次。“有余量”：剩余高于告急阈值时才提醒。重置前提醒在 5 小时窗口重置前 1 小时、7 天窗口重置前 1 天发送。恢复通知附带上一周期的剩余额度，取自每次重置前 30 秒的查询。",
+      quota_queries: "额度查询",
+      models_api_key: "模型列表 API key",
+      models_api_key_hint: "插件用这个 key 从 CPA 读取模型列表，为自动点火选择模型；不使用自动点火时可以留空。请在 CPA 的 access.api-keys 中新建一个专用 key，不要填管理密钥。",
+      poll_interval: "查询间隔（秒）", request_timeout: "请求超时（秒）", history_retention: "历史保留（天）",
+      passive_skip: "被动数据跳过窗口（秒）", passive_skip_max: "最多连续跳过（分钟）",
+      passive_skip_hint: "整点前这段时间内已有被动数据的账号跳过本轮主动查询；设为 0 则每轮都主动查询。",
+      ignition_enabled: "启用自动点火",
+      start_hour: "每日开始（时）", end_hour: "每日结束（时）", end_grace: "结束后宽限（分钟）",
+      grace: "重置后延迟（秒）", failure_retry: "失败重试间隔（秒）", max_transient: "临时错误上限（次）",
+      services: "服务", col_service: "服务", col_ignition_model: "点火模型",
+      monitor_service: "监控 {0}", ignite_service: "点火 {0}", model_auto: "自动：{0}",
+      ignite_groups: "{0} 点火额度组", no_ignition: "不支持点火", list_or: " 或 ",
+      codex_reset_enabled: "转发 Did Codex Reset 发布的 Codex 重置信号",
+      codex_reset_pending: "首次开启时推送当前待生效的排期",
+      chart_prefs: "额度图表", remember_chart_filters: "记住额度窗口、时间范围和排序",
+      remember_chart_filters_hint: "在当前浏览器中记住“额度变化”上次选择的额度窗口、时间范围和排序；关闭后每次打开页面都使用默认选择。",
+      remember_chart_expanded: "记住展开的分组",
+      remember_chart_expanded_hint: "在当前浏览器中记住“额度变化”中展开的多账号分组，5 小时和 7 天额度共用一套；关闭后每次打开页面分组都是收起的。",
+      save_hint: "修改后自动保存到 CPA 的 config.yaml，插件几秒内应用。文本和数字在离开输入框或按回车时保存，保存结果显示在区块标题旁，高级设置按分组显示。",
+      language_note: "通知语言跟随最近打开此页面时管理中心的语言，当前为{0}。",
+      lang_zh: "中文", lang_en: "English",
+      due: "已到", minutes: "{0} 分钟", hours_minutes: "{0} 小时 {1} 分", days: "{0} 天",
+      soon: "即将", in_time: "{0}后", just_now: "刚刚", ago: "{0}前",
+      reset_now: "已重置",
+      state_disabled: "已停用", state_starting: "启动中", state_running: "运行中",
+      last_poll: "上次查询 {0}（{1}）", next_poll: "下次 {0}（{1}）",
+      config_error: "配置无法解析，仍在使用上一份配置：{0}",
+      models_error: "模型列表不可用：{0}",
+      notify_off: "未设置 Bark 推送地址或 Webhook 地址，通知已关闭。",
+      notify_error: "Webhook 设置无效，未启用：{0}",
+      no_models_key: "未设置模型列表 API key，自动点火无法选择模型。",
+      remaining_aria: "{0} {1} 剩余",
+      source_passive: "被动", source_active: "主动", updated: "更新于 {0}",
+      no_accounts: "没有可监控的 {0} 凭证。",
+      first_query: "CPA 启动约 20 秒后开始第一次查询。",
+      refresh: "刷新", refreshed: "已刷新 {0}",
+      account_settings: "账号", rename: "名称",
+      rename_hint: "名称写入 CPA 凭证备注的第一行，保留其余各行。留空则按邮箱区分账号；备注有多行时，清空名称须确认删除整条备注。",
+      account_order_hint: "拖动手柄调整顺序，额度卡片和图表默认顺序随之调整。拖动时按 Esc 可取消。",
+      account_name_aria: "{0} 的名称", account_weight_aria: "{0} 的权重", weight_default: "套餐默认值 {0}",
+      rename_clear_note: "这个账号的备注还有其他内容。清空名称会删除整条备注，继续吗？",
+      weight: "权重", weight_hint: "同一服务有多个账号时，可设置各账号的权重，合计按权重平均剩余额度。权重须大于 0，可带小数；留空使用输入框中提示的套餐默认值。",
+      plan: "套餐：{0}", weight_invalid: "权重必须是大于 0 的数字",
+      cooldown_stale: "额度已恢复，但 CPA 仍冷却到 {0}，期间的请求和点火都会被拒绝；在 CPA 管理中心清除这个账号的冷却。",
+      cooldown: "CPA 冷却到 {0}（{1}）",
+      blocked_5h: "5 小时额度已用完", blocked_7d: "7 天额度已用完", blocked_other: "{0}额度已用完",
+      blocked_until: "{0} 重置后恢复点火", blocked_wait: "额度恢复后恢复点火",
+      paused_until: "暂停至 {0}", failures: "失败 {0} 次", rolling: "窗口未开始", normal: "正常",
+      ignition_note: "每天 {0}:00 开始，之后在每次重置后 {1} 秒点火，最晚到 {2}。",
+      no_targets: "没有启用点火的额度组。",
+      ignite_now: "立即点火",
+      ignite_confirm: "立即向 {0} 发送一次点火请求？这会开始一个新的 5 小时窗口。",
+      ignited: "{0} 点火成功",
+      manual_actions: "立即操作",
+      reset_now: "立即重置", reset_done: "{0} 已重置",
+      telegram_title: "Telegram 推送", telegram_enabled: "启用 Telegram 推送",
+      telegram_bot_token: "Bot Token", telegram_chat_ids: "接收 ID",
+      telegram_hint: "多个接收 ID 用分号分隔；账号停用或报错时直接通知。",
+      notify_off_telegram: "未设置 Telegram Bot Token，通知已关闭。",
+      reset_settings: "自动重置", reset_enabled: "启用自动重置",
+      reset_weekly_only: "仅每周窗口用尽时重置",
+      reset_min_interval: "最短重置间隔（秒）",
+      reset_credentials: "重置凭证",
+      reset_credentials_hint: "凭证序号，逗号分隔；留空为全部 Codex 凭证。",
+      reset_hint: "每周窗口用尽且账号持有 reset credit 时，自动消耗一张重置限额并清除 CPA 本地冷却。",
+      notify_errors: "账号错误时推送",
+      ev_ignite: "点火成功", ev_ignite_manual: "手动点火", ev_ignite_failed: "点火失败", ev_ignite_paused: "点火暂停", ev_model_refused: "模型被拒",
+      ev_cooldown_stale: "冷却未解除", ev_plan_change: "套餐变化", ev_notify: "已推送", ev_notify_failed: "推送失败", ev_codex_reset: "重置信号", ev_error: "错误",
+      ev_ignited: "{0} · 下次重置 {1}",
+      ev_retry: "{0}后重试：{1}", ev_retry_cooldown: "CPA 冷却结束，{0}后重试：{1}",
+      ev_seconds: "{0} 秒", ev_minutes: "{0} 分钟",
+      ev_paused: "暂停到 {0}：{1}",
+      ev_paused_auth: "暂停，等待更新凭证：{0}", ev_paused_suspended: "暂停，账号已停用：{0}",
+      ev_refused: "{0} 被上游拒绝，改用 {1}，{2} 小时内不再尝试",
+      ev_notify_failed_detail: "{0}：{1}",
+      ev_cooldown: "额度已恢复，CPA 仍冷却到 {0}",
+      ev_codex_sent: "已发送 {0} 条通知",
+      ev_reset: "额度重置", ev_exhausted: "额度耗尽", ev_credential_invalid: "凭证失效", ev_credential_suspended: "账号停用",
+      ev_credential_rate_limited: "被限流", ev_credential_restored: "凭证恢复", ev_notify_quota: "额度提醒", ev_notify_reminder: "重置提醒",
+      ev_window_left: "{0} · 剩余 {1}", ev_window_next: "{0} · 剩余 {1} · 下次重置 {2}", ev_window_due: "{0} · 剩余 {1} · {2} 重置",
+      ev_limited_until: "{0} · 限流到 {1}", ev_ignite_paused_note: "{0} · 点火已暂停", ev_ignite_paused_until: "{0} · 点火暂停到 {1}", ev_appeal: "申诉", ev_source_ignite: "点火时确认", ev_source_query: "额度查询时确认",
+      ev_show_5h: "显示 5 小时重置", ev_show_5h_count: "显示 5 小时重置（{0}）",
+      no_events: "暂无事件", collapse: "收起", show_more: "显示更多（共 {0} 条）",
+      failed: "失败：{0}",
+      range_h: "{0} 小时", range_d: "{0} 天", range_mo: "{0} 个月",
+      overview_aria: "各额度剩余百分比总览",
+      ignition_lane: "点火", lane_ok: "{0} 成功", lane_failed: " · {0} 失败",
+      total: "合计", total_suffix: " 合计", estimated_suffix: "（估算）", more_accounts: "　… 另 {0} 个账号",
+      pooled_note: "{0} 个账号合计，阴影为账号间的最低到最高",
+      stat_total: "合计", stat_current: "当前", stat_pace: "匀速", stat_diff: "差值", stat_to_reset: "距重置",
+      projected_5h: "按当前速度", projected_7d: "按本周期日均",
+      legend_projection_5h: "按当前速度的延长线", legend_projection_7d: "按本周期日均的延长线", legend_hatch: "无数据或尚未到来",
+      detail_aria: "{0} 剩余百分比",
+      detail_keys: "按左右方向键查看各时刻的数值",
+      passive_sample: "（被动）", active_sample: "（主动）",
+      quota_reset: "额度重置",
+      loading: "加载中…", no_history: "这个范围内还没有额度数据。",
+      history_failed: "读取历史失败：{0}",
+      tz_config: "配置中指定", tz_cpa: "跟随 CPA 服务器",
+      tz_note: "通知和页面中的时间使用 {0}，{1}。",
+      save_failed: "保存失败：{0}",
+      management_key_refused: "这是 CPA 管理密钥，未保存。请填写 access.api-keys 中的 key",
+      api_key_refused: "CPA 不接受这个 key，未保存。请填写 access.api-keys 中的 key",
+      load_failed: "加载失败：{0}",
+      refreshed_all: "已刷新全部额度", test_sent: "测试通知已发送",
+      level_full: "满", level_high: "高", level_medium: "中", level_low: "低", level_empty: "空",
+      inactive: "已停用", inactive_suffix: "（已停用）", stat_last: "最后读数",
+      legend_inactive: "已停用：账号不再报告这个窗口，保留到最后一个数据点移出所选范围",
+      drag_handle: "拖动调整顺序",
+      order_failed: "账号顺序保存失败：{0}",
+      view_nav: "页面", advanced: "高级",
+      notify_channels: "通知渠道", webhook_advanced: "高级：请求方法、请求头、请求体和成功条件", alert_rules: "提醒规则",
+      ignition_off: "自动点火已关闭，这些设置暂不生效。",
+      ignition_models_hint: "选择点火模型需要“高级”中的模型列表 API key。",
+      monitor_hint: "勾选要监控额度的服务。",
+      save_saved: "已保存", save_saving: "保存中…",
+      save_field_failed: "✕ {0}保存失败", save_failure_reason: "：{0}", save_failed_compact: "✕ 保存失败", save_more_failed: "（另有 {0} 项失败）", save_order: "排序",
+      save_waiting: "已保存，等待生效", save_applied: "已生效", save_unconfirmed: "未确认生效",
+      save_applied_verified: "已生效，验证通过", save_applied_unverified: "已生效，未能验证：{0}", network_error: "网络错误",
+      mask_on: "打码账号", mask_off: "显示账号", account_n: "账号 {0}",
+      weekdays: "周日,周一,周二,周三,周四,周五,周六",
+      snapshot_card: "复制这张卡片的截图", snapshot_cards: "复制所有卡片的截图", snapshot_detail: "复制曲线详情图的截图",
+      snapshot_copied: "已复制截图", snapshot_failed: "截图复制失败：{0}", snapshot_unsupported: "当前浏览器不支持复制图片",
+      mcp_hint: "AI 客户端（如 Claude Code）可以通过 MCP 查询额度、历史和事件，并刷新额度。",
+      mcp_enabled: "启用 MCP 接口", mcp_listen: "监听地址", mcp_key: "密钥", mcp_key_unset: "未设置",
+      mcp_show: "显示", mcp_hide: "隐藏", copy: "复制", copied: "已复制", copy_failed: "无法复制，请手动选择文本复制",
+      mcp_generate: "生成新密钥", mcp_regenerate_confirm: "生成新密钥？旧密钥会立即失效，使用它的客户端需要换成新密钥。",
+      mcp_status: "状态", mcp_unknown: "未知", mcp_running: "运行中", mcp_stopped: "未启动",
+      mcp_public_url: "对外地址（可选）",
+      mcp_public_url_invalid: "对外地址须为 http 或 https 地址，不能含空格、? 或 #；下面的配置暂用监听地址。",
+      mcp_public_hint: "对外开放时请使用反向代理并配置 HTTPS，然后在这里填写对外地址，下面的配置随之更新。这个地址只保存在当前浏览器。",
+      mcp_snippets: "客户端配置", mcp_claude: "Claude Code", mcp_json: "通用 JSON", mcp_stdio: "只支持 stdio 的客户端（mcp-remote）",
+      mcp_no_key: "先生成密钥，配置中的 <key> 会换成实际的密钥。", mcp_error: "MCP 接口未启动：{0}"
+    },
+    en: {
+      app_sub: "", repo_hint: "View on GitHub",
+      update_hint: "v{0} is available; update it in the CPA plugin store",
+      key_title: "Management key required",
+      key_hint: "If you checked \"remember password\" when signing in to the Management Center, this page uses that key. Otherwise enter it here; it is kept in this tab only.",
+      key_placeholder: "CPA management key",
+      key_submit: "OK",
+      key_invalid: "The management key is not valid. Enter it again.",
+      refresh_all: "Refresh all",
+      quota: "Quota",
+      ignition: "Ignition",
+      col_group: "Quota group", col_next: "Next ignition", col_reset: "Current reset", col_last: "Last success", col_model: "Model", col_status: "Status",
+      chart_title: "Quota history", chart_window: "Quota window", chart_range: "Time range", chart_sort: "Order",
+      quota_5h: "5-hour quota", quota_7d: "7-day quota",
+      sort_default: "Default order", sort_low: "Lowest first",
+      no_data: "No data",
+      legend_ignited: "● ignition succeeded; ×n marks several targets at the same time",
+      legend_failed: "✕ an ignition failed",
+      legend_reset: "↻ reset",
+      pace_reference: "Even pace",
+      pace_extended: "Even pace (extended back)",
+      legend_pace_extended: "Even pace extended back to the cycle start (the reset moved within the cycle)",
+      legend_pooled: "Services with several accounts show their total; click a row for details, click again to list the accounts",
+      legend_estimated: "An account of the total is missing data; estimated from its readings and reset time",
+      data_table: "Data table",
+      col_quota: "Quota", col_account: "Account", col_latest: "Latest", col_min: "Lowest", col_max: "Highest", col_samples: "Samples", col_to_reset: "Until reset",
+      events: "Events",
+      settings: "Settings",
+      bark_url: "Bark push URL", bark_group: "Bark group",
+      webhook_url: "Webhook URL", webhook_method: "Method", webhook_headers: "Headers (one per line)", webhook_body: "Body",
+      webhook_body_placeholder: "Empty sends the built-in JSON message",
+      webhook_success: "Success condition (optional)", webhook_success_hint: "The JSON response must contain these fields and values for the delivery to count; empty checks only the HTTP status",
+      webhook_hint: "The URL, headers and body can use placeholders: {{title}} {{body}} {{text}} {{url}} {{priority}} {{kind}} {{label}} {{time}}. See the README for each service.",
+      headers_invalid: "One header per line, as Name: value", json_invalid: "Enter a JSON object, such as {\"code\":0}",
+      test_notify: "Send test", test_notify_hint: "Sends to every configured channel once the settings just changed are in effect",
+      test_waiting: "Waiting for the plugin to apply the new settings…", test_not_applied: "The new settings are not in effect yet, so the test was not sent",
+      test_ok: "{0}: sent", test_failed: "{0}: failed, {1}", test_response: "Response: {0}",
+      test_unchecked: "Only the HTTP status was checked. Feishu, DingTalk, WeCom and similar services answer 200 on failure too, so check that the message arrived or set a success condition.",
+      test_some_failed: "Some channels failed the test", test_all_failed: "The test notification failed",
+      thresholds: "Alert thresholds", remaining_le: "Remaining ≤",
+      threshold_notice: "Notice", threshold_low: "Low", threshold_critical: "Critical",
+      thresholds_hint: "One notification when quota drops to each threshold, and one more when it runs out. The thresholds must not increase from first to third; the first two also set the colors of the bars and the chart.",
+      thresholds_order: "Thresholds must satisfy Notice ≥ Low ≥ Critical; not saved",
+      window_5h: "5-hour window", window_7d: "7-day window",
+      recovery_notify: "Notify when quota recovers", reset_reminder: "Remind before resets",
+      recovery_notify_5h: "Notify when quota recovers · 5-hour window", recovery_notify_7d: "Notify when quota recovers · 7-day window",
+      reset_reminder_5h: "Remind before resets · 5-hour window", reset_reminder_7d: "Remind before resets · 7-day window",
+      mode_off: "Off", recovery_all: "Always", recovery_after_exhausted: "After out",
+      reminder_all: "Always", reminder_has_remaining: "If left",
+      mode_off_title: "Off", recovery_all_title: "Notify at every reset", recovery_after_exhausted_title: "After the window runs out, notify once at its next reset",
+      reminder_all_title: "Remind before every reset", reminder_has_remaining_title: "Remind only when more than the Critical threshold is left",
+      notify_modes_hint: "\"After out\": after the window runs out, notify once at its next reset. \"If left\": remind only when more than the Critical threshold is left. Reminders are sent 1 hour before a 5-hour window resets and 1 day before a 7-day window resets. Recovery notifications include what was left of the ended cycle, from the query 30 seconds before every reset.",
+      quota_queries: "Quota queries",
+      models_api_key: "Model list API key",
+      models_api_key_hint: "The plugin reads CPA's model list with this key to pick ignition models; without ignition it can stay empty. Create a dedicated key in CPA's access.api-keys rather than using the management key.",
+      poll_interval: "Query interval (s)", request_timeout: "Request timeout (s)", history_retention: "History retention (days)",
+      passive_skip: "Passive data window (s)", passive_skip_max: "Longest skip (min)",
+      passive_skip_hint: "Accounts with passive data within this time before a slot skip that active query; 0 queries every time.",
+      ignition_enabled: "Enable ignition",
+      start_hour: "Daily start (hour)", end_hour: "Daily end (hour)", end_grace: "Grace after end (min)",
+      grace: "Delay after reset (s)", failure_retry: "Retry after failure (s)", max_transient: "Transient error limit",
+      services: "Services", col_service: "Service", col_ignition_model: "Ignition model",
+      monitor_service: "Monitor {0}", ignite_service: "Ignite {0}", model_auto: "Auto: {0}",
+      ignite_groups: "{0} ignition groups", no_ignition: "No ignition", list_or: " or ",
+      codex_reset_enabled: "Forward Codex reset signals published by Did Codex Reset",
+      codex_reset_pending: "When first turned on, send the pending schedule",
+      chart_prefs: "Quota chart", remember_chart_filters: "Remember the window, range and order",
+      remember_chart_filters_hint: "This browser remembers the quota window, time range and order last chosen in the quota history. When off, the page opens with the default choices.",
+      remember_chart_expanded: "Remember expanded groups",
+      remember_chart_expanded_hint: "This browser remembers the multi-account groups expanded in the quota history, one set for the 5-hour and 7-day quotas. When off, the page opens with the groups collapsed.",
+      save_hint: "Changes save to CPA's config.yaml automatically, and the plugin applies them within a few seconds. Text and numbers save when you leave the field or press Enter. Save results appear beside section headings or advanced group legends.",
+      language_note: "Notifications use the Management Center language from the last time this page was opened, now {0}.",
+      lang_zh: "中文", lang_en: "English",
+      due: "due", minutes: "{0} min", hours_minutes: "{0} h {1} min", days: "{0} days",
+      soon: "soon", in_time: "in {0}", just_now: "just now", ago: "{0} ago",
+      reset_now: "reset",
+      state_disabled: "Disabled", state_starting: "Starting", state_running: "Running",
+      last_poll: "last query {0} ({1})", next_poll: "next {0} ({1})",
+      config_error: "The config cannot be parsed; the previous config stays in use: {0}",
+      models_error: "Model list unavailable: {0}",
+      notify_off: "No Bark push URL or webhook URL is set, so notifications are off.",
+      notify_error: "The webhook settings are invalid, so the webhook is off: {0}",
+      no_models_key: "No model list API key is set, so ignition cannot pick a model.",
+      remaining_aria: "{0} {1} remaining",
+      source_passive: "passive", source_active: "active", updated: "updated {0}",
+      no_accounts: "No {0} credentials to monitor.",
+      first_query: "The first query runs about 20 seconds after CPA starts.",
+      refresh: "Refresh", refreshed: "Refreshed {0}",
+      account_settings: "Accounts", rename: "Name",
+      rename_hint: "Names are saved as the first line of the CPA credential note; other lines are kept. Leave the name empty to distinguish accounts by email. Clearing a name on a multiline note requires confirmation to delete the whole note.",
+      account_order_hint: "Drag a handle to set the default order of quota cards and charts. Press Esc during a drag to cancel.",
+      account_name_aria: "Name of {0}", account_weight_aria: "Weight of {0}", weight_default: "Plan default: {0}",
+      rename_clear_note: "The note of this account has more lines. Clearing the name deletes the whole note. Continue?",
+      weight: "Weight", weight_hint: "For services with several accounts, the total averages their remaining quota by weight. Weights must be above 0; decimals are allowed. Leave a field empty to use the plan default shown in it.",
+      plan: "Plan: {0}", weight_invalid: "The weight must be a number above 0",
+      cooldown_stale: "Quota is back, but CPA cools this account down until {0} and rejects requests and ignition until then. Clear the cooldown in the CPA Management Center.",
+      cooldown: "CPA cooldown until {0} ({1})",
+      blocked_5h: "5-hour quota used up", blocked_7d: "7-day quota used up", blocked_other: "{0} quota used up",
+      blocked_until: "Ignition resumes after the reset at {0}", blocked_wait: "Ignition resumes when the quota recovers",
+      paused_until: "Paused until {0}", failures: "{0} failures", rolling: "Window not started", normal: "Normal",
+      ignition_note: "Starts at {0}:00 every day, then ignites {1} seconds after each reset, until {2}.",
+      no_targets: "No quota group has ignition enabled.",
+      ignite_now: "Ignite now",
+      ignite_confirm: "Send an ignition request to {0} now? This starts a new 5-hour window.",
+      ignited: "{0} ignited",
+      manual_actions: "Manual actions",
+      reset_now: "Reset now", reset_done: "{0} reset",
+      telegram_title: "Telegram", telegram_enabled: "Enable Telegram notifications",
+      telegram_bot_token: "Bot Token", telegram_chat_ids: "Chat IDs",
+      telegram_hint: "Separate multiple chat IDs with semicolons; account errors and suspensions notify directly.",
+      notify_off_telegram: "Telegram Bot Token is not set, so notifications are off.",
+      reset_settings: "Auto reset", reset_enabled: "Enable auto reset",
+      reset_weekly_only: "Only reset when the weekly window is exhausted",
+      reset_min_interval: "Minimum reset interval (s)",
+      reset_credentials: "Reset credentials",
+      reset_credentials_hint: "Credential indexes, comma separated; empty means all Codex credentials.",
+      reset_hint: "When the weekly window is exhausted and the account holds a reset credit, one credit is consumed and the CPA local cooldown is cleared.",
+      notify_errors: "Notify on account errors",
+      ev_ignite: "Ignited", ev_ignite_manual: "Manual ignition", ev_ignite_failed: "Ignition failed", ev_ignite_paused: "Ignition paused", ev_model_refused: "Model refused",
+      ev_cooldown_stale: "Cooldown not cleared", ev_plan_change: "Plan changed", ev_notify: "Notified", ev_notify_failed: "Notification failed", ev_codex_reset: "Reset signal", ev_error: "Error",
+      ev_ignited: "{0} · next reset {1}",
+      ev_retry: "Retrying in {0}: {1}", ev_retry_cooldown: "Retrying when the CPA cooldown ends, in {0}: {1}",
+      ev_seconds: "{0} s", ev_minutes: "{0} min",
+      ev_paused: "Paused until {0}: {1}",
+      ev_paused_auth: "Paused until the credential is updated: {0}", ev_paused_suspended: "Paused, account suspended: {0}",
+      ev_refused: "{0} was refused upstream; used {1}, not tried again for {2} hours",
+      ev_notify_failed_detail: "{0}: {1}",
+      ev_cooldown: "Quota is back, but CPA cools down until {0}",
+      ev_codex_sent: "Sent {0} notifications",
+      ev_reset: "Quota reset", ev_exhausted: "Quota exhausted", ev_credential_invalid: "Credential invalid", ev_credential_suspended: "Account suspended",
+      ev_credential_rate_limited: "Rate limited", ev_credential_restored: "Credential restored", ev_notify_quota: "Quota alert", ev_notify_reminder: "Reset reminder",
+      ev_window_left: "{0} · {1} left", ev_window_next: "{0} · {1} left · next reset {2}", ev_window_due: "{0} · {1} left · resets {2}",
+      ev_limited_until: "{0} · limited until {1}", ev_ignite_paused_note: "{0} · ignition paused", ev_ignite_paused_until: "{0} · ignition paused until {1}", ev_appeal: "Appeal", ev_source_ignite: "Confirmed by ignition", ev_source_query: "Confirmed by a quota query",
+      ev_show_5h: "Show 5-hour resets", ev_show_5h_count: "Show 5-hour resets ({0})",
+      no_events: "No events yet", collapse: "Show less", show_more: "Show more ({0} in total)",
+      failed: "Failed: {0}",
+      range_h: "{0}h", range_d: "{0}d", range_mo: "{0} month",
+      overview_aria: "Remaining quota overview",
+      ignition_lane: "Ignition", lane_ok: "{0} succeeded", lane_failed: " · {0} failed",
+      total: "Total", total_suffix: " total", estimated_suffix: " (estimated)", more_accounts: "　… {0} more accounts",
+      pooled_note: "Total of {0} accounts; the shade spans the lowest to the highest account",
+      stat_total: "Total", stat_current: "Now", stat_pace: "Even pace", stat_diff: "Difference", stat_to_reset: "Until reset",
+      projected_5h: "At the current rate", projected_7d: "At this cycle's daily average",
+      legend_projection_5h: "Projection at the current rate", legend_projection_7d: "Projection at this cycle's daily average", legend_hatch: "No data, or not yet",
+      detail_aria: "{0} remaining percent",
+      detail_keys: "Use the left and right arrow keys to step through the values",
+      passive_sample: " (passive)", active_sample: " (active)",
+      quota_reset: "quota reset",
+      loading: "Loading…", no_history: "No quota data in this range yet.",
+      history_failed: "Could not read the history: {0}",
+      tz_config: "set in the config", tz_cpa: "following the CPA server",
+      tz_note: "Notifications and this page show times in {0}, {1}.",
+      save_failed: "Could not save: {0}",
+      management_key_refused: "This is the CPA management key, so it was not saved. Enter a key from access.api-keys",
+      api_key_refused: "CPA does not accept this key, so it was not saved. Enter a key from access.api-keys",
+      load_failed: "Could not load: {0}",
+      refreshed_all: "Refreshed all quota", test_sent: "Test notification sent",
+      level_full: "Full", level_high: "High", level_medium: "Medium", level_low: "Low", level_empty: "Empty",
+      inactive: "Inactive", inactive_suffix: " (inactive)", stat_last: "Last reading",
+      legend_inactive: "Inactive: the account no longer reports this window; it shows until its last sample leaves the range",
+      drag_handle: "Drag to reorder",
+      order_failed: "Could not save the account order: {0}",
+      view_nav: "Page", advanced: "Advanced",
+      notify_channels: "Notification channels", webhook_advanced: "Advanced: method, headers, body and success condition", alert_rules: "Alert rules",
+      ignition_off: "Ignition is off, so these settings do not apply for now.",
+      ignition_models_hint: "Picking ignition models needs the model list API key under Advanced.",
+      monitor_hint: "Check the services whose quota to monitor.",
+      save_saved: "Saved", save_saving: "Saving…",
+      save_field_failed: "✕ {0} save failed", save_failure_reason: ": {0}", save_failed_compact: "✕ Save failed", save_more_failed: " ({0} more failed)", save_order: "Order",
+      save_waiting: "Saved; waiting to take effect", save_applied: "In effect", save_unconfirmed: "Not confirmed in effect",
+      save_applied_verified: "In effect; CPA accepts the key", save_applied_unverified: "In effect, but could not verify: {0}", network_error: "network error",
+      mask_on: "Blur accounts", mask_off: "Show accounts", account_n: "Account {0}",
+      weekdays: "Sun,Mon,Tue,Wed,Thu,Fri,Sat",
+      snapshot_card: "Copy a screenshot of this card", snapshot_cards: "Copy a screenshot of all cards", snapshot_detail: "Copy a screenshot of the detail chart",
+      snapshot_copied: "Screenshot copied", snapshot_failed: "Could not copy the screenshot: {0}", snapshot_unsupported: "This browser cannot copy images",
+      mcp_hint: "AI clients such as Claude Code can read quota, history and events and refresh quota over MCP.",
+      mcp_enabled: "Enable the MCP endpoint", mcp_listen: "Listen address", mcp_key: "Key", mcp_key_unset: "Not set",
+      mcp_show: "Show", mcp_hide: "Hide", copy: "Copy", copied: "Copied", copy_failed: "Could not copy; select the text and copy it",
+      mcp_generate: "Generate new key", mcp_regenerate_confirm: "Generate a new key? The old key stops working at once, and clients using it need the new one.",
+      mcp_status: "Status", mcp_unknown: "Unknown", mcp_running: "Running", mcp_stopped: "Not running",
+      mcp_public_url: "Public address (optional)",
+      mcp_public_url_invalid: "The public address must be an http or https address without spaces, ? or #. The configs below use the listen address.",
+      mcp_public_hint: "To open it to other machines, put a reverse proxy with HTTPS in front and enter its address here; the configs below follow it. The address is kept in this browser only.",
+      mcp_snippets: "Client configuration", mcp_claude: "Claude Code", mcp_json: "Generic JSON", mcp_stdio: "stdio-only clients (mcp-remote)",
+      mcp_no_key: "Generate a key first; it replaces <key> in the configs.", mcp_error: "The MCP endpoint is not running: {0}"
+    }
+  };
+
+  var lang = "zh";
+
+  function translate(key) {
+    var text = (I18N[lang] && I18N[lang][key] !== undefined) ? I18N[lang][key] : (I18N.zh[key] !== undefined ? I18N.zh[key] : key);
+    for (var i = 1; i < arguments.length; i++) text = text.split("{" + (i - 1) + "}").join(String(arguments[i]));
+    return text;
+  }
+
+  // The language follows the Management Center: the lang attribute of the
+  // parent page, which it updates on every switch, or the language it stored
+  // when the page is opened on its own. Chinese variants show Chinese and
+  // every other language English.
+  function centerLanguage() {
+    var root = parentRoot();
+    var value = root ? root.getAttribute("lang") || "" : "";
+    if (!value) {
+      try {
+        var raw = localStorage.getItem("cli-proxy-language") || "";
+        try {
+          var parsed = JSON.parse(raw);
+          value = (parsed && parsed.state && parsed.state.language) || (parsed && parsed.language) || (typeof parsed === "string" ? parsed : "");
+        } catch (e) { value = raw; }
+      } catch (e) { /* no storage */ }
+    }
+    if (!value) value = navigator.language || "";
+    return /^zh/i.test(value) ? "zh" : "en";
+  }
+
+  function applyStaticText() {
+    document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+    [["data-i18n", null], ["data-i18n-placeholder", "placeholder"], ["data-i18n-title", "title"], ["data-i18n-aria-label", "aria-label"]].forEach(function (pair) {
+      Array.prototype.forEach.call(document.querySelectorAll("[" + pair[0] + "]"), function (node) {
+        var text = translate(node.getAttribute(pair[0]));
+        if (pair[1]) node.setAttribute(pair[1], text);
+        else node.textContent = text;
+      });
+    });
+  }
+
+  var languageApplied = false;
+  function applyLanguage() {
+    var next = centerLanguage();
+    if (languageApplied && next === lang) return;
+    lang = next;
+    languageApplied = true;
+    applyStaticText();
+    renderSaveStates();
+    renderRangeButtons();
+    renderMaskButton();
+    renderCardsSnapshot();
+    if (status) {
+      renderStatus();
+      $("timezone-note").textContent = timezoneText();
+      reportLanguage();
+    }
+    if (status && history) renderChart();
+  }
+
+  // Notifications are sent without a page open, so the page tells the
+  // plugin which language to use; it keeps the last one reported.
+  var reportingLanguage = false;
+  function reportLanguage() {
+    if (!status || status.language === lang || reportingLanguage) return;
+    reportingLanguage = true;
+    api("POST", API + "/language", { language: lang }).then(function (data) {
+      if (data.status) { status = data.status; renderLanguageNote(); }
+    }).catch(function () { /* retried on the next status refresh */ }).then(function () { reportingLanguage = false; });
+  }
+
+  function renderLanguageNote() {
+    $("language-note").textContent = translate("language_note", translate("lang_" + (status.language || "zh")));
+  }
+
+  // With "remember password" on, the Management Center stores the key in
+  // localStorage, XOR-obfuscated with the host (v2) or host and user agent (v1).
+  // Unprefixed plaintext JSON is also supported.
   function centerKey() {
     try {
       var raw = localStorage.getItem("cli-proxy-auth");
@@ -49,20 +553,11 @@
       var parsed = JSON.parse(raw);
       var stored = parsed && parsed.state ? parsed.state : parsed;
       return stored && typeof stored.managementKey === "string" ? stored.managementKey : "";
-    } catch (e) { return ""; }
+    } catch (e) {
+      return "";
+    }
   }
 
-  var key = "";
-  try { key = sessionStorage.getItem(KEY_STORE) || centerKey(); } catch (e) { key = ""; }
-
-  function askForKey(message) {
-    key = "";
-    try { sessionStorage.removeItem(KEY_STORE); } catch (e) {}
-    $("key-section").hidden = false;
-    if (message) $("key-error").textContent = message;
-  }
-
-  // ---- API ----
   // timeout, in milliseconds, aborts a request that takes longer.
   function api(method, path, body, timeout) {
     var opts = { method: method, headers: { "Authorization": "Bearer " + key, "Accept": "application/json" } };
@@ -79,36 +574,40 @@
     var done = function () { clearTimeout(timer); };
     return fetch(path, opts).then(function (res) {
       return res.json().catch(function (err) {
+        // A body cut off by the timeout is no answer.
         if (opts.signal && opts.signal.aborted) throw err;
         return {};
       }).then(function (data) {
         if (res.status === 401) {
-          askForKey("管理密钥无效或已过期，请重新输入。");
-          var unauth = new Error("unauthorized");
-          unauth.status = 401;
-          throw unauth;
+          askForKey(translate("key_invalid"));
+          throw new Error("unauthorized");
         }
-        if (!res.ok) {
-          var err = new Error(data.error || data.message || ("请求失败：" + res.status));
-          err.status = res.status;
-          throw err;
-        }
+        if (!res.ok) throw new Error(data.error || data.message || ("HTTP " + res.status));
         return data;
       });
     }).then(function (data) { done(); return data; }, function (err) { done(); throw err; });
+  }
+
+  function askForKey(message) {
+    key = "";
+    sessionStorage.removeItem(KEY_STORE);
+    $("app").hidden = true;
+    $("key-section").hidden = false;
+    $("key-error").hidden = !message;
+    $("key-error").textContent = message || "";
   }
 
   var toastTimer = null;
   function toast(message) {
     var node = $("toast");
     clear(node);
-    node.appendChild(document.createTextNode(message));
+    maskedNodes(message).forEach(function (child) { node.appendChild(child); });
     node.hidden = false;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(function () { node.hidden = true; }, 5000);
   }
 
-  // ---- Time (all shown in the plugin's time zone) ----
+  // Times are shown in the plugin's time zone, like notifications.
   function offsetSeconds() {
     var value = status ? Number(status.utc_offset_seconds) : NaN;
     return isFinite(value) ? value : -new Date().getTimezoneOffset() * 60;
@@ -125,8 +624,6 @@
 
   function shifted(t) { return new Date(t.getTime() + offsetSeconds() * 1000); }
 
-  var WEEKDAYS = "周日,周一,周二,周三,周四,周五,周六".split(",");
-
   function fmtDateTime(t) {
     if (!t) return "—";
     var s = shifted(t);
@@ -137,7 +634,7 @@
   function fmtDateTimeDay(t) {
     if (!t) return "—";
     var s = shifted(t);
-    return pad(s.getUTCMonth() + 1) + "/" + pad(s.getUTCDate()) + " " + WEEKDAYS[s.getUTCDay()] + " " +
+    return pad(s.getUTCMonth() + 1) + "/" + pad(s.getUTCDate()) + " " + translate("weekdays").split(",")[s.getUTCDay()] + " " +
       pad(s.getUTCHours()) + ":" + pad(s.getUTCMinutes());
   }
 
@@ -152,51 +649,40 @@
   }
 
   function fmtDuration(ms) {
-    if (ms <= 0) return "已到";
+    if (ms <= 0) return translate("due");
     var minutes = Math.round(ms / 60000);
-    if (minutes < 60) return minutes + " 分钟";
+    if (minutes < 60) return translate("minutes", minutes);
     var hours = Math.floor(minutes / 60);
-    if (hours < 48) return hours + " 小时 " + (minutes % 60) + " 分";
-    return Math.round(hours / 24) + " 天";
+    if (hours < 48) return translate("hours_minutes", hours, minutes % 60);
+    return translate("days", Math.round(hours / 24));
   }
 
   function fmtIn(t) {
     if (!t) return "";
     var ms = t.getTime() - Date.now();
-    if (ms < 60000) return "即将";
-    return fmtDuration(ms) + "后";
+    if (ms < 60000) return translate("soon");
+    return translate("in_time", fmtDuration(ms));
   }
 
   function fmtAgo(t) {
     if (!t) return "";
     var ms = Date.now() - t.getTime();
-    if (ms < 60000) return "刚刚";
-    return fmtDuration(ms) + "前";
+    if (ms < 60000) return translate("just_now");
+    return translate("ago", fmtDuration(ms));
   }
-
-  function fmtCountdown(ms) {
-    if (ms <= 0) return "已重置";
-    var minutes = Math.round(ms / 60000);
-    if (minutes < 60) return minutes + "m";
-    var hours = Math.floor(minutes / 60);
-    if (hours < 24) return hours + "h " + pad(minutes % 60) + "m";
-    return Math.floor(hours / 24) + "d " + (hours % 24) + "h";
-  }
-
-  function pct(v) { return v == null ? "—" : Math.round(v) + "%"; }
-
-  function fmtDiff(d) { return d == null ? "—" : (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(d) + "%"; }
 
   // Bars and the chart color quota in five levels: empty at 0% and full at
-  // 100%, judged on the raw value; between them low, medium and high, split
-  // by the first two notification thresholds.
+  // 100%, judged on the raw value, so 99.6% is not full; between them low,
+  // medium and high, split by the first two notification thresholds, the
+  // same split as the 🟡 and 🔴 notifications. Cards, chart bands, swatches,
+  // tooltips and the legend all use quotaLevel.
   function quotaThresholds() {
     var cfg = status && status.config ? status.config : {};
-    var th = cfg.alerts && Array.isArray(cfg.alerts.thresholds) ? cfg.alerts.thresholds : [];
-    var notice = Number(th[0]), low = Number(th[1]);
+    var notice = Number(cfg.notice_threshold), low = Number(cfg.low_threshold);
     return { notice: isFinite(notice) ? notice : 50, low: isFinite(low) ? low : 20 };
   }
 
+  // A weighted average of full accounts can land a rounding error below 100.
   var LEVEL_EPSILON = 1e-6;
 
   function quotaLevel(remaining) {
@@ -208,50 +694,320 @@
     return "high";
   }
 
+  function fmtCountdown(ms) {
+    if (ms <= 0) return translate("reset_now");
+    var minutes = Math.round(ms / 60000);
+    if (minutes < 60) return minutes + "m";
+    var hours = Math.floor(minutes / 60);
+    if (hours < 24) return hours + "h " + pad(minutes % 60) + "m";
+    return Math.floor(hours / 24) + "d " + (hours % 24) + "h";
+  }
+
+  function windowName(w) {
+    if (w.short === "5h") return translate("window_5h");
+    if (w.short === "7d") return translate("window_7d");
+    return w.label;
+  }
+
+  // The providers come from the status API in display order.
+  function providerList() { return (status && status.providers) || []; }
+
+  function providerTitle(provider) {
+    var hit = providerList().filter(function (p) { return p.id === provider; })[0];
+    return hit ? hit.title : provider;
+  }
+
+  // "A、B 或 C" in Chinese, "A, B or C" in English.
+  function listText(items) {
+    if (items.length < 2) return items.join("");
+    return items.slice(0, -1).join(lang === "zh" ? "、" : ", ") + translate("list_or") + items[items.length - 1];
+  }
+
+  function localized(text) { return text ? (lang === "zh" ? text.zh : text.en) : ""; }
+
   function badge(kind, text) {
     return el("span", { class: "badge badge-" + kind }, [el("span", { class: "badge-dot" }), document.createTextNode(text)]);
   }
 
-  // ---- State ----
-  var status = null;
-  var settingsFilled = false;
-  var refreshTimer = null;
+  // ---- Account masking ----
 
-  // ---- Header + notices ----
+  // The eye button in the header blurs every text that names an account,
+  // for screenshots to share. The choice is kept in this browser, so each
+  // computer keeps its own, and applies before the first render.
+  // Text that names accounts carries SENSITIVE, which .mask-accounts
+  // blurs; chart text in SVG gets the mask-blur filter instead. Masked,
+  // title tooltips that name accounts are left out and labels for screen
+  // readers number the accounts. Confirmations keep the names.
+  var SENSITIVE = "account-sensitive";
+  var MASK_STORE = "phoenix-mask-accounts";
+  var masked = false;
+  try { masked = localStorage.getItem(MASK_STORE) === "1"; } catch (err) {}
+  document.documentElement.classList.toggle("mask-accounts", masked);
+
+  function accountAlias(index) { return translate("account_n", index + 1); }
+
+  // The names that tell accounts apart: titles, emails, credential file
+  // names and group labels of the current accounts, and the labels of
+  // events and history series, which keep the names of renamed and deleted
+  // accounts; without the provider and group names they share. Longest
+  // first, so an email wins over a part of it.
+  function accountSecrets() {
+    var common = {}, found = {};
+    providerList().forEach(function (p) { common[p.title] = true; common[p.id] = true; });
+    var accounts = (status && status.accounts) || [];
+    accounts.forEach(function (a) { (a.groups || []).forEach(function (g) { common[g.source_label] = true; }); });
+    accounts.forEach(function (a) {
+      var names = [a.title, a.email, a.name];
+      (a.groups || []).forEach(function (g) { names.push(g.label); });
+      names.forEach(function (name) {
+        name = typeof name === "string" ? name.trim() : "";
+        if (name.length >= 2 && !common[name]) found[name] = true;
+      });
+    });
+    var past = [];
+    ((status && status.events) || []).concat((history && history.events) || []).forEach(function (ev) { past.push(ev.label); });
+    // A series of a quota group no current account has lost its metadata:
+    // the history names it by the internal group key, which identifies the
+    // account, so its names count whatever they look like.
+    var groups = {};
+    accounts.forEach(function (a) { (a.groups || []).forEach(function (g) { groups[g.key] = true; }); });
+    ((history && history.series) || []).forEach(function (s) {
+      if (s.label !== s.source_label) past.push(s.label);
+      if (!groups[s.group]) past.push(s.label, s.source_label, s.group);
+    });
+    past.forEach(function (name) {
+      name = typeof name === "string" ? name.trim() : "";
+      if (name.length >= 2 && !common[name]) found[name] = true;
+    });
+    return Object.keys(found).sort(function (a, b) { return b.length - a.length; });
+  }
+
+  function hasSecret(text) {
+    text = String(text == null ? "" : text);
+    return accountSecrets().some(function (name) { return text.indexOf(name) >= 0; });
+  }
+
+  // The text as nodes, with each account name in a SENSITIVE span. extra
+  // lists more text to treat as account names.
+  function maskedNodes(text, extra) {
+    var rest = String(text == null ? "" : text), secrets = accountSecrets(), out = [];
+    if (extra) {
+      secrets = secrets.concat(extra.filter(function (name) { return typeof name === "string" && name.trim().length; }))
+        .sort(function (a, b) { return b.length - a.length; });
+    }
+    while (rest) {
+      var at = -1, hit = "";
+      secrets.forEach(function (name) {
+        var i = rest.indexOf(name);
+        if (i >= 0 && (at < 0 || i < at)) { at = i; hit = name; }
+      });
+      if (at < 0) { out.push(document.createTextNode(rest)); break; }
+      if (at) out.push(document.createTextNode(rest.slice(0, at)));
+      out.push(el("span", { class: SENSITIVE, text: hit }));
+      rest = rest.slice(at + hit.length);
+    }
+    return out;
+  }
+
+  // An SVG text that names an account, blurred while masked.
+  function svgSensitive(node, always) {
+    if (masked && (always || hasSecret(node.textContent))) node.setAttribute("filter", "url(#mask-blur)");
+    return node;
+  }
+
+  // The header button and the eye buttons beside the screenshot buttons all
+  // switch the same masking, so a screenshot needs no trip to the top.
+  function drawMaskButton(button) {
+    var label = translate(masked ? "mask_off" : "mask_on");
+    button.setAttribute("aria-pressed", masked ? "true" : "false");
+    button.setAttribute("title", label);
+    button.setAttribute("aria-label", label);
+    clear(button);
+    var icon = svg("svg", { viewBox: "0 0 16 16", width: 16, height: 16, "aria-hidden": "true" });
+    icon.appendChild(svg("path", { d: "M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8s-2.4 4.5-6.5 4.5S1.5 8 1.5 8z" }));
+    icon.appendChild(svg("circle", { cx: 8, cy: 8, r: 2.1 }));
+    if (masked) icon.appendChild(svg("path", { d: "M2.5 2.5l11 11" }));
+    button.appendChild(icon);
+    return button;
+  }
+
+  function renderMaskButton() {
+    Array.prototype.forEach.call(document.querySelectorAll(".mask-toggle"), drawMaskButton);
+  }
+
+  // An eye button for beside a screenshot button; screenshots leave it out.
+  function maskButton() {
+    return drawMaskButton(el("button", { type: "button", class: "btn btn-ghost btn-icon mask-toggle no-snapshot", onclick: toggleMask }));
+  }
+
+  function toggleMask() {
+    var detailFocus = document.activeElement === $("chart-detail-head").querySelector(".mask-toggle");
+    masked = !masked;
+    try { localStorage.setItem(MASK_STORE, masked ? "1" : "0"); } catch (err) {}
+    document.documentElement.classList.toggle("mask-accounts", masked);
+    renderMaskButton();
+    if (!status) return;
+    renderStatus();
+    if (history) renderChart();
+    if (detailFocus) {
+      var eye = $("chart-detail-head").querySelector(".mask-toggle");
+      if (eye) eye.focus({ preventScroll: true });
+    }
+  }
+
+  // ---- Screenshots ----
+
+  // The camera buttons copy a PNG of an account card, of all cards or of
+  // the detail chart to the clipboard, as the page shows it, masking
+  // included. The nodes are cloned without the .no-snapshot buttons and
+  // drawn with the page's style sheet through an SVG foreignObject on a
+  // canvas, at the screen's pixel ratio. Animations, transitions and hover
+  // styles are left out. Nothing outside the page is loaded, so the canvas
+  // stays readable.
+  function canCopyImage() {
+    return !!(window.ClipboardItem && navigator.clipboard && navigator.clipboard.write && window.isSecureContext);
+  }
+
+  // A PNG blob of the nodes side by side in a frame width pixels wide. The
+  // frame's style (.snapshot-frame in page.css) is part of the page's style
+  // sheet, so the frame is measured off screen with the same style the
+  // image is drawn with.
+  function snapshotPng(nodes, width) {
+    var body = getComputedStyle(document.body);
+    var frame = el("div", { class: "snapshot-frame" });
+    frame.style.width = width + "px";
+    frame.style.fontFamily = body.fontFamily;
+    frame.style.fontSize = body.fontSize;
+    frame.style.lineHeight = body.lineHeight;
+    nodes.forEach(function (node) {
+      var copy = node.cloneNode(true);
+      Array.prototype.forEach.call(copy.querySelectorAll(".no-snapshot, .tooltip, [visibility='visible'][pointer-events='none']"), function (n) {
+        n.parentNode.removeChild(n);
+      });
+      frame.appendChild(copy);
+    });
+    // Measured off screen, with the page's layout.
+    var host = el("div", { class: "snapshot-host", "aria-hidden": "true" }, [frame]);
+    document.body.appendChild(host);
+    var w = Math.ceil(frame.getBoundingClientRect().width), h = Math.ceil(frame.getBoundingClientRect().height);
+    document.body.removeChild(host);
+    var scale = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    var css = Array.prototype.map.call(document.querySelectorAll("style"), function (s) { return s.textContent; }).join("\n");
+    var root = document.documentElement, theme = root.getAttribute("data-theme");
+    var markup = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + w * scale + "\" height=\"" + h * scale + "\" viewBox=\"0 0 " + w + " " + h + "\"" +
+      (theme ? " data-theme=\"" + theme + "\"" : "") + " class=\"" + root.className + "\" lang=\"" + root.lang + "\">" +
+      "<style><![CDATA[" + css.split("]]>").join("]]]]><![CDATA[>") + "]]></style>" +
+      "<foreignObject x=\"0\" y=\"0\" width=\"" + w + "\" height=\"" + h + "\">" + new XMLSerializer().serializeToString(frame) + "</foreignObject></svg>";
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () {
+        var canvas = document.createElement("canvas");
+        canvas.width = w * scale;
+        canvas.height = h * scale;
+        try {
+          canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+          canvas.toBlob(function (blob) { if (blob) resolve(blob); else reject(new Error("canvas")); }, "image/png");
+        } catch (err) { reject(err); }
+      };
+      img.onerror = function () { reject(new Error("image")); };
+      img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(markup);
+    });
+  }
+
+  // Writes the PNG to the clipboard within the click, which the browser
+  // requires, while the image is still being drawn.
+  function copySnapshot(nodes) {
+    var width = nodes.reduce(function (max, n) { return Math.max(max, n.getBoundingClientRect().width); }, 0);
+    var png;
+    try { png = snapshotPng(nodes, Math.ceil(width) + 24); } catch (err) { png = Promise.reject(err); }
+    var write;
+    try { write = navigator.clipboard.write([new ClipboardItem({ "image/png": png })]); } catch (err) { write = Promise.reject(err); }
+    png.catch(function () {});
+    write.then(function () { toast(translate("snapshot_copied")); }, function (err) {
+      toast(translate("snapshot_failed", (err && (err.message || err.name)) || String(err)));
+    });
+  }
+
+  // The button for all cards, beside "Refresh all".
+  function renderCardsSnapshot() {
+    var old = $("snapshot-cards"), button = snapshotButton("snapshot_cards", function () { return [$("accounts")]; });
+    button.id = "snapshot-cards";
+    if (old) old.parentNode.replaceChild(button, old);
+    else $("refresh-all").parentNode.insertBefore(button, $("refresh-all"));
+    if (!$("mask-cards")) {
+      var eye = maskButton();
+      eye.id = "mask-cards";
+      button.parentNode.insertBefore(eye, button);
+    }
+  }
+
+  // A camera button that copies a screenshot of the nodes nodesOf returns.
+  function snapshotButton(label, nodesOf) {
+    var ok = canCopyImage();
+    var icon = svg("svg", { viewBox: "0 0 16 16", width: 15, height: 15, "aria-hidden": "true" });
+    icon.appendChild(svg("path", { d: "M2 5.5A1.5 1.5 0 0 1 3.5 4h1.6l1.1-1.5h3.6L10.9 4h1.6A1.5 1.5 0 0 1 14 5.5v6a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z" }));
+    icon.appendChild(svg("circle", { cx: 8, cy: 8.5, r: 2.4 }));
+    var text = ok ? translate(label) : translate("snapshot_unsupported");
+    return el("button", { type: "button", class: "btn btn-ghost btn-icon snapshot no-snapshot", title: text, "aria-label": text, disabled: !ok,
+      onclick: function () { copySnapshot(nodesOf()); } }, [icon]);
+  }
+
+  // ---- Status rendering ----
+
   function renderHeader() {
     var state = $("state");
     clear(state);
-    if (!status.enabled) state.appendChild(badge("muted", "已停用"));
-    else if (!status.running) state.appendChild(badge("warning", "启动中"));
-    else state.appendChild(badge("success", "运行中"));
+    if (!status.enabled) state.appendChild(badge("muted", translate("state_disabled")));
+    else if (!status.running) state.appendChild(badge("warning", translate("state_starting")));
+    else state.appendChild(badge("success", translate("state_running")));
     var parts = [];
     var last = parseTime(status.last_poll), next = parseTime(status.next_poll);
-    if (last) parts.push("上次查询 " + fmtClock(last) + "（" + fmtAgo(last) + "）");
-    if (next) parts.push("下次 " + fmtClock(next) + "（" + fmtIn(next) + "）");
+    if (last) parts.push(translate("last_poll", fmtClock(last), fmtAgo(last)));
+    if (next) parts.push(translate("next_poll", fmtClock(next), fmtIn(next)));
     var meta = $("meta");
     clear(meta);
-    meta.appendChild(document.createTextNode("v" + (status.version || "")));
+    meta.appendChild(document.createTextNode("v" + status.version));
+    if (status.latest_version && status.release_url) meta.appendChild(updateLink());
     if (parts.length) meta.appendChild(document.createTextNode(" · " + parts.join(" · ")));
   }
 
+  // A green ring with a green up arrow after the version, linking to the newer
+  // release.
+  function updateLink() {
+    var hint = translate("update_hint", status.latest_version);
+    var icon = svg("svg", { viewBox: "0 0 16 16", width: 14, height: 14, "aria-hidden": "true" });
+    icon.appendChild(svg("circle", { cx: 8, cy: 8, r: 7.25 }));
+    icon.appendChild(svg("path", { d: "M8 11.5V4.5M5 7.5l3-3 3 3" }));
+    var link = el("a", { class: "update", href: status.release_url, target: "_blank", rel: "noopener", title: hint, "aria-label": hint });
+    link.appendChild(icon);
+    return link;
+  }
+
   function notice(text) {
-    return el("div", { class: "notice" }, [el("span", { class: "notice-icon", text: "!" }), el("span", { text: text })]);
+    return el("div", { class: "notice" }, [el("span", { class: "notice-icon", text: "!" }), el("span", {}, maskedNodes(text))]);
   }
 
   function renderNotices() {
     var box = $("notices");
     clear(box);
-    var errors = (status && status.errors) || {};
-    if (errors.config_error) box.appendChild(notice("配置无法解析，仍在使用上一份配置：" + errors.config_error));
-    if (errors.list_error) box.appendChild(notice(errors.list_error));
-    if (errors.models_error) box.appendChild(notice("模型列表不可用：" + errors.models_error));
-    if (errors.notify_error) box.appendChild(notice("通知设置无效，未启用：" + errors.notify_error));
+    if (status.config_error) box.appendChild(notice(translate("config_error", status.config_error)));
+    if (status.lock_error) box.appendChild(notice(status.lock_error));
+    if (status.list_error) box.appendChild(notice(status.list_error));
+    if (status.models_error) box.appendChild(notice(translate("models_error", status.models_error)));
+    if (status.notify_error) box.appendChild(notice(translate("notify_error", status.notify_error)));
+    if (status.mcp && status.mcp.enabled && !status.mcp.running && status.mcp.error) box.appendChild(notice(translate("mcp_error", status.mcp.error)));
+    // No channel is how notifications are turned off, so it is a hint in the
+    // settings rather than a notice.
+    var telegram = status.config && status.config.telegram;
+    $("notify-off").hidden = !!(telegram && telegram.enabled && telegram.bot_token_set);
+    if (status.config && status.config.ignition && status.config.ignition.enabled && !status.config.models_api_key) {
+      box.appendChild(notice(translate("no_models_key")));
+    }
   }
 
-  // ---- Quota cards ----
   // An empty window shows no fill: its whole track turns dark red and
   // striped instead.
-  function quotaRow(w, index) {
+  function quotaRow(group, w, index, account) {
     var remaining = Math.max(0, Math.min(100, w.remaining));
     var level = quotaLevel(w.remaining);
     var reset = parseTime(w.reset);
@@ -262,183 +1018,720 @@
       meta.push(el("span", { class: "quota-countdown" + (left > 0 && left <= 3600000 ? " soon" : ""), text: fmtCountdown(left) }));
     }
     return el("div", { class: "quota-row" }, [
-      el("div", {}, [
-        el("span", { class: "quota-name", text: w.label || (w.short === "5h" ? "5 小时窗口" : w.short === "7d" ? "7 天窗口" : w.id || "") }),
+      el("div", { class: "quota-row-head" }, [
+        el("span", { class: "quota-name", text: windowName(w) }),
         el("span", { class: "quota-meta" }, meta)
       ]),
-      el("div", { class: "bar" + (level === "empty" ? " bar-empty" : ""), role: "meter", "aria-valuemin": "0", "aria-valuemax": "100",
-        "aria-valuenow": String(Math.round(remaining)), "aria-label": (w.label || "") + " 剩余" },
-        level === "empty" ? [] : [el("div", { class: "fill fill-" + level, style: "width:" + remaining + "%" })])
+      el("div", { class: "quota-bar" + (level === "empty" ? " bar-empty" : ""), role: "meter", "aria-valuemin": "0", "aria-valuemax": "100",
+        "aria-valuenow": String(Math.round(remaining)), "aria-label": translate("remaining_aria", masked ? accountAlias(account) : group.label, windowName(w)) }, [
+        level === "empty" ? null : el("span", { class: "quota-fill fill-" + level, style: "width:" + remaining + "%;--meter-index:" + index })
+      ])
     ]);
   }
 
-  function freshness(windows) {
+  function freshness(group) {
     var latest = null, source = "";
-    (windows || []).forEach(function (w) {
+    (group.windows || []).forEach(function (w) {
       var t = parseTime(w.observed_at);
       if (t && (!latest || t > latest)) { latest = t; source = w.source; }
     });
     if (!latest) return null;
     return el("div", { class: "group-foot" }, [
-      el("span", { class: "source source-" + source, text: source === "passive" ? "被动" : "主动" }),
-      el("span", { text: "更新于 " + fmtAgo(latest) + "前" })
+      el("span", { class: "source source-" + source, text: source === "passive" ? translate("source_passive") : translate("source_active") }),
+      el("span", { text: translate("updated", fmtAgo(latest)) })
     ]);
   }
 
-  var WINDOW_ORDER = { "5h": 0, "7d": 1 };
+  // ---- Account order ----
 
-  function sortedWindows(account) {
-    return (account.windows || []).slice().sort(function (a, b) {
-      var ra = WINDOW_ORDER[a.kind || a.short] !== undefined ? WINDOW_ORDER[a.kind || a.short] : 2;
-      var rb = WINDOW_ORDER[b.kind || b.short] !== undefined ? WINDOW_ORDER[b.kind || b.short] : 2;
-      return ra - rb;
+  // Cards follow account_order, a list of credential file names, the key
+  // account_weights uses too. The status API already returns the accounts
+  // in this order; the page sorts them again by the config it last read, so
+  // a new order shows at once instead of after the plugin applies it.
+  // Accounts not in the list keep their order from the API, after the
+  // listed ones. pendingOrder is an order being saved; it stays in place
+  // over configs read before that save finishes.
+  var pendingOrder = null;
+
+  function sortAccounts() {
+    if (!status || !status.accounts) return;
+    var order = Array.isArray(rawConfig.account_order) ? rawConfig.account_order : [];
+    var pos = {};
+    order.forEach(function (name, i) { if (!Object.prototype.hasOwnProperty.call(pos, name)) pos[name] = i; });
+    var rank = function (a) { return Object.prototype.hasOwnProperty.call(pos, a.name) ? pos[a.name] : order.length; };
+    status.accounts = status.accounts.map(function (a, i) { return { a: a, i: i }; }).sort(function (x, y) {
+      return (rank(x.a) - rank(y.a)) || (x.i - y.i);
+    }).map(function (x) { return x.a; });
+  }
+
+  // Saves the full list of credential file names in their new order through
+  // the save queue. Cards and chart show it at once.
+  function saveAccountOrder(names) {
+    var say = claimState($("account-order-state"));
+    pendingOrder = names.slice();
+    rawConfig.account_order = names.slice();
+    sortAccounts();
+    renderAccounts();
+    if (history) renderChart();
+    saveQueue = saveQueue.then(function () {
+      return patchConfig({ account_order: names }).then(function (token) {
+        showApplied(say, token);
+        if (pendingOrder && pendingOrder.join("\n") === names.join("\n")) pendingOrder = null;
+        return loadConfig();
+      }).catch(function (err) {
+        if (pendingOrder && pendingOrder.join("\n") === names.join("\n")) pendingOrder = null;
+        say("failed", err.message);
+        if (err.message !== "unauthorized") toast(translate("order_failed", err.message));
+        return loadConfig().catch(function () {}).then(function () {
+          sortAccounts();
+          renderAccounts();
+          if (history) renderChart();
+        });
+      });
     });
   }
 
-  function accountTitle(account) {
-    return account.title || account.auth_id || ("账号 " + (account.auth_index != null ? account.auth_index : ""));
+  function reducedMotion() { return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches; }
+
+  function accountRows() { return Array.prototype.slice.call($("account-rows").children); }
+
+  // FLIP begins at each row's current painted position, even if its previous
+  // move is unfinished. Drop targets use offsetTop instead, without transforms.
+  function animateAccountRows(change) {
+    var rows = accountRows(), before = rows.map(function (row) { return row.getBoundingClientRect().top; });
+    rows.forEach(function (row) { if (row.orderAnimation) row.orderAnimation.cancel(); });
+    change();
+    rows.forEach(function (row, i) {
+      if (row.classList.contains("account-placeholder")) return;
+      var dy = before[i] - row.getBoundingClientRect().top;
+      if (dy && row.animate && !reducedMotion()) {
+        row.orderAnimation = row.animate([{ transform: "translateY(" + dy + "px)" }, { transform: "none" }],
+          { duration: 180, easing: getComputedStyle(row).getPropertyValue("--ease-out-strong").trim() });
+      }
+    });
+  }
+
+  // The original row is a placeholder; an inert fixed copy follows the
+  // pointer. Status refreshes wait through both dragging and settling.
+  var accountDrag = null;
+  var accountsBehind = false;
+
+  function startAccountDrag(e, row, handle) {
+    if (e.button !== 0 || e.isPrimary === false || accountDrag) return;
+    e.preventDefault();
+    var active = document.activeElement;
+    if (active && active.closest("#account-rows") && active.tagName === "INPUT") active.blur();
+    if (row.orderAnimation) row.orderAnimation.cancel();
+    var rect = row.getBoundingClientRect(), copy = row.cloneNode(true);
+    copy.classList.add("account-floating");
+    copy.setAttribute("aria-hidden", "true");
+    copy.setAttribute("inert", "");
+    copy.style.width = rect.width + "px";
+    copy.style.height = rect.height + "px";
+    copy.style.left = rect.left + "px";
+    copy.style.top = rect.top + "px";
+    $("settings").appendChild(copy);
+    accountDrag = { row: row, copy: copy, handle: handle, pointer: e.pointerId,
+      before: accountRows(), top: rect.top, grab: e.clientY - rect.top, y: e.clientY, settling: false };
+    row.classList.add("account-placeholder");
+    $("account-rows").classList.add("sorting");
+    handle.setPointerCapture(e.pointerId);
+    document.addEventListener("pointermove", moveAccountDrag);
+    document.addEventListener("pointerup", endAccountDrag);
+    document.addEventListener("pointercancel", endAccountDrag);
+    document.addEventListener("keydown", cancelAccountDrag);
+    window.addEventListener("scroll", scrollAccountDrag, true);
+  }
+
+  // The index is determined by the other rows' layout midpoints. Animated
+  // transforms never feed back into hit testing, so a stationary pointer
+  // cannot make rows oscillate between positions.
+  function accountDropIndex(rows, y, top) {
+    var index = 0;
+    rows.forEach(function (row) { if (y > top + row.offsetTop + row.offsetHeight / 2) index++; });
+    return index;
+  }
+
+  function moveAccountDrag(e) {
+    var drag = accountDrag;
+    if (!drag || drag.settling || e.pointerId !== drag.pointer) return;
+    drag.y = e.clientY;
+    drag.copy.style.transform = "translateY(" + (e.clientY - drag.grab - drag.top) + "px)";
+    var box = $("account-rows"), rows = accountRows().filter(function (row) { return row !== drag.row; });
+    var index = accountDropIndex(rows, e.clientY, box.getBoundingClientRect().top);
+    var next = rows[index] || null;
+    if (drag.row.nextElementSibling !== next) animateAccountRows(function () { box.insertBefore(drag.row, next); });
+  }
+
+  function scrollAccountDrag() {
+    if (accountDrag) moveAccountDrag({ pointerId: accountDrag.pointer, clientY: accountDrag.y });
+  }
+
+  function cancelAccountDrag(e) {
+    if (e.key !== "Escape" || !accountDrag) return;
+    e.preventDefault();
+    endAccountDrag({ pointerId: accountDrag.pointer, type: "pointercancel" });
+  }
+
+  function endAccountDrag(e) {
+    var drag = accountDrag;
+    if (!drag || drag.settling || e.pointerId !== drag.pointer) return;
+    drag.settling = true;
+    document.removeEventListener("pointermove", moveAccountDrag);
+    document.removeEventListener("pointerup", endAccountDrag);
+    document.removeEventListener("pointercancel", endAccountDrag);
+    document.removeEventListener("keydown", cancelAccountDrag);
+    window.removeEventListener("scroll", scrollAccountDrag, true);
+    if (drag.handle.hasPointerCapture(drag.pointer)) drag.handle.releasePointerCapture(drag.pointer);
+    var cancelled = e.type === "pointercancel", box = $("account-rows");
+    if (cancelled) animateAccountRows(function () { drag.before.forEach(function (row) { box.appendChild(row); }); });
+    var rect = drag.row.getBoundingClientRect(), from = drag.copy.getBoundingClientRect();
+    var finish = function () {
+      drag.copy.remove();
+      drag.row.classList.remove("account-placeholder");
+      box.classList.remove("sorting");
+      var names = accountRows().map(function (row) { return row.getAttribute("data-account"); });
+      var before = drag.before.map(function (row) { return row.getAttribute("data-account"); });
+      accountDrag = null;
+      if (!cancelled && names.join("\n") !== before.join("\n")) saveAccountOrder(names);
+      else if (accountsBehind) renderAccounts();
+      else renderAccountSettings();
+    };
+    if (drag.copy.animate && !reducedMotion()) {
+      var animation = drag.copy.animate([
+        { transform: "translateY(" + (from.top - drag.top) + "px)" },
+        { transform: "translate(" + (rect.left - from.left) + "px," + (rect.top - drag.top) + "px)" }
+      ], { duration: 180, easing: getComputedStyle(drag.copy).getPropertyValue("--ease-out-strong").trim(), fill: "forwards" });
+      animation.finished.then(finish, finish);
+    } else finish();
+  }
+
+  function makeAccountSetting(account) {
+    var row = el("div", { class: "account-setting", "data-account": account.name });
+    var handle = el("span", { class: "drag-handle", "aria-hidden": "true" });
+    handle.addEventListener("pointerdown", function (e) { startAccountDrag(e, row, handle); });
+    row.appendChild(handle);
+    row.appendChild(el("span", { class: "type-badge" }));
+    row.appendChild(el("div", { class: "account-identity" }, [
+      el("span", { class: "strong " + SENSITIVE }), el("span", { class: "account-email " + SENSITIVE })
+    ]));
+    ["name", "weight"].forEach(function (kind) {
+      var input = el("input", { type: kind === "weight" ? "number" : "text", class: SENSITIVE,
+        "data-account-field": kind, autocomplete: "off", spellcheck: "false" });
+      if (kind === "weight") { input.step = "any"; input.min = "0"; }
+      input.addEventListener("change", function () { saveAccountField(input, row); });
+      row.appendChild(el("label", {}, [el("span", { class: "field-label" }, [
+        el("span", { text: translate(kind === "name" ? "rename" : "weight") })
+      ]), input]));
+    });
+    return row;
+  }
+
+  function renderAccountSettings() {
+    if (!$("account-rows")) return;
+    if (accountDrag) { accountsBehind = true; return; }
+    var box = $("account-rows"), counts = {}, existing = new Map();
+    var active = box.contains(document.activeElement) ? document.activeElement : null;
+    var selection = active && active.type === "text" ? [active.selectionStart, active.selectionEnd] : null;
+    status.accounts.forEach(function (a) { counts[a.provider] = (counts[a.provider] || 0) + 1; });
+    accountRows().forEach(function (row) { existing.set(row.getAttribute("data-account"), row); });
+    status.accounts.forEach(function (account, index) {
+      var row = existing.get(account.name) || makeAccountSetting(account);
+      existing.delete(account.name);
+      row.account = account;
+      // Avoid moving unchanged nodes: reparenting a focused input blurs it.
+      if (box.children[index] !== row) box.insertBefore(row, box.children[index] || null);
+      var spoken = masked ? accountAlias(index) : account.email || account.name;
+      var badge = row.querySelector(".type-badge");
+      badge.className = "type-badge type-" + account.provider;
+      badge.textContent = providerTitle(account.provider);
+      var identity = row.querySelector(".account-identity");
+      identity.firstChild.textContent = account.title;
+      identity.lastChild.textContent = account.email || account.name;
+      [identity.firstChild, identity.lastChild].forEach(function (node) {
+        if (masked) node.removeAttribute("title"); else node.title = node.textContent;
+      });
+      row.querySelector(".drag-handle").title = translate("drag_handle");
+      Array.prototype.forEach.call(row.querySelectorAll("[data-account-field]"), function (input) {
+        var kind = input.getAttribute("data-account-field"), weight = kind === "weight";
+        input.parentNode.firstChild.firstChild.textContent = translate(weight ? "weight" : "rename");
+        input.setAttribute("aria-label", translate(weight ? "account_weight_aria" : "account_name_aria", spoken));
+        input.parentNode.classList.toggle("account-weight-empty", weight && counts[account.provider] <= 1);
+        input.disabled = weight && counts[account.provider] <= 1;
+        saveEntry(saveHost(input), input);
+        var saved = rawConfig.account_weights && Number(rawConfig.account_weights[account.name]);
+        var value = weight ? (saved > 0 ? fmtWeight(saved) : "") : (account.note || "").split(/\r?\n/)[0].trim();
+        if (!input.accountDirty && !input.accountPending && document.activeElement !== input) {
+          input.value = value;
+          input.accountSaved = value;
+        }
+        if (weight) input.placeholder = translate("weight_default", fmtWeight(Number(account.default_weight) > 0 ? Number(account.default_weight) : 1));
+      });
+    });
+    existing.forEach(function (row) { row.remove(); });
+    if (active && active.isConnected && document.activeElement !== active) {
+      active.focus({ preventScroll: true });
+      if (selection) active.setSelectionRange(selection[0], selection[1]);
+    }
   }
 
   function renderAccounts() {
+    // Rebuilding the cards would drop the one being dragged.
+    if (accountDrag) { accountsBehind = true; return; }
+    accountsBehind = false;
+    renderAccountSettings();
     var box = $("accounts");
     clear(box);
-    var accounts = (status && status.accounts) || [];
-    if (!accounts.length) {
-      box.appendChild(el("p", { class: "empty", text: status.running ? "暂无额度数据。插件启动后会从 CPA 的使用记录和主动查询中填充。" : "CPA 启动约 20 秒后开始第一次查询。" }));
+    if (!status.accounts.length) {
+      var titles = providerList().map(function (p) { return p.title; });
+      box.appendChild(el("p", { class: "empty", text: status.running ? translate("no_accounts", listText(titles)) : translate("first_query") }));
       return;
     }
-    accounts.forEach(function (account) {
-      var card = el("div", { class: "account" });
-      var head = el("div", { class: "account-head" }, [
-        el("span", { class: "account-name", text: accountTitle(account) })
-      ]);
-      if (account.provider) head.appendChild(el("span", { class: "badge badge-muted", text: account.provider }));
-      card.appendChild(head);
-      if (account.auth_id && account.auth_id !== account.title) {
-        card.appendChild(el("div", { class: "account-id", text: account.auth_id }));
-      }
-      sortedWindows(account).forEach(function (w, i) { card.appendChild(quotaRow(w, i)); });
-      var foot = freshness(account.windows);
-      if (foot) card.appendChild(foot);
+    var meterIndex = 0;
+    // Weights only matter for a total, so they show on services with
+    // several accounts.
+    var counts = {};
+    status.accounts.forEach(function (a) { counts[a.provider] = (counts[a.provider] || 0) + 1; });
+    status.accounts.forEach(function (account, index) {
+      var card = el("div", { class: "card account", "data-account": account.name });
+      var pooledAccount = counts[account.provider] > 1, weight = accountWeight(account);
+      var refresh = el("button", { type: "button", class: "btn btn-ghost btn-sm no-snapshot", text: translate("refresh"), onclick: function () {
+        runAction(refresh, API + "/refresh", { auth_index: account.auth_index }, translate("refreshed", account.title));
+      } });
+      card.appendChild(el("div", { class: "account-head" }, [
+        el("span", { class: "type-badge type-" + account.provider }, maskedNodes(account.title).concat(
+          pooledAccount && weight !== 1 ? [el("span", { class: "account-weight", title: translate("weight"), text: "×" + fmtWeight(weight) })] : []
+        )),
+        el("span", { class: "account-email " + SENSITIVE, title: masked ? null : account.email || account.name, text: account.email || account.name })
+      ]));
+      (account.groups || []).forEach(function (group) {
+        var block = el("div", { class: "quota-group" });
+        if (group.source_label && group.source_label !== providerTitle(account.provider)) {
+          block.appendChild(el("div", { class: "group-title", text: group.source_label }));
+        }
+        (group.windows || []).forEach(function (w) { block.appendChild(quotaRow(group, w, meterIndex++, index)); });
+        var foot = freshness(group);
+        if (foot) block.appendChild(foot);
+        card.appendChild(block);
+      });
       var cooldown = parseTime(account.cooldown_until);
       if (cooldown && account.stale_cooldown) {
-        card.appendChild(el("div", { class: "error-text", text: "额度已恢复，但 CPA 仍冷却到 " + fmtDateTime(cooldown) + "，期间的请求和点火都会被拒绝；在 CPA 管理中心清除这个账号的冷却。" }));
+        card.appendChild(el("div", { class: "error-text", text: translate("cooldown_stale", fmtDateTime(cooldown)) }));
       } else if (cooldown) {
-        card.appendChild(el("div", { class: "cell-note", text: "CPA 冷却到 " + fmtDateTime(cooldown) + "（" + fmtIn(cooldown) + "）" }));
+        card.appendChild(el("div", { class: "cell-note", text: translate("cooldown", fmtDateTime(cooldown), fmtIn(cooldown)) }));
       }
-      var problem = account.error || account.credential_problem || "";
-      if (problem) card.appendChild(el("div", { class: "error-text", text: problem }));
-      var refresh = el("button", { type: "button", class: "button secondary sm", text: "刷新", onclick: function () {
-        runAction(refresh, API + "/refresh", { auth_index: account.auth_index }, "已刷新 " + accountTitle(account));
-      } });
+      if (account.error) card.appendChild(el("div", { class: "error-text" }, maskedNodes(account.error)));
       card.appendChild(el("div", { class: "account-head cell-note" }, [
-        el("span", { class: "cell-note", text: account.plan ? "套餐：" + account.plan : "" }),
-        refresh
+        el("span", { class: "cell-note", text: account.plan ? translate("plan", account.plan) : "" }),
+        refresh,
+        snapshotButton("snapshot_card", function () { return [card]; })
       ]));
       box.appendChild(card);
     });
   }
 
-  // ---- Ignition targets ----
   function targetStatus(t) {
-    if (t.status === "circuit") {
-      var until = parseTime(t.circuit_until);
-      return { kind: "failure", text: "熔断", title: until ? "熔断到 " + fmtDateTime(until) : (t.last_error || "") };
+    var tr = translate;
+    if (t.blocked_window) {
+      var until = parseTime(t.blocked_until);
+      var blocked = t.blocked_window === "5h" || t.blocked_window === "7d" ? tr("blocked_" + t.blocked_window) : tr("blocked_other", t.blocked_window);
+      return { kind: "muted", text: blocked, title: until ? tr("blocked_until", fmtDateTime(until)) : tr("blocked_wait") };
     }
-    if (t.status === "cooling") return { kind: "warning", text: "冷却中", title: t.last_error || "" };
-    if (t.status === "paused") return { kind: "muted", text: "暂停", title: t.last_error || "" };
-    if (t.consecutive_failures > 0) return { kind: "warning", text: "失败 " + t.consecutive_failures + " 次", title: t.last_error || "" };
-    return { kind: "success", text: "正常" };
+    var circuit = parseTime(t.circuit_until);
+    if (circuit) return { kind: "failure", text: tr("paused_until", fmtDateTime(circuit)), title: t.circuit_reason };
+    if (t.consecutive_failures > 0) return { kind: "warning", text: tr("failures", t.consecutive_failures), title: t.last_error };
+    if (t.rolling) return { kind: "muted", text: tr("rolling") };
+    return { kind: "success", text: tr("normal") };
   }
 
+  // The ignition card shows only while ignition is on.
   function renderTargets() {
     var body = $("targets");
     clear(body);
     var ignition = (status.config && status.config.ignition) || {};
-    var endMinutes = (Number(ignition.end_hour) || 0) * 60 + (Number(ignition.end_grace_minutes) || 0);
-    $("ignition-note").textContent = "每天 " + pad(Number(ignition.start_hour) || 0) + ":00 开始，之后在每次重置后 " +
-      (Number(ignition.grace_seconds) || 0) + " 秒点火，最晚到 " + pad(Math.floor(endMinutes / 60) % 24) + ":" + pad(endMinutes % 60) + "。";
-    var targets = (status && status.targets) || [];
-    if (!targets.length) {
-      body.appendChild(el("tr", {}, [el("td", { colspan: "6", class: "empty", text: "没有启用点火的目标。" })]));
+    var endMinutes = (ignition.end_hour || 0) * 60 + (ignition.end_grace_minutes || 0);
+    $("ignition-note").textContent = translate("ignition_note", pad(ignition.start_hour), ignition.grace_seconds, pad(Math.floor(endMinutes / 60) % 24) + ":" + pad(endMinutes % 60));
+    if (!status.targets.length) {
+      body.appendChild(el("tr", {}, [el("td", { colspan: "7", class: "empty", text: translate("no_targets") })]));
       return;
     }
-    targets.forEach(function (t) {
+    status.targets.forEach(function (t) {
       var st = targetStatus(t);
-      var rowStatus = el("div", { class: "row-status" });
-      var resetBtn = el("button", { type: "button", class: "button secondary sm", text: "立即重置", onclick: function () {
-        resetBtn.disabled = true; igniteBtn.disabled = true;
-        rowStatus.className = "row-status";
-        rowStatus.textContent = "正在提交重置请求…";
-        api("POST", API + "/reset", { auth_index: t.auth_index }).then(function (data) {
-          if (data.status) { status = data.status; renderStatus(); }
-          rowStatus.textContent = data.ok === false ? "重置失败：" + (data.error || "") : "重置请求已提交";
-          if (data.ok === false) rowStatus.classList.add("error");
-          loadHistory(true);
-        }).catch(function (err) {
-          if (err.message !== "unauthorized") { rowStatus.textContent = "重置失败：" + err.message; rowStatus.classList.add("error"); }
-        }).then(function () { resetBtn.disabled = false; igniteBtn.disabled = false; });
+      var resetButton = el("button", { type: "button", class: "btn btn-secondary btn-sm", text: translate("reset_now"), onclick: function () {
+        runAction(resetButton, API + "/reset", { auth_index: t.auth_index }, translate("reset_done", t.label));
       } });
-      var igniteBtn = el("button", { type: "button", class: "button primary sm", text: "立即点火", onclick: function () {
-        if (!confirm("立即向 " + (t.label || accountTitle({ auth_index: t.auth_index })) + " 发送一次点火请求？这会开始一个新的 5 小时窗口。")) return;
-        resetBtn.disabled = true; igniteBtn.disabled = true;
-        rowStatus.className = "row-status";
-        rowStatus.textContent = "正在提交点火请求…";
-        api("POST", API + "/ignite", { auth_index: t.auth_index }).then(function (data) {
-          if (data.status) { status = data.status; renderStatus(); }
-          rowStatus.textContent = data.ok === false ? "点火失败：" + (data.error || "") : "点火请求已提交";
-          if (data.ok === false) rowStatus.classList.add("error");
-          loadHistory(true);
-        }).catch(function (err) {
-          if (err.message !== "unauthorized") { rowStatus.textContent = "点火失败：" + err.message; rowStatus.classList.add("error"); }
-        }).then(function () { resetBtn.disabled = false; igniteBtn.disabled = false; });
+      var button = el("button", { type: "button", class: "btn btn-secondary btn-sm", text: translate("ignite_now"), onclick: function () {
+        if (!confirm(translate("ignite_confirm", t.label))) return;
+        runAction(button, API + "/ignite", { target: t.key }, translate("ignited", t.label));
       } });
-      var reset = parseTime(t.reset), last = parseTime(t.last_success);
+      var next = parseTime(t.next_due), reset = parseTime(t.reset), last = parseTime(t.last_success);
       var statusCell = el("td", {}, [badge(st.kind, st.text)]);
-      if (st.title) statusCell.appendChild(el("div", { class: "cell-note", text: st.title }));
+      if (st.title) statusCell.appendChild(el("div", { class: "cell-note" }, maskedNodes(st.title)));
       body.appendChild(el("tr", {}, [
-        el("td", { class: "strong", text: t.label || ("账号 " + t.auth_index) }),
+        el("td", { class: "strong" }, maskedNodes(t.label)),
+        el("td", { class: "mono", text: next ? fmtDateTimeDay(next) : "—" }),
         el("td", { class: "mono", text: reset ? fmtDateTimeDay(reset) : "—" }),
         el("td", { class: "mono", text: last ? fmtDateTime(last) : "—" }),
         el("td", { class: "mono", text: t.last_model || "—" }),
         statusCell,
-        el("td", { class: "actions" }, [el("div", { class: "row-actions" }, [resetBtn, igniteBtn]), rowStatus])
+        el("td", { class: "actions" }, [resetButton, button])
       ]));
     });
   }
 
   // ---- Events ----
-  var EVENT_STYLE = {
-    ignite: ["success", "点火成功"], ignite_manual: ["success", "手动点火"], ignite_failed: ["warning", "点火失败"],
-    ignite_paused: ["failure", "点火暂停"], model_refused: ["warning", "模型被拒"], cooldown_stale: ["warning", "冷却未解除"],
-    plan_change: ["warning", "套餐变化"], notify: ["muted", "已推送"], notify_failed: ["warning", "推送失败"],
-    codex_reset: ["muted", "重置信号"], error: ["failure", "错误"], reset: ["success", "额度重置"],
-    exhausted: ["warning", "额度耗尽"], credential_invalid: ["failure", "凭证失效"],
-    credential_suspended: ["failure", "账号停用"], credential_restored: ["success", "凭证恢复"],
-    ok: ["success", "完成"], info: ["muted", "事件"]
+
+  // Badge style per event type; the label is ev_<kind> in the dictionary.
+  var EVENT_TYPES = {
+    ignite: "success", ignite_manual: "success", ignite_failed: "warning", ignite_paused: "failure", model_refused: "warning",
+    cooldown_stale: "warning", plan_change: "warning", notify: "muted", notify_failed: "warning", codex_reset: "muted", error: "failure",
+    reset: "success", exhausted: "warning", credential_invalid: "failure", credential_restored: "success"
   };
   var EVENTS_COLLAPSED = 12, EVENTS_MAX = 100;
   var eventsExpanded = false;
+  // Resets of 5-hour windows, one per service every five hours, show only
+  // when chosen; the choice is kept in this browser.
   var EVENTS_STORE = "phoenix-events-5h";
   var showFiveHourResets = false;
   try { showFiveHourResets = localStorage.getItem(EVENTS_STORE) === "1"; } catch (err) {}
 
-  function isFiveHourReset(ev) {
-    var p = ev.params || {};
-    var win = String(p.window || ev.window || "");
-    if (win === "5h" || win === "five-hour") return ev.kind === "reset" || /重置/.test(ev.message || "");
-    if (ev.kind !== "reset") return false;
-    return /5\s*(h|小时)|five-hour/i.test((ev.message || "") + " " + (ev.kind || ""));
+  // The events a notification reports, by its notify_kind. A notification
+  // sent within NOTIFY_LAG of such an event of the same quota group shows
+  // as a mark on that event's row instead of a row of its own.
+  var NOTIFY_TRIGGERS = {
+    recovery: ["reset"], circuit: ["ignite_paused"], cooldown: ["cooldown_stale"], plan: ["plan_change"],
+    credential: ["credential_invalid"], suspended: ["credential_invalid"], rate_limited: ["credential_invalid"],
+    credential_ok: ["credential_restored"], codex_reset: ["codex_reset"]
+  };
+  // How long, in seconds, a notification may follow its event, as [from,
+  // to]. Notifications that failed are retried with later polls for up to
+  // an hour, so most kinds allow 70 minutes. Did Codex Reset records its
+  // event after sending, so its notifications come a little before it.
+  var NOTIFY_LAG = {
+    recovery: [0, 4200], circuit: [0, 4200], cooldown: [0, 4200], plan: [0, 4200], credential: [0, 4200],
+    suspended: [0, 4200], rate_limited: [0, 4200], credential_ok: [0, 4200], codex_reset: [-300, 300]
+  };
+  // An ignition pause this many seconds from a credential problem of the
+  // same quota group is part of it and shares its row.
+  var PAUSE_PAIR = 60;
+  // Error texts longer than this are cut in the list; the tooltip keeps all.
+  var ERROR_CHARS = 160;
+
+  function groupLabel(key) {
+    var label = "";
+    ((status && status.accounts) || []).forEach(function (a) {
+      (a.groups || []).forEach(function (g) { if (g.key === key) label = g.label; });
+    });
+    return label;
   }
 
-  function eventLabel(ev) {
-    if (ev.label) return ev.label;
-    if (ev.auth_index != null) {
-      var hit = null;
-      (status.accounts || []).forEach(function (a) { if (String(a.auth_index) === String(ev.auth_index)) hit = a; });
-      if (hit) return accountTitle(hit);
+  function retryText(seconds) {
+    return seconds < 60 ? translate("ev_seconds", seconds) : translate("ev_minutes", Math.round(seconds / 60));
+  }
+
+  function cutText(text, max) {
+    var chars = Array.from(text);
+    return chars.length > max ? chars.slice(0, max - 1).join("").replace(/\s+$/, "") + "…" : text;
+  }
+
+  // One line for an error text, which can hold a JSON body from the
+  // provider over many lines: the text before the body, then the status
+  // code, reason and message from it. Without a JSON body, the first line.
+  function errorSummary(text) {
+    text = String(text == null ? "" : text).trim();
+    var start = text.indexOf("{"), end = text.lastIndexOf("}"), body = null;
+    if (start >= 0 && end > start) {
+      try { body = JSON.parse(text.slice(start, end + 1)); } catch (err) { body = null; }
     }
+    if (!body || typeof body !== "object") {
+      var first = text.split(/\r?\n/).filter(function (line) { return line.trim(); })[0] || "";
+      return cutText(first.trim(), ERROR_CHARS);
+    }
+    var e = body.error && typeof body.error === "object" ? body.error : body;
+    var code = null, reason = "", message = "";
+    [e.code, e.status, body.status, body.code].forEach(function (v) {
+      if (code == null && (typeof v === "number" || /^\d{3}$/.test(String(v)))) code = String(v);
+    });
+    var http = text.slice(end + 1).match(/HTTP (\d{3})/) || text.slice(0, start).match(/HTTP (\d{3})/);
+    if (code == null && http) code = http[1];
+    (Array.isArray(e.details) ? e.details : []).forEach(function (d) {
+      if (!reason && d && typeof d.reason === "string") reason = d.reason;
+    });
+    [e.status, e.type, e.code, typeof body.error === "string" ? body.error : null].forEach(function (v) {
+      if (!reason && typeof v === "string" && v && !/^\d+$/.test(v)) reason = v;
+    });
+    [e.message, body.message, body.error_description, e.error_description].forEach(function (v) {
+      if (!message && typeof v === "string" && v.trim()) message = v.trim().split(/\r?\n/)[0];
+    });
+    var parts = [code != null ? "HTTP " + code : "", reason, message].filter(function (s) { return s; });
+    var prefix = text.slice(0, start).trim();
+    var line = parts.join(" · ");
+    if (prefix) line = prefix + (/[：:]$/.test(prefix) ? (/：$/.test(prefix) ? "" : " ") : " ") + line;
+    return cutText(line || text.split(/\r?\n/)[0].trim(), ERROR_CHARS);
+  }
+
+  // What a notification reports. Notifications recorded before notify_kind
+  // existed are told by their title, in either language; see
+  // internal/notify/text.go.
+  function notifyKind(ev) {
+    var p = ev.params || {};
+    if (p.notify_kind) return p.notify_kind;
+    var title = String(p.title || ev.detail || ev.message || "").replace(/^推送失败 /, "");
+    var starts = function (prefix) { return title.indexOf(prefix) === 0; };
+    if (/^(📅|✅) Codex /.test(title)) return "codex_reset";
+    if (starts("✅")) return "recovery";
+    if (title.indexOf("点火已暂停") >= 0 || title.indexOf("ignition paused") >= 0) return "circuit";
+    if (starts("🎫")) return "plan";
+    if (title.indexOf("CPA 仍在冷却") >= 0 || title.indexOf("CPA still cooling down") >= 0) return "cooldown";
+    if (starts("🟡") || starts("🔴")) return "quota";
+    if (starts("⏰")) return "reminder";
     return "";
+  }
+
+  // The kind ("5h", "7d" or "") and short label of the window of a reset or
+  // exhausted event. Events recorded without them have only the window ID.
+  function eventWindow(p) {
+    var id = String(p.window || "");
+    if (p.label) return { kind: p.kind || "", label: p.label };
+    var kind = id === "five-hour" || /-5h$/.test(id) ? "5h" : id === "seven-day" || id.indexOf("weekly") >= 0 ? "7d" : "";
+    return { kind: kind, label: kind || id };
+  }
+
+  // Whether two events concern the same quota group. Notifications and some
+  // events were recorded without the group and only have its label.
+  function sameSubject(a, b) {
+    if (a.group && b.group) return a.group === b.group;
+    return !!a.label && a.label === b.label;
+  }
+
+  function eventSeconds(ev) { var t = parseTime(ev.time); return t ? t.getTime() / 1000 : 0; }
+
+  // The rows of the event list, newest first like events: a notification
+  // that reports an event joins that event's row (pushes); one that reports
+  // none, such as a quota alert, stays a row of its own. A recovery joins
+  // the reset of each window it names, or without window names the latest
+  // reset and those of the same poll. Other notifications join their latest
+  // event. Resets of 5-hour windows are left out unless chosen, together
+  // with their notifications; hidden counts them.
+  function eventRows(events, showFiveHour) {
+    var rows = events.map(function (ev) { return { event: ev, t: eventSeconds(ev), pushes: [] }; });
+    // A credential problem found by ignition also pauses it: the pause
+    // joins the problem's row (paused), and so do its notifications.
+    rows.forEach(function (row) {
+      if (row.event.kind !== "ignite_paused") return;
+      var host = rows.filter(function (other) {
+        return other.event.kind === "credential_invalid" && !other.paused && Math.abs(other.t - row.t) <= PAUSE_PAIR && sameSubject(row.event, other.event);
+      }).sort(function (a, b) { return Math.abs(a.t - row.t) - Math.abs(b.t - row.t); })[0];
+      if (!host) return;
+      host.paused = row.event;
+      row.host = host;
+    });
+    rows.forEach(function (row) {
+      var ev = row.event;
+      if (ev.kind !== "notify" && ev.kind !== "notify_failed") return;
+      row.notifyKind = notifyKind(ev);
+      var triggers = NOTIFY_TRIGGERS[row.notifyKind];
+      if (!triggers) return;
+      var p = ev.params || {};
+      var windows = row.notifyKind === "recovery" && p.windows ? p.windows.split(",").map(function (w) { return w.trim(); }) : null;
+      var lag = NOTIFY_LAG[row.notifyKind];
+      // Did Codex Reset concerns no account: its events and notifications
+      // have no quota group.
+      var global = row.notifyKind === "codex_reset";
+      var hits = rows.filter(function (other) {
+        var o = other.event, dt = row.t - other.t;
+        if (triggers.indexOf(o.kind) < 0 || dt < lag[0] || dt > lag[1]) return false;
+        if (global ? ev.group || o.group : !sameSubject(ev, o)) return false;
+        return !windows || windows.indexOf((o.params || {}).window) >= 0;
+      }).sort(function (a, b) { return Math.abs(row.t - a.t) - Math.abs(row.t - b.t); })
+        .map(function (h) { return h.host || h; });
+      if (!hits.length) return;
+      var chosen;
+      if (windows) {
+        var seen = {};
+        chosen = hits.filter(function (h) {
+          var w = (h.event.params || {}).window;
+          if (seen[w]) return false;
+          seen[w] = true;
+          return true;
+        });
+      } else if (row.notifyKind === "recovery") {
+        chosen = hits.filter(function (h) { return Math.abs(hits[0].t - h.t) <= 60; });
+      } else chosen = [hits[0]];
+      chosen.forEach(function (h) { h.pushes.push(ev); });
+      row.merged = true;
+    });
+    var hidden = 0, fiveHour = 0;
+    var out = rows.filter(function (row) {
+      if (row.merged || row.host) return false;
+      var ev = row.event;
+      if (ev.kind === "reset" && eventWindow(ev.params || {}).kind === "5h") {
+        fiveHour++;
+        if (!showFiveHour) { hidden++; return false; }
+      }
+      return true;
+    });
+    return { rows: out, hidden: hidden, fiveHour: fiveHour };
+  }
+
+  // A notification title without the label the label column shows, such as
+  // "🟡 GPT · 5h 45%" under the label GPT.
+  function notifyTitle(title, label) {
+    title = String(title || "");
+    var at = label ? title.indexOf(label + " · ") : -1;
+    return at >= 0 && at <= 3 ? title.slice(0, at) + title.slice(at + label.length + 3) : title;
+  }
+
+  // How an event shows in the list, in the page language: the badge style
+  // and text, the label, a one-line detail, the full text for the tooltip
+  // (tip), an appeal link, and the texts of the detail that are sensitive
+  // as a whole (secrets): error texts from the provider, which may name an
+  // account. whole marks a detail that is sensitive as a whole: the detail
+  // of an error event, and of an older event without a label, whose message
+  // may name an account that no longer exists. Events written before params
+  // existed keep their stored Chinese text.
+  function eventView(ev, notifyKindOf, paused) {
+    var p = ev.params || {};
+    var known = EVENT_TYPES[ev.kind];
+    var view = {
+      style: known || (ev.level === "error" ? "failure" : ev.level === "warn" ? "warning" : "muted"),
+      badge: known ? translate("ev_" + ev.kind) : ev.kind,
+      label: ev.label || (ev.group ? groupLabel(ev.group) : ""),
+      detail: "", tip: "", secrets: [], whole: false, link: ""
+    };
+    // Masked, these details hide whole: errors, and older events without
+    // params that stored no label or whose text is a failure or warning,
+    // as their text may name accounts since removed or renamed. The label
+    // looked up from the current quota group does not count: it may differ
+    // from the name in the text.
+    view.whole = ev.kind === "error" || (!ev.params && (!ev.label || view.style === "failure" || view.style === "warning"));
+    var time = function (value) { return fmtDateTime(parseTime(value)); };
+    var error = function (summary, full) {
+      var line = summary || errorSummary(full);
+      view.secrets.push(line, String(full || ""));
+      return line;
+    };
+    if (!ev.params) {
+      var detail = ev.detail || ev.message || "";
+      if (!ev.detail && view.label && detail.indexOf(view.label + " ") === 0) detail = detail.slice(view.label.length + 1);
+      if (!ev.detail) detail = detail.replace(/^点火成功（(.+?)），下次重置 /, "$1 · 下次重置 ");
+      view.detail = errorSummary(detail);
+      view.tip = detail;
+      return view;
+    }
+    switch (ev.kind) {
+      case "ignite": case "ignite_manual":
+        view.detail = p.reset ? translate("ev_ignited", p.model, time(p.reset)) : p.model || "";
+        break;
+      case "ignite_failed":
+        // A manual ignition is not retried.
+        if (p.manual === "1") {
+          view.detail = error(p.summary, p.error);
+          view.tip = p.error || view.detail;
+          break;
+        }
+        view.detail = translate(p.cooldown ? "ev_retry_cooldown" : "ev_retry", retryText(Number(p.retry_seconds) || 0), error(p.summary, p.error));
+        view.tip = translate(p.cooldown ? "ev_retry_cooldown" : "ev_retry", retryText(Number(p.retry_seconds) || 0), p.error || "");
+        break;
+      case "ignite_paused":
+        // A pause for an invalid credential or a suspended account has no
+        // end; it lasts until the credential changes.
+        var pausedKey = parseTime(p.until) ? "ev_paused" : p.reason === "auth" || p.reason === "suspended" ? "ev_paused_" + p.reason : "";
+        var pausedLine = error(p.summary, p.error);
+        view.detail = !pausedKey ? pausedLine : pausedKey === "ev_paused" ? translate(pausedKey, time(p.until), pausedLine) : translate(pausedKey, pausedLine);
+        view.tip = !pausedKey ? p.error || pausedLine : pausedKey === "ev_paused" ? translate(pausedKey, time(p.until), p.error || "") : translate(pausedKey, p.error || "");
+        break;
+      case "model_refused":
+        view.detail = translate("ev_refused", p.model, p.fallback, p.hours);
+        break;
+      case "notify": case "notify_failed":
+        var kind = notifyKindOf || notifyKind(ev);
+        if (ev.kind === "notify" && (kind === "quota" || kind === "reminder")) view.badge = translate("ev_notify_" + kind);
+        if (!view.label && kind === "codex_reset") view.label = "Did Codex Reset";
+        var title = notifyTitle(p.title, view.label);
+        if (ev.kind === "notify") view.detail = title;
+        else {
+          view.detail = translate("ev_notify_failed_detail", title, error("", p.error));
+          view.tip = translate("ev_notify_failed_detail", p.title || "", p.error || "");
+        }
+        break;
+      case "cooldown_stale":
+        view.detail = translate("ev_cooldown", time(p.until));
+        break;
+      case "plan_change":
+        view.detail = p.from + " → " + p.to;
+        break;
+      case "codex_reset":
+        view.detail = translate("ev_codex_sent", p.count);
+        break;
+      case "reset": case "exhausted":
+        var win = eventWindow(p), left = pct(Number(p.remaining)), at = parseTime(p.reset);
+        view.detail = !at ? translate("ev_window_left", win.label, left)
+          : translate(ev.kind === "reset" ? "ev_window_next" : "ev_window_due", win.label, left, fmtDateTime(at));
+        break;
+      case "credential_invalid":
+        if (p.reason === "suspended" || p.reason === "rate_limited") view.badge = translate("ev_credential_" + p.reason);
+        var codes = [p.status ? "HTTP " + p.status : "", p.code].filter(Boolean).join(" · ");
+        var line = error(p.summary, p.error || codes);
+        // A problem found by ignition, or with its pause in the row, says
+        // that ignition is paused, until when for a rate limit.
+        var stops = paused || p.source === "ignite";
+        var until = parseTime(p.until) || parseTime(paused && (paused.params || {}).until);
+        if (stops) view.detail = until ? translate("ev_ignite_paused_until", line, fmtDateTime(until)) : translate("ev_ignite_paused_note", line);
+        else view.detail = p.reason === "rate_limited" && until ? translate("ev_limited_until", line, fmtDateTime(until)) : line;
+        // The tooltip adds the full error of the pause in the row.
+        view.tip = [[codes, p.summary].filter(Boolean).join(" · ") || line, p.appeal_url || "", paused && (paused.params || {}).error || ""]
+          .filter(Boolean).join("\n");
+        if (/^https?:\/\//i.test(p.appeal_url || "")) view.link = p.appeal_url;
+        break;
+      case "credential_restored":
+        view.detail = p.source === "ignite" || p.source === "query" ? translate("ev_source_" + p.source) : "";
+        break;
+      case "error":
+        view.detail = errorSummary(ev.detail || ev.message || "");
+        view.tip = ev.detail || ev.message || "";
+        break;
+      default:
+        view.detail = ev.detail || ev.message || "";
+    }
+    return view;
+  }
+
+  // The label and detail of an event, for the chart's tooltips.
+  function eventParts(ev) {
+    var view = eventView(ev);
+    return { label: view.label || "—", detail: view.detail };
+  }
+
+  // The label and detail of an event as nodes, with the account names
+  // marked SENSITIVE by what the fields mean: the label names the quota
+  // group of an account, so it is sensitive as a whole, and so is its text
+  // within the detail, such as in a notification title, and an error text
+  // from the provider.
+  function eventMasked(ev, view) {
+    view = view || eventView(ev);
+    var label = view.label ? [el("span", { class: SENSITIVE, text: view.label })] : [document.createTextNode("—")];
+    var detail = view.whole ? [el("span", { class: SENSITIVE, text: view.detail })] : maskedNodes(view.detail, [view.label].concat(view.secrets));
+    return { label: label, detail: detail };
+  }
+
+  // A mark after the detail for the notifications of an event: sent, or
+  // failed with the errors in its tooltip.
+  function pushMarks(pushes) {
+    var marks = [];
+    var sent = pushes.filter(function (ev) { return ev.kind === "notify"; });
+    var failed = pushes.filter(function (ev) { return ev.kind === "notify_failed"; });
+    if (sent.length) {
+      marks.push(el("span", { class: "event-mark", title: masked ? null : sent.map(function (ev) { return (ev.params || {}).title || ev.detail || ""; }).join("\n"),
+        text: translate("ev_notify") }));
+    }
+    if (failed.length) {
+      marks.push(el("span", { class: "event-mark failed", title: masked ? null : failed.map(function (ev) {
+        var p = ev.params || {};
+        return p.title ? translate("ev_notify_failed_detail", p.title, p.error || "") : ev.detail || ev.message || "";
+      }).join("\n"), text: translate("ev_notify_failed") }));
+    }
+    return marks;
   }
 
   function renderEvents() {
@@ -446,64 +1739,108 @@
     clear(list);
     var more = $("events-more");
     var filter = $("events-5h"), filterText = $("events-5h-label");
-    var events = ((status && status.events) || []).slice().sort(function (a, b) {
-      var ta = parseTime(a.time), tb = parseTime(b.time);
-      return (tb ? tb.getTime() : 0) - (ta ? ta.getTime() : 0);
-    });
-    var fiveHour = 0, hidden = 0;
-    var rows = events.filter(function (ev) {
-      if (isFiveHourReset(ev)) {
-        fiveHour++;
-        if (!showFiveHourResets) { hidden++; return false; }
-      }
-      return true;
-    });
+    var built = eventRows(status.events || [], showFiveHourResets);
     if (filter) {
       filter.checked = showFiveHourResets;
-      filterText.textContent = fiveHour ? "显示 5 小时重置（" + fiveHour + "）" : "显示 5 小时重置";
+      filterText.textContent = translate(built.fiveHour ? "ev_show_5h_count" : "ev_show_5h", built.fiveHour);
     }
-    if (!rows.length) {
-      list.appendChild(el("p", { class: "empty", text: "暂无事件" }));
+    if (!built.rows.length) {
+      list.appendChild(el("p", { class: "empty", text: translate("no_events") }));
       more.hidden = true;
       return;
     }
-    var total = Math.min(rows.length, EVENTS_MAX);
-    rows.slice(0, eventsExpanded ? EVENTS_MAX : EVENTS_COLLAPSED).forEach(function (ev) {
-      var known = EVENT_STYLE[ev.kind];
-      var style = known ? known[0] : (ev.kind === "error" ? "failure" : "muted");
-      var name = known ? known[1] : (ev.kind || "事件");
-      var detail = ev.message || ev.detail || "";
-      var label = eventLabel(ev);
-      var cell = [el("span", { class: "event-text", title: detail || null, text: detail })];
-      if (ev.notify === "sent") cell.push(el("span", { class: "event-mark", text: "已推送" }));
-      else if (ev.notify === "failed") cell.push(el("span", { class: "event-mark failed", text: "推送失败" }));
+    var total = Math.min(built.rows.length, EVENTS_MAX);
+    built.rows.slice(0, eventsExpanded ? EVENTS_MAX : EVENTS_COLLAPSED).forEach(function (row) {
+      var ev = row.event, view = eventView(ev, row.notifyKind, row.paused), nodes = eventMasked(ev, view);
+      var cell = [el("span", { class: "event-text", title: masked ? null : view.tip || view.detail || null }, nodes.detail)];
+      if (view.link) cell.push(el("a", { class: "event-link", href: view.link, target: "_blank", rel: "noopener noreferrer", text: translate("ev_appeal") }));
       list.appendChild(el("div", { class: "event-row", role: "row" }, [
         el("span", { class: "event-time", role: "cell", text: fmtDateTime(parseTime(ev.time)) }),
-        el("span", { class: "event-type", role: "cell" }, [badge(style, name)]),
-        el("span", { class: "event-label", role: "cell", text: label || "—" }),
-        el("span", { class: "event-detail", role: "cell" }, cell)
+        el("span", { class: "event-type", role: "cell" }, [badge(view.style, view.badge)]),
+        el("span", { class: "event-label", role: "cell" }, nodes.label),
+        el("span", { class: "event-detail", role: "cell" }, cell.concat(pushMarks(row.pushes)))
       ]));
     });
     more.hidden = total <= EVENTS_COLLAPSED;
-    more.textContent = eventsExpanded ? "收起" : "显示更多（共 " + total + " 条）";
+    more.textContent = eventsExpanded ? translate("collapse") : translate("show_more", total);
+  }
+
+  // The provider settings, built when the provider list changes: a monitor
+  // switch per provider under Services, and a row per provider in the
+  // ignition table. Providers that cannot be ignited show no ignition switch
+  // or model; those with quota groups to choose get a row of group
+  // checkboxes.
+  function renderServiceRows() {
+    var body = $("ignition-rows");
+    var list = providerList();
+    var ids = list.map(function (p) { return p.id; }).join(",");
+    if (body.getAttribute("data-ids") === ids) return false;
+    clear(body);
+    list.forEach(function (p) {
+      var cells = [el("td", { class: "strong", text: p.title })];
+      if (p.ignite) {
+        cells.push(el("td", {}, [el("input", { name: "providers." + p.id + ".ignite", type: "checkbox", "data-service": p.id, "data-label": "ignite_service" })]));
+        cells.push(el("td", {}, [el("input", { name: "providers." + p.id + ".model", type: "text", "data-service": p.id })]));
+      } else {
+        cells.push(el("td", { class: "muted", text: "—" }));
+        cells.push(el("td", { class: "muted", "data-i18n": "no_ignition", text: translate("no_ignition") }));
+      }
+      body.appendChild(el("tr", {}, cells));
+      if (p.groups && p.groups.length) {
+        body.appendChild(el("tr", { class: "sub-row" }, [el("td"), el("td", { colspan: "2" }, [
+          el("span", { class: "field-label", "data-groups-label": p.id }),
+          el("div", { class: "checks", "data-groups": p.id }),
+          el("span", { class: "hint", "data-groups-hint": p.id })
+        ])]));
+      }
+    });
+    body.setAttribute("data-ids", ids);
+    return true;
+  }
+
+  // Labels of the service rows in the current language. The model inputs
+  // show, after the automatic rule, the model the next ignition starts with.
+  function renderServiceText() {
+    var next = status.next_models || {};
+    var form = $("settings");
+    providerList().forEach(function (p) {
+      Array.prototype.forEach.call(form.querySelectorAll("[data-service='" + p.id + "'][data-label]"), function (input) {
+        input.setAttribute("aria-label", translate(input.getAttribute("data-label"), p.title));
+      });
+      var model = form.elements["providers." + p.id + ".model"];
+      if (model) {
+        var text = translate("model_auto", localized(p.model_hint));
+        if (next[p.id]) text += " - " + next[p.id];
+        model.setAttribute("placeholder", text);
+      }
+      var label = form.querySelector("[data-groups-label='" + p.id + "']");
+      if (label) label.textContent = translate("ignite_groups", p.title);
+      var hint = form.querySelector("[data-groups-hint='" + p.id + "']");
+      if (hint) hint.textContent = localized(p.groups_hint);
+    });
   }
 
   function renderStatus() {
-    if (!status) return;
+    sortAccounts();
     checkApplied();
     renderHeader();
     renderNotices();
+    // Rows built after the first fill need their values.
+    if (renderServiceRows() && settingsFilled) fillSettings({ providers: true });
+    renderServiceText();
+    // Before the first load starts, start() loads the chosen window.
     if (renderWindowButtons() && (history || historyLoading)) loadHistory();
     renderAccounts();
     renderTargets();
     renderEvents();
-    if (!settingsFilled) fillSettings();
+    renderLanguageNote();
   }
 
   function loadStatus(timeout) {
     return api("GET", API + "/status", undefined, timeout).then(function (data) {
       status = data;
       renderStatus();
+      reportLanguage();
     });
   }
 
@@ -511,55 +1848,145 @@
     button.disabled = true;
     return api("POST", path, body).then(function (data) {
       if (data.status) { status = data.status; renderStatus(); }
-      toast(data.ok === false ? "失败：" + (data.error || "") : success);
+      toast(data.ok ? success : translate("failed", data.error));
       loadHistory(true);
     }).catch(function (err) {
-      if (err.message !== "unauthorized") toast("失败：" + err.message);
+      if (err.message !== "unauthorized") toast(translate("failed", err.message));
     }).then(function () { button.disabled = false; });
   }
 
+  // The account name is the first line of the CPA credential note. Renaming
+  // replaces that line and keeps the rest of the note. CPA trims the note, so
+  // a note whose first line is empty takes its name from the next line;
+  // clearing the name of a note with more lines therefore deletes the note,
+  // after a confirmation. The account is then refreshed so that the plugin
+  // reads the new note at once. The quota query of the refresh can fail for
+  // reasons unrelated to the name, which the plugin applies anyway, so its
+  // result only updates the page.
+  function saveAccountName(account, note) {
+    return api("PATCH", "/v0/management/auth-files/fields", { name: account.name, note: note }).then(function () {
+      (status.accounts || []).forEach(function (a) { if (a.name === account.name) a.note = note; });
+      return api("POST", API + "/refresh", { auth_index: account.auth_index }).then(function (data) {
+        if (data.status) { status = data.status; renderStatus(); }
+      }, function () { /* the name shows after the next poll */ }).then(function () { loadHistory(true); });
+    });
+  }
+
+  function fmtWeight(weight) { return String(Math.round(weight * 100) / 100); }
+
+  function accountNote(note, name) {
+    var rest = (note || "").split(/\r?\n/).slice(1).join("\n").trim();
+    return name ? (name + "\n" + rest).trim() : "";
+  }
+
+  function accountFieldHost(input) { return saveHost(input); }
+
+  // Account fields have no config input name: names go to CPA credentials,
+  // and weights patch a shared map built from the preceding queued save.
+  // Dirty or pending fields survive polling, sorting and earlier saves.
+  // Each field owns its result; the heading summarizes failures and progress.
+  function saveAccountField(input, row) {
+    var host = accountFieldHost(input), binding = saveEntry(host, input);
+    var account = row.account, kind = input.getAttribute("data-account-field"), weight = kind === "weight";
+    var answer = weight ? input.value.trim() : input.value.replace(/\s+/g, " ").trim();
+    var value = Number(answer), gen = input.accountEdit || 0;
+    if (weight && (input.validity.badInput || (answer !== "" && (!isFinite(value) || value <= 0)))) {
+      setSaveState(host, "failed", translate("weight_invalid"), input);
+      return;
+    }
+    if (answer === input.accountSaved && !input.accountPending && !input.hasAttribute("aria-invalid")) {
+      input.value = answer;
+      input.accountDirty = false;
+      return;
+    }
+    if (!weight && !answer && (account.note || "").split(/\r?\n/).slice(1).join("\n").trim() && !confirm(translate("rename_clear_note"))) {
+      input.value = input.accountSaved;
+      input.accountDirty = false;
+      return;
+    }
+    var note = !weight ? accountNote(account.note, answer) : "";
+    var say = claimState(host, input);
+    input.accountPending = (input.accountPending || 0) + 1;
+    saveQueue = saveQueue.then(function () {
+      if (!weight) return saveAccountName(account, note).then(function () { say("saved", translate("save_saved")); });
+      var latest = rawConfig.account_weights;
+      var weights = latest && typeof latest === "object" ? JSON.parse(JSON.stringify(latest)) : {};
+      if (answer === "") delete weights[account.name]; else weights[account.name] = value;
+      return patchConfig({ account_weights: Object.keys(weights).length ? weights : null }).then(function (token) {
+        showApplied(say, token);
+        return loadConfig();
+      });
+    }).then(function () {
+      input = binding.input;
+      if ((input.accountEdit || 0) === gen) {
+        input.value = weight && answer !== "" ? fmtWeight(value) : answer;
+        input.accountSaved = input.value;
+        input.accountDirty = false;
+      }
+    }).catch(function (err) {
+      input = binding.input;
+      if ((input.accountEdit || 0) === gen) input.accountDirty = true;
+      say("failed", err.message);
+    }).then(function () {
+      input = binding.input;
+      input.accountPending--;
+      renderAccounts();
+      if (history) renderChart();
+    });
+  }
+
   // ---- Chart ----
+
   // Time ranges follow the quota window, in hours for the 5-hour quota and
   // days for the 7-day quota: one unit; half of a window plus one (3h, 4d);
-  // a window plus one (6h, 8d); half a day or month (12h, 15d); a day or a
-  // month; five windows plus one (26h, 36d).
+  // a window plus one (6h, 8d); half a day or month, which fits two whole
+  // windows (12h, 15d); a day or a month; five windows plus one (26h, 36d).
+  // Keys are the history endpoint's range values.
+  // Each entry is the range value, the count and the unit of its label.
   var RANGES = {
     "5h": [["1h", 1, "h"], ["3h", 3, "h"], ["6h", 6, "h"], ["12h", 12, "h"], ["24h", 24, "h"], ["26h", 26, "h"]],
     "7d": [["24h", 1, "d"], ["4d", 4, "d"], ["8d", 8, "d"], ["15d", 15, "d"], ["1mo", 1, "mo"], ["36d", 36, "d"]]
   };
+  // The default ranges are the shortest that cover one whole window.
   var DEFAULT_RANGE = { "5h": "6h", "7d": "8d" };
+  // From a window plus one on, the axis ends at the reset of the selected
+  // row, so the rest of its window lies ahead of now. "24h" extends as a
+  // range of the 5-hour window, not as the 1d range of the 7-day window.
   function extendsAhead(kind, name) {
     return (RANGES[kind] || []).some(function (r, i) { return i >= 2 && r[0] === name; });
   }
+  // The default row order is the status API's group_order, by quota name;
+  // other quotas follow in API order. The status API orders the quota groups
+  // of an account the same way.
   var LANE = 22, LANE_GAP = 6, AXIS_H = 22, EVENT_H = 24;
   // A rise of this many points between two samples is a reset.
   var RESET_JUMP = 5;
   // Quotas report whole percents; steps this small are a steady decline.
   var QUANTUM = 2;
-  // A passive value unchanged for longer than this is held until now when the
-  // rate of use is estimated, so a pause shows as one.
+  // Passive samples are written up to a minute after the value changes. A
+  // passive value unchanged for longer than this is held until now when the
+  // rate of use is estimated, so a pause shows as one. Active samples come
+  // once per poll, so an active value is held only after one and a half
+  // sample steps; holding it sooner would level the projection in the
+  // second half of every poll interval.
   var HOLD_AFTER = 120;
+  // The width of a character of 11px text in the monospace chart font, and
+  // the spacing of the values beside the detail chart.
   var CHAR_W = 6.6, LABEL_H = 16;
 
-  var chartWindow = "5h";
-  var range = "6h";
-  var chartSort = "default";
-  var chartExpanded = {};
-  var chartSelected = null;
-  var history = null;
-  var historyWindow = "";
-  var historyRange = "";
   var chartView = null;
   var hoverSource = "";
   var hoverListeners = [];
+  // Samples of the row in the detail chart; hovering either chart snaps to them.
   var snapPoints = [];
 
   function cssVar(name) {
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   }
 
-  var LEVEL_VARS = { empty: "--quota-empty-color", low: "--danger", medium: "--quota-medium-color", high: "--ok", full: "--quota-full-color" };
+  var LEVEL_VARS = { empty: "--quota-empty-color", low: "--viz-failure", medium: "--quota-medium-color", high: "--viz-success", full: "--quota-full-color" };
 
+  // A rect in the color of a level; an empty one is also striped.
   function levelRect(root, attrs, level) {
     var fill = {};
     Object.keys(attrs).forEach(function (name) { fill[name] = attrs[name]; });
@@ -572,7 +1999,15 @@
     root.appendChild(svg("rect", stripes));
   }
 
+  function pct(v) { return v == null ? "—" : Math.round(v) + "%"; }
+
+  function fmtDiff(d) { return d == null ? "—" : (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(d) + "%"; }
+
   function unixDate(t) { return new Date(t * 1000); }
+
+  // "5h", "7d" or empty for a window of another length, which the chart
+  // does not show.
+  function windowKind(series) { return series.kind || ""; }
 
   // The chart offers the window kinds the accounts report, and those whose
   // loaded history still has a sample in the range of an inactive window;
@@ -580,7 +2015,9 @@
   function windowKinds() {
     var seen = {};
     (status.accounts || []).forEach(function (a) {
-      (a.windows || []).forEach(function (w) { if (w.kind) seen[w.kind] = true; });
+      (a.groups || []).forEach(function (g) {
+        (g.windows || []).forEach(function (w) { if (w.kind) seen[w.kind] = true; });
+      });
     });
     ["5h", "7d"].forEach(function (kind) {
       var cached = historyCache[historyKey(kind, kind === chartWindow ? range : rangeFor(kind))];
@@ -593,7 +2030,7 @@
   function recentSamples(data, kind) {
     var from = new Date(data.from).getTime() / 1000;
     return (data.series || []).some(function (s) {
-      return (s.window || s.kind) === kind && s.points && s.points.length && s.points[s.points.length - 1][0] >= from;
+      return windowKind(s) === kind && s.points && s.points.length && s.points[s.points.length - 1][0] >= from;
     });
   }
 
@@ -621,19 +2058,50 @@
     return value;
   }
 
+  // Samples further apart than a few poll intervals leave a gap, which is
+  // drawn as missing data rather than as a held value. Active queries are
+  // skipped for up to passive_skip_max_minutes while response headers keep
+  // the main windows fresh; windows without header data, such as Fable, then
+  // wait that long plus one poll, which is not a gap.
   function gapLimit() {
-    return sampleStep() * 3.5;
+    var cfg = status && status.config ? status.config : {};
+    var poll = Number(cfg.poll_interval_seconds) || 300;
+    var limit = sampleStep() * 3.5;
+    if (Number(cfg.passive_skip_seconds) > 0) {
+      limit = Math.max(limit, (Number(cfg.passive_skip_max_minutes) || 0) * 60 + poll * 1.5);
+    }
+    return limit;
   }
 
+  // The usual time between two samples: the poll interval, or the bucket of
+  // a long range.
   function sampleStep() {
     var cfg = status && status.config ? status.config : {};
     return Math.max(history.bucket_seconds || 0, Number(cfg.poll_interval_seconds) || 300);
   }
 
-  // Pooled remaining of several accounts: the mean percentage (equal weights;
-  // Phoenix has no per-account weights), each point also carrying the lowest
-  // and highest account for the range band, and 1 when an account's share is
-  // estimated (gapValue). key is "points" or "floor".
+  // The weight of an account in a pooled row: the weight set on its card, or
+  // the default of its plan.
+  function accountWeight(account) {
+    var saved = rawConfig.account_weights;
+    var weight = saved && typeof saved === "object" ? Number(saved[account.name]) : NaN;
+    if (isFinite(weight) && weight > 0) return weight;
+    weight = Number(account.default_weight);
+    return isFinite(weight) && weight > 0 ? weight : 1;
+  }
+
+  // Pooled remaining of several accounts: the mean percentage weighted by
+  // the accounts' weights, which is the share of the total quota left when
+  // the weights match the sizes of the plans. Each point also carries the
+  // lowest and highest account for the range band, and 1 when an account's
+  // share is estimated (gapValue). key is "points" or "floor".
+  //
+  // An account without a recent sample keeps its share as estimated, or the
+  // total would jump to the mean of the others, such as to 100% for a pair
+  // whose other account is full. Only accounts with no sample yet are left
+  // out. The total has points only at the samples of its accounts, so it
+  // covers only the times some account has data for; a reset within an
+  // account's gap shows at the next sample of another account.
   function pooled(rows, limit, key) {
     var times = [];
     rows.forEach(function (r) { r[key].forEach(function (p) { times.push(p[0]); }); });
@@ -647,15 +2115,16 @@
         if (!v) return;
         if (v.estimated) estimated = 1;
         else fresh = true;
-        sum += v.value; total += 1; lo = Math.min(lo, v.value); hi = Math.max(hi, v.value);
+        sum += r.weight * v.value; total += r.weight; lo = Math.min(lo, v.value); hi = Math.max(hi, v.value);
       });
+      // With every account estimated there is no data at all: a gap.
       if (fresh) out.push([t, sum / total, 0, lo, hi, estimated]);
     });
     return out;
   }
 
   // The reset an account's window was due at as of time t, from the resets
-  // of its history ([sample time, reset due]); 0 when unknown.
+  // of its history ([sample time, reset]); 0 when unknown.
   function resetAsOf(resets, t) {
     var at = 0;
     (resets || []).forEach(function (r) { if (r[0] <= t) at = r[1]; });
@@ -665,6 +2134,14 @@
   // The value of one account at time t for a pooled total: its last sample
   // when recent, otherwise an estimate { value, estimated: true }; null
   // before its first sample.
+  //
+  // Within one cycle the remaining only falls, so across a gap between two
+  // samples it lies between them: the estimate runs straight from one to
+  // the other, never above the first. A response header reads a point above
+  // the usage API, which is not a rise. A gap that spans the window's reset
+  // keeps the last value until the reset, then runs from 100% to the next
+  // sample. After the last sample the last value holds until the reset,
+  // then 100%.
   function gapValue(points, resets, t, limit) {
     var p = valueAt(points, t);
     if (!p) return null;
@@ -686,8 +2163,12 @@
     return { value: value, estimated: true };
   }
 
-  // The lowest remaining so far in each cycle. A rise by a reset starts a
-  // new cycle.
+
+  // The lowest remaining so far in each cycle. Response headers report a
+  // point more than active queries (51 against 50), which near a threshold
+  // flips the band's color for a moment; a rise by a reset starts a new
+  // cycle. Unlike declining(), which averages 50 and 51 to 50.5, this keeps
+  // the lower reading.
   function cycleFloor(points) {
     var low = null;
     return points.map(function (p) {
@@ -698,73 +2179,111 @@
     });
   }
 
-  // One row per account. With several accounts a pooled "合计" row leads and
-  // expands into one row per account. floor holds the samples as cycleFloor()
-  // leaves them, for the band and the rate of use.
+  // One row per quota group label. A label with several accounts becomes a
+  // pooled row that expands into one row per account. floor holds the
+  // samples as cycleFloor() leaves them, for the band and the rate of use.
   //
   // A window shows while the status still reports it, or while it has a
-  // sample in the chosen range. A window that only has samples is inactive:
-  // it gets a row of its own after the pooled row, is left out of the total
-  // and of "lowest first", and shows no projection or even pace.
+  // sample in the chosen range. A window that only has samples is inactive,
+  // such as the 5-hour window of an account whose plan no longer has one:
+  // it gets a row of its own after the label's row, is left out of the
+  // total and of "lowest first", and shows no projection or even pace.
+  //
+  // Rows follow the order of the cards: a label takes the place of its
+  // first account, and labels of the same account keep the group_order of
+  // the status API, so Gemini stays before Claude / GPT within Antigravity.
   function chartRows() {
-    var info = {}, accountOf = {}, current = [];
-    (status.accounts || []).forEach(function (a, index) {
+    var info = {}, accountOf = {}, emailOf = {}, current = [];
+    status.accounts.forEach(function (a, index) {
       accountOf["auth|" + a.auth_index] = index;
-      (a.windows || []).forEach(function (w) {
-        var reset = parseTime(w.reset);
-        info[a.auth_index + "|" + w.id] = { reset: reset ? reset.getTime() / 1000 : 0, remaining: w.remaining };
-        if ((w.kind || w.short) === historyWindow) {
-          current.push({ id: "auth|" + a.auth_index + "|" + w.id, name: accountTitle(a), sub: a.auth_id || String(a.auth_index),
-            group: a.auth_index, window: w.id, kind: w.kind || w.short, points: [], floor: [], resets: [], resetTimes: [],
-            reset: reset ? reset.getTime() / 1000 : null, last: w.remaining, account: index, inactive: false, weight: 1 });
-        }
+      emailOf[a.auth_index] = a.email || a.name;
+      (a.groups || []).forEach(function (g) {
+        accountOf["group|" + g.key] = index;
+        (g.windows || []).forEach(function (w) {
+          var reset = parseTime(w.reset);
+          // A reported window without a reset has reset 0; see paceSegments.
+          info[g.key + "|" + w.id] = { email: a.email || a.name, reset: reset ? reset.getTime() / 1000 : 0, weight: accountWeight(a), remaining: w.remaining };
+          if (w.kind === historyWindow) current.push({ group: g.key, window: w.id, window_label: w.short, kind: w.kind, label: g.label,
+            source_label: g.source_label, provider: a.provider, auth_index: a.auth_index, points: [], resets: [] });
+        });
       });
     });
     var limit = gapLimit();
     var from = new Date(history.from).getTime() / 1000;
-    var seen = {};
-    var series = (history.series || []).filter(function (s) { return s.points && s.points.length; });
-    series.forEach(function (s) { seen[s.auth_index + "|" + s.window] = true; });
-    var rows = [];
+    var byLabel = {}, order = [], seen = {};
+    // A window the status reports without samples in the history, such as
+    // one not queried within the range, still gets its row, with the current
+    // reading and no data on the time axis.
+    var series = history.series.filter(function (s) { return s.points && s.points.length; });
+    series.forEach(function (s) { seen[s.group + "|" + s.window] = true; });
+    history.series.forEach(function (s) { if (!seen[s.group + "|" + s.window]) seen[s.group + "|" + s.window] = s; });
+    series = series.concat(current.filter(function (s) { return seen[s.group + "|" + s.window] !== true; }).map(function (s) {
+      var empty = seen[s.group + "|" + s.window];
+      if (empty && Array.isArray(empty.resets)) s.resets = empty.resets;
+      return s;
+    }));
     series.forEach(function (s, seq) {
-      if ((s.window || s.kind) !== historyWindow) return;
-      var meta = info[s.auth_index + "|" + s.window];
+      if (windowKind(s) !== historyWindow) return;
+      var meta = info[s.group + "|" + s.window];
       var lastPoint = s.points[s.points.length - 1];
+      // Only the sample before the range can lie before it, so the last
+      // sample tells whether any falls in the range.
       if (!meta && lastPoint[0] < from) return;
-      var account = accountOf["auth|" + s.auth_index];
-      var title = "";
-      if (account !== undefined) title = accountTitle(status.accounts[account]);
-      rows.push({ id: "auth|" + s.auth_index + "|" + s.window, name: s.label || title || ("账号 " + s.auth_index),
-        sub: (account !== undefined ? (status.accounts[account].auth_id || "") : "") || String(s.auth_index || ""),
-        group: s.auth_index, window: s.window, kind: s.window || s.kind, points: s.points, floor: cycleFloor(s.points),
-        resets: Array.isArray(s.resets) ? s.resets : [], resetTimes: Array.isArray(s.resetTimes) ? s.resetTimes : [],
-        reset: meta ? meta.reset : null, last: lastPoint ? lastPoint[1] : (meta ? meta.remaining : 0),
-        lastAt: lastPoint ? lastPoint[0] : null, account: account === undefined ? status.accounts.length + seq : account,
-        inactive: !meta, weight: 1, orphan: account === undefined });
+      // A window with its own label, such as "7 Day Opus" next to the
+      // 7-day window of the same group label, gets a row of its own.
+      var extra = s.window_label && s.window_label !== historyWindow ? " · " + s.window_label : "";
+      var source = (s.source_label || s.label) + extra;
+      var id = s.provider + "|" + source;
+      var account = accountOf["group|" + s.group];
+      if (account === undefined) account = accountOf["auth|" + s.auth_index];
+      if (!byLabel[id]) { byLabel[id] = []; order.push(id); }
+      byLabel[id].push({ id: s.group + "|" + s.window, name: s.label + extra, source: source,
+        sub: meta ? meta.email : emailOf[s.auth_index] || s.auth_index || "", group: s.group, inactive: !meta, lastAt: lastPoint ? lastPoint[0] : null,
+        points: s.points, floor: cycleFloor(s.points), resets: Array.isArray(s.resets) ? s.resets : [],
+        reset: meta ? meta.reset : null, weight: meta ? meta.weight : 1, last: lastPoint ? lastPoint[1] : meta.remaining,
+        account: account === undefined ? status.accounts.length + seq : account, seq: seq,
+        // No current account: the name, often the internal group key, is
+        // sensitive as a whole.
+        orphan: account === undefined });
     });
-    current.forEach(function (c) {
-      if (!seen[c.group + "|" + c.window]) rows.push(c);
-    });
-    var live = rows.filter(function (r) { return !r.inactive; });
-    var gone = rows.filter(function (r) { return r.inactive; });
     var lowFirst = chartSort === "low";
-    var byAccount = function (a, b) { return (a.account - b.account); };
+    var groupOrder = status.group_order || [];
+    var byAccount = function (a, b) { return (a.account - b.account) || (a.seq - b.seq); };
     var byLast = function (a, b) { return (a.last - b.last) || byAccount(a, b); };
-    live.sort(lowFirst ? byLast : byAccount);
-    gone.sort(byAccount);
-    var out = [];
-    if (live.length > 1) out.push(pooledRow(live, limit));
-    else if (live.length === 1) out.push(live[0]);
-    out.push.apply(out, gone);
-    return out;
+    var units = order.map(function (id, index) {
+      var kids = byLabel[id];
+      var live = kids.filter(function (k) { return !k.inactive; }).sort(lowFirst ? byLast : byAccount);
+      var gone = kids.filter(function (k) { return k.inactive; }).sort(byAccount);
+      var rank = groupOrder.indexOf(kids[0].source);
+      if (rank < 0) rank = groupOrder.length + index;
+      var first = (live.length ? live : gone).reduce(function (min, k) { return Math.min(min, k.account); }, Infinity);
+      var main = live.length === 1 ? live[0] : live.length ? pooledRow(id, live, limit) : null;
+      return { main: main, gone: gone, account: first, rank: rank };
+    });
+    units.sort(function (a, b) {
+      if (lowFirst && (a.main || b.main)) {
+        if (!a.main || !b.main) return a.main ? -1 : 1;
+        if (a.main.last !== b.main.last) return a.main.last - b.main.last;
+      }
+      return (a.account - b.account) || (a.rank - b.rank);
+    });
+    var rows = [];
+    units.forEach(function (u) {
+      if (u.main) rows.push(u.main);
+      rows.push.apply(rows, u.gone);
+    });
+    return rows;
   }
 
-  // The total of the active accounts.
-  function pooledRow(kids, limit) {
+  // The total of the active accounts of a label.
+  function pooledRow(id, kids, limit) {
+    // The next reset of the accounts; a reset that has passed, of a window
+    // not opened again or not queried since, is not the next one.
     var now = Date.now() / 1000;
     var resets = kids.map(function (k) { return k.reset; }).filter(function (t) { return t > now; });
-    return { id: "group:all", name: "合计", children: kids, points: pooled(kids, limit, "points"), floor: pooled(kids, limit, "floor"),
-      last: kids.reduce(function (sum, k) { return sum + k.last; }, 0) / kids.length,
+    var weights = kids.reduce(function (sum, k) { return sum + k.weight; }, 0);
+    return { id: "group:" + id, name: kids[0].source, children: kids, points: pooled(kids, limit, "points"), floor: pooled(kids, limit, "floor"),
+      last: kids.reduce(function (sum, k) { return sum + k.weight * k.last; }, 0) / weights,
       reset: resets.length ? Math.min.apply(null, resets) : null, groups: kids.map(function (k) { return k.group; }) };
   }
 
@@ -779,14 +2298,16 @@
 
   // The right end of the time axis: for a range that extends ahead, the
   // reset of the selected row's window (the earliest account's for a pooled
-  // row), otherwise now.
+  // row), otherwise now. Without a reset still to come, such as a 5-hour
+  // window no request has opened yet, it is now.
   function axisEnd(row) {
     var from = new Date(history.from).getTime() / 1000, now = new Date(history.to).getTime() / 1000;
     if (!extendsAhead(historyWindow, historyRange) || !row || !row.reset || row.reset <= now || row.reset - now >= now - from) return now;
     return row.reset;
   }
 
-  // The axis spans the chosen range and ends at end.
+  // The axis spans the chosen range and ends at end. The history covers the
+  // range up to now, so an axis that ends later leaves out its oldest part.
   function geometry(width, end) {
     var now = new Date(history.to).getTime() / 1000;
     var to = end || now, from = to - (now - new Date(history.from).getTime() / 1000);
@@ -829,6 +2350,9 @@
     var empty = svg("pattern", { id: "chart-hatch-empty", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" });
     empty.appendChild(svg("rect", { width: 2.5, height: 6, fill: cssVar("--quota-empty-stripe") }));
     defs.appendChild(empty);
+    var blur = svg("filter", { id: "mask-blur", x: "-10%", y: "-60%", width: "120%", height: "220%" });
+    blur.appendChild(svg("feGaussianBlur", { stdDeviation: 3.5 }));
+    defs.appendChild(blur);
     root.appendChild(defs);
     return defs;
   }
@@ -853,10 +2377,14 @@
     if (g.x(b) - g.x(a) > 1) root.appendChild(svg("rect", { x: g.x(a), y: y0, width: g.x(b) - g.x(a), height: height, fill: "url(#chart-hatch)" }));
   }
 
+  // The start of the hatching after the last stretch: now, or the end of
+  // the data when it stopped before.
   function dataEnd(g, cursor, limit) { return cursor < g.now - limit ? cursor : g.now; }
 
   // A band of solid color per quota level. Samples merge while the level
   // stays the same, and edges snap to whole pixels so neighbours leave no seam.
+  // The band of an inactive window ends at its last sample, and the rest is
+  // hatched as missing data.
   function drawBand(root, g, points, y0, limit, inactive) {
     var cursor = g.from;
     runs(points, limit, inactive ? points[points.length - 1][0] : g.now).forEach(function (run) {
@@ -880,17 +2408,17 @@
 
   function ignitionEvents(g) {
     return (history.events || []).map(function (ev) {
-      return { t: new Date(ev.time).getTime() / 1000,
-        failed: ev.kind === "ignite_failed" || ev.kind === "ignite_paused" || /fail/i.test(ev.kind || ""),
-        event: ev };
-    }).filter(function (ev) {
-      return ev.t >= g.from && (ev.event.kind === "ignite" || ev.event.kind === "ignite_manual" || ev.failed);
-    });
+      var parts = eventParts(ev);
+      return { t: new Date(ev.time).getTime() / 1000, failed: ev.kind === "ignite_failed" || ev.kind === "ignite_paused",
+        event: ev, group: ev.group };
+    }).filter(function (ev) { return ev.t >= g.from; });
   }
 
+  // An ignition in a tooltip: its time, label and detail.
   function noteNodes(item) {
-    var ev = item.event;
-    return [document.createTextNode(fmtClock(unixDate(item.t)) + " " + (ev.message || ev.kind || ""))];
+    var nodes = eventMasked(item.event), hasLabel = eventParts(item.event).label !== "—";
+    return [document.createTextNode(fmtClock(unixDate(item.t)) + " ")].concat(
+      hasLabel ? nodes.label.concat([document.createTextNode(" ")]) : [], nodes.detail);
   }
 
   function placeTip(tip, box, g, t, top) {
@@ -903,8 +2431,8 @@
   function tipRow(tip, text, value, strong) {
     tip.appendChild(el("div", { class: "row" + (strong ? " strong" : "") }, [
       el("span", { class: "key" + (value != null ? " fill-" + quotaLevel(value) : "") }),
-      el("span", { class: "name", text: text }),
-      el("span", { class: "value", text: value != null ? pct(value) : "无数据" })
+      el("span", { class: "name" }, maskedNodes(text)),
+      el("span", { class: "value", text: value != null ? pct(value) : translate("no_data") })
     ]));
   }
 
@@ -919,12 +2447,12 @@
       if (r.children && chartExpanded[r.id]) r.children.forEach(function (c) { flat.push({ row: c, depth: 1 }); });
     });
     var height = AXIS_H + flat.length * (LANE + LANE_GAP) + EVENT_H + 6;
-    var root = svg("svg", { viewBox: "0 0 " + g.width + " " + height, role: "img", "aria-label": "各额度剩余百分比总览" });
+    var root = svg("svg", { viewBox: "0 0 " + g.width + " " + height, role: "img", "aria-label": translate("overview_aria") });
     hatchPattern(root);
     var ticks = chartTicks(g);
     ticks.list.forEach(function (t) {
-      root.appendChild(svgText({ x: g.x(t), y: 13, "text-anchor": "middle", "font-size": 11, fill: cssVar("--muted") }, ticks.label(t)));
-      root.appendChild(svg("line", { x1: g.x(t), x2: g.x(t), y1: AXIS_H - 4, y2: height - 4, stroke: cssVar("--line"), "stroke-dasharray": "2 4" }));
+      root.appendChild(svgText({ x: g.x(t), y: 13, "text-anchor": "middle", "font-size": 11, fill: cssVar("--text-tertiary") }, ticks.label(t)));
+      root.appendChild(svg("line", { x1: g.x(t), x2: g.x(t), y1: AXIS_H - 4, y2: height - 4, stroke: cssVar("--border-color"), "stroke-dasharray": "2 4" }));
     });
     var rowY = {};
     flat.forEach(function (f, i) {
@@ -933,24 +2461,24 @@
       var selected = chartSelected === r.id;
       if (selected) root.appendChild(svg("rect", { x: 0, y: y0 - 3, width: g.width, height: LANE + 6, rx: 6, fill: cssVar("--chart-select") }));
       var lx = 4 + f.depth * 18;
-      if (r.children) root.appendChild(svgText({ x: lx, y: y0 + 15, "font-size": 10, fill: cssVar("--muted") }, chartExpanded[r.id] ? "▾" : "▸"));
+      if (r.children) root.appendChild(svgText({ x: lx, y: y0 + 15, "font-size": 10, fill: cssVar("--text-tertiary") }, chartExpanded[r.id] ? "▾" : "▸"));
       var nameX = lx + (r.children ? 14 : 0);
       var name = f.depth ? r.sub : r.name;
       var maxChars = Math.floor((g.labelW - nameX - (r.children ? 30 : 8)) / 7);
       if (name.length > maxChars) name = name.slice(0, Math.max(1, maxChars - 1)) + "…";
-      root.appendChild(svgText({ x: nameX, y: y0 + 15, "font-size": f.depth ? 12 : 13, "font-weight": f.depth ? 400 : 600,
-        fill: cssVar(f.depth ? "--muted" : "--text"), "class": "row-name" }, name));
-      if (r.children) root.appendChild(svgText({ x: nameX + name.length * 8 + 8, y: y0 + 15, "font-size": 11, fill: cssVar("--muted") }, "×" + r.children.length));
+      root.appendChild(svgSensitive(svgText({ x: nameX, y: y0 + 15, "font-size": f.depth ? 12 : 13, "font-weight": f.depth ? 400 : 600,
+        fill: cssVar(f.depth ? "--text-secondary" : "--text-primary"), "class": "row-name" }, name), f.depth || r.orphan || hasSecret(f.depth ? r.sub : r.name)));
+      if (r.children) root.appendChild(svgText({ x: nameX + name.length * 8 + 8, y: y0 + 15, "font-size": 11, fill: cssVar("--text-tertiary") }, "×" + r.children.length));
       root.appendChild(svg("rect", { x: g.labelW, y: y0, width: g.plotW, height: LANE, rx: 4, fill: cssVar("--chart-lane") }));
       drawBand(root, g, r.floor, y0, limit, r.inactive);
       var rx = g.width - g.rightW + 14;
       if (r.inactive) {
-        root.appendChild(svgText({ x: rx, y: y0 + 15, "font-size": 12, fill: cssVar("--muted"), "class": "row-name" }, "已停用"));
+        root.appendChild(svgText({ x: rx, y: y0 + 15, "font-size": 12, fill: cssVar("--text-tertiary"), "class": "row-name" }, translate("inactive")));
       } else {
         levelRect(root, { x: rx, y: y0 + 7, width: 8, height: 8, rx: 2 }, quotaLevel(r.last));
-        root.appendChild(svgText({ x: rx + 14, y: y0 + 15, "font-size": 13, "font-weight": 650, fill: cssVar("--text") }, pct(r.last)));
+        root.appendChild(svgText({ x: rx + 14, y: y0 + 15, "font-size": 13, "font-weight": 650, fill: cssVar("--text-primary") }, pct(r.last)));
       }
-      if (r.reset && !r.inactive) root.appendChild(svgText({ x: g.width - 2, y: y0 + 15, "font-size": 11, "text-anchor": "end", fill: cssVar("--muted") },
+      if (r.reset && !r.inactive) root.appendChild(svgText({ x: g.width - 2, y: y0 + 15, "font-size": 11, "text-anchor": "end", fill: cssVar("--text-tertiary") },
         "↻" + fmtCountdown(r.reset * 1000 - Date.now())));
       var hit = svg("rect", { x: 0, y: y0 - 3, width: g.width, height: LANE + 6, fill: "transparent", style: "cursor:pointer" });
       hit.addEventListener("click", function () {
@@ -967,8 +2495,8 @@
 
     // Ignitions at the same moment merge into one mark with a count.
     var ey = AXIS_H + flat.length * (LANE + LANE_GAP) + 4, cy = ey + 9;
-    root.appendChild(svgText({ x: 4, y: ey + 13, "font-size": 12, fill: cssVar("--muted"), "class": "row-name" }, "点火"));
-    root.appendChild(svg("line", { x1: g.labelW, x2: g.labelW + g.plotW, y1: cy, y2: cy, stroke: cssVar("--line") }));
+    root.appendChild(svgText({ x: 4, y: ey + 13, "font-size": 12, fill: cssVar("--text-tertiary"), "class": "row-name" }, translate("ignition_lane")));
+    root.appendChild(svg("line", { x1: g.labelW, x2: g.labelW + g.plotW, y1: cy, y2: cy, stroke: cssVar("--border-color") }));
     var events = ignitionEvents(g), clusters = [];
     events.slice().sort(function (a, b) { return a.t - b.t; }).forEach(function (ev) {
       var last = clusters[clusters.length - 1];
@@ -977,19 +2505,19 @@
     });
     clusters.forEach(function (c) {
       var x = g.x(c.t);
-      if (c.n > 1) root.appendChild(svgText({ x: x + 6, y: cy + 4, "font-size": 10, fill: cssVar("--muted") }, "×" + c.n));
+      if (c.n > 1) root.appendChild(svgText({ x: x + 6, y: cy + 4, "font-size": 10, fill: cssVar("--text-tertiary") }, "×" + c.n));
       if (c.failed) root.appendChild(svg("path", { d: "M" + (x - 4) + " " + (cy - 4) + "L" + (x + 4) + " " + (cy + 4) + "M" + (x + 4) + " " + (cy - 4) + "L" + (x - 4) + " " + (cy + 4),
-        stroke: cssVar("--danger"), "stroke-width": 2.2, "stroke-linecap": "round" }));
-      else root.appendChild(svg("circle", { cx: x, cy: cy, r: 3.5, fill: cssVar("--ok"), stroke: cssVar("--card"), "stroke-width": 1.5 }));
+        stroke: cssVar("--viz-failure"), "stroke-width": 2.2, "stroke-linecap": "round" }));
+      else root.appendChild(svg("circle", { cx: x, cy: cy, r: 3.5, fill: cssVar("--viz-success"), stroke: cssVar("--bg-primary"), "stroke-width": 1.5 }));
     });
     var failed = events.filter(function (ev) { return ev.failed; }).length;
-    root.appendChild(svgText({ x: g.width - 2, y: ey + 13, "font-size": 11, "text-anchor": "end", fill: cssVar(failed ? "--danger" : "--muted") },
-      (events.length - failed) + " 成功" + (failed ? " · " + failed + " 失败" : "")));
+    root.appendChild(svgText({ x: g.width - 2, y: ey + 13, "font-size": 11, "text-anchor": "end", fill: cssVar(failed ? "--viz-failure" : "--text-tertiary") },
+      translate("lane_ok", events.length - failed) + (failed ? translate("lane_failed", failed) : "")));
     var eventHit = svg("rect", { x: g.labelW, y: ey - 2, width: g.plotW, height: 22, fill: "transparent" });
     eventHit.addEventListener("pointermove", function (e) { hoverAt(e, root, null, "overview"); });
     root.appendChild(eventHit);
 
-    var cross = svg("line", { y1: AXIS_H - 4, y2: height - 4, stroke: cssVar("--muted"), "stroke-width": 1, visibility: "hidden", "pointer-events": "none" });
+    var cross = svg("line", { y1: AXIS_H - 4, y2: height - 4, stroke: cssVar("--text-tertiary"), "stroke-width": 1, visibility: "hidden", "pointer-events": "none" });
     root.appendChild(cross);
     root.addEventListener("pointerleave", function () { setHover(null); });
     box.appendChild(root);
@@ -999,6 +2527,7 @@
     hoverListeners.push(function (t, rowId) {
       if (t == null) { cross.setAttribute("visibility", "hidden"); tip.hidden = true; return; }
       cross.setAttribute("x1", g.x(t)); cross.setAttribute("x2", g.x(t)); cross.setAttribute("visibility", "visible");
+      // After now only the detail chart has values, its projection.
       if (hoverSource !== "overview" || t > g.now) { tip.hidden = true; return; }
       clear(tip);
       tip.appendChild(el("div", { class: "time", text: fmtDateTime(unixDate(t)) }));
@@ -1011,11 +2540,11 @@
         var r = f.row;
         if (f.depth) { tipRow(tip, "　" + r.sub, at(r), r.id === rowId); return; }
         var p = sample(r);
-        var suffix = r.children ? " 合计" + (p && p[5] ? "（估算）" : "") : r.inactive ? "（已停用）" : "";
+        var suffix = r.children ? translate("total_suffix") + (p && p[5] ? translate("estimated_suffix") : "") : r.inactive ? translate("inactive_suffix") : "";
         tipRow(tip, r.name + suffix, p ? p[1] : null, r.id === rowId);
         if (r.children && !chartExpanded[r.id]) {
           r.children.slice(0, 5).forEach(function (c) { tipRow(tip, "　" + c.sub, at(c), false); });
-          if (r.children.length > 5) tip.appendChild(el("div", { class: "row muted", text: "　… 另 " + (r.children.length - 5) + " 个账号" }));
+          if (r.children.length > 5) tip.appendChild(el("div", { class: "row muted", text: translate("more_accounts", r.children.length - 5) }));
         }
       });
       var near = (g.to - g.from) / g.plotW * 8;
@@ -1052,8 +2581,10 @@
   }
 
   // Within one window a quota only falls, but active queries and response
-  // headers can disagree by a point. Pool adjacent violators to the closest
-  // non-increasing sequence.
+  // headers can disagree by a point and round differently, so samples step
+  // back up for a moment. Pool adjacent violators to the closest
+  // non-increasing sequence; a curve through the raw samples would show
+  // each reversal as a notch.
   function declining(pts, key) {
     var blocks = [];
     pts.forEach(function (p) {
@@ -1077,7 +2608,8 @@
   }
 
   // Keep the first sample of every value, and the last sample of a plateau
-  // only when a real drop follows it.
+  // only when a real drop follows it: 62, 61, 60 is a steady decline, while
+  // 100 held for an hour and then 80 is a burst of use.
   function curvePoints(pts, key) {
     return pts.filter(function (p, i) {
       if (i === 0 || i === pts.length - 1 || p[key] !== pts[i - 1][key]) return true;
@@ -1086,7 +2618,8 @@
   }
 
   // Split a line into runs of measured and estimated stretches (index 5 of
-  // a pooled point). A stretch is estimated where either end is.
+  // a pooled point, see pooled). A stretch is estimated where either end is,
+  // and neighbouring runs share their end point, so the line stays joined.
   function estimatedRuns(pts) {
     var runs = [];
     for (var i = 0; i + 1 < pts.length; i++) {
@@ -1097,7 +2630,8 @@
     return runs.length ? runs : [{ estimated: !!(pts[0] && pts[0][5]), pts: pts }];
   }
 
-  // Split samples where any of the keys rises by a reset.
+  // Split samples where any of the keys rises by a reset. Resets one sample
+  // apart (two accounts, or a reset seen late) count as one.
   function splitAtResets(pts, keys) {
     var parts = [[pts[0]]], resets = [];
     for (var i = 1; i < pts.length; i++) {
@@ -1111,6 +2645,8 @@
       }
       parts[parts.length - 1].push(pts[i]);
     }
+    // Hold each piece's last value until the reset sample, so the line
+    // reaches the reset instead of stopping a poll interval before it.
     for (var k = 0; k + 1 < parts.length; k++) {
       var tail = parts[k][parts[k].length - 1];
       parts[k].push([parts[k + 1][0][0]].concat(tail.slice(1)));
@@ -1119,12 +2655,22 @@
   }
 
   var WINDOW_SECONDS = { "5h": 5 * 3600, "7d": 7 * 86400 };
+  // A current reset this many seconds from the last one in the history is a
+  // new reset the history does not hold yet.
   var RESET_DRIFT = 60;
 
   // The even pace of one account's window, as segments [a, b, x]: from a to
   // b the pace is 100 × (x − t) / length, falling to 0% at the reset x.
   // resets lists [t, x] in time order: from the sample at t on, the window
-  // was due to reset at x, 0 when unknown.
+  // was due to reset at x, 0 when unknown. Each entry draws from t, or one
+  // window length before x when that is later, until the next entry or x.
+  // A window reset early gets a new entry, so the line of the old reset
+  // stops there instead of being squeezed down to 0%; no line is drawn
+  // where the reset is unknown. current is the reset in the status, 0 when
+  // the status reports the window without a reset, or null when it does not
+  // report the window. When it differs from the last entry, the history does
+  // not hold it yet, and it applies from now: a new reset draws from now, an
+  // unknown one ends the line now.
   function paceSegments(resets, length, current, now) {
     var list = (resets || []).filter(function (r) { return Array.isArray(r) && isFinite(r[0]) && isFinite(r[1]); });
     var last = list[list.length - 1];
@@ -1134,6 +2680,8 @@
     }
     var out = [];
     if (!(length > 0)) return out;
+    // A segment cut by an unknown reset leaves out its end, the time from
+    // which the reset is unknown, as the 4th element.
     list.forEach(function (r, i) {
       var x = r[1];
       if (!(x > 0)) return;
@@ -1144,9 +2692,14 @@
     return out;
   }
 
-  // Where a line of the even pace starts after its cycle began, it extends
+  // Where a line of the even pace starts after its cycle began, because
+  // the reset was unknown before or moved within the cycle, it extends
   // back to the start of the cycle: the last rise of the samples by a reset
-  // since one window length before its reset.
+  // (RESET_JUMP) since one window length before its reset. Segments that
+  // follow each other with resets within RESET_DRIFT count as one line, so
+  // a reset that wavers by seconds extends nothing. The extensions are
+  // [a, b, x] like the segments of paceSegments, and the line they extend
+  // stays as it is.
   function paceExtensions(segments, points, length) {
     var out = [];
     points = points || [];
@@ -1163,6 +2716,9 @@
     return out;
   }
 
+  // The even pace at t, or null outside the segments. Where two segments
+  // meet, the later one counts, and where the reset becomes unknown there
+  // is none.
   function paceAt(segments, length, t) {
     var value = null;
     segments.forEach(function (s) {
@@ -1171,6 +2727,9 @@
     return value;
   }
 
+  // The even pace of a total: the mean of its accounts' even pace weighted
+  // like the total, only while every account has one. parts are
+  // {weight, segments}.
   function pooledPace(parts, length, t) {
     var sum = 0, total = 0;
     for (var i = 0; i < parts.length; i++) {
@@ -1182,6 +2741,10 @@
     return total ? sum / total : null;
   }
 
+  // The extended even pace of a total (paceExtensions): where any account
+  // has an extension, the mean with the extensions in place of the lines
+  // they extend, while every account has a value. parts are {weight,
+  // segments, extensions}.
   function extendedPace(parts, length, t) {
     var sum = 0, total = 0, used = false;
     for (var i = 0; i < parts.length; i++) {
@@ -1196,6 +2759,10 @@
     return used && total ? sum / total : null;
   }
 
+  // The even pace of a row: at(t) is its value, null where it has none,
+  // extended(t) the value of its extensions back to the cycle start, and
+  // breaks are the times where either can bend or jump. A pooled row
+  // combines the even pace of its accounts, each from its own resets.
   function rowPace(row, now) {
     var length = WINDOW_SECONDS[historyWindow];
     var parts = !length ? [] : (row.children || [row]).map(function (r) {
@@ -1226,7 +2793,11 @@
 
   // The current rate of use, in points per second, from a bottom-up
   // piecewise linear fit: neighbouring pieces merge, the closest fit first,
-  // while one line stays within QUANTUM points of all their samples.
+  // while one line stays within QUANTUM points of all their samples. Steps
+  // of whole percents then fit as one line, while a pause or a change in the
+  // rate of use starts a new piece, so how far back the rate looks depends
+  // on the samples. The slope between two samples of a staircase would be
+  // zero or a whole point in a moment.
   function recentSlope(pts) {
     if (pts.length < 2) return 0;
     var pieces = [], costs = [], i, j;
@@ -1245,19 +2816,25 @@
     return lineFit(pts, last[0], last[1]).slope;
   }
 
-  // The current rate of a 5-hour window, in points per second: the recent
-  // slope of this cycle's lowest readings so far (cycleFloor).
+  // The current rate of a 5-hour window, in points per second (rate): the
+  // recent slope of this cycle's lowest readings so far (cycleFloor). held
+  // tells whether the latest value counts until now, as a pause.
   function currentRate(row, now) {
     var floor = row.floor, start = 0;
     for (var i = 1; i < floor.length; i++) if (floor[i][1] > floor[i - 1][1]) start = i;
     var pts = floor.slice(start), tail = pts[pts.length - 1];
-    var held = now - tail[0] > (tail[2] === "passive" ? HOLD_AFTER : Math.max(HOLD_AFTER, sampleStep() * 1.5));
+    var held = now - tail[0] > (tail[2] === 1 ? HOLD_AFTER : Math.max(HOLD_AFTER, sampleStep() * 1.5));
     if (held) pts.push([now, tail[1]]);
     return { rate: recentSlope(pts), held: held };
   }
 
   // The rate of a 7-day window, in points per second: what this cycle has
-  // used so far, over the time since it began. Null when there is none.
+  // used so far, from its lowest reading (cycleFloor), over the time since it
+  // began, its reset less the window. The hours without use count too, so
+  // the rate follows the daily rhythm of use rather than its latest hours.
+  // A pooled row averages the rates of its accounts by their weights, each
+  // from its own reset, over the accounts with a cycle under way and a
+  // sample in it. Null when there is none.
   function cycleRate(row, now) {
     var length = WINDOW_SECONDS[historyWindow], sum = 0, total = 0;
     (row.children || [row]).forEach(function (r) {
@@ -1271,8 +2848,14 @@
 
   // The projection: from the latest value along the rate of use until the
   // quota runs out (out) or the window resets, with what is left then
-  // (left). A 5-hour window keeps its current rate; a 7-day window takes the
-  // rate of its cycle so far.
+  // (left). A 5-hour window keeps its current rate; a 7-day window, whose
+  // use comes in daily bursts, takes the rate of its cycle so far. A rate
+  // that does not fall stays level. It starts (t0) where the line of samples
+  // ends, now; for a 5-hour window whose rate does not yet hold the latest
+  // value until now, at the latest sample, so the line does not level off
+  // before a projection that still falls. Null without a reset ahead on the
+  // axis, without current data, with nothing left, without a rate, or for
+  // a total whose latest value is estimated.
   function projection(row, g, lastRun, limit) {
     var last = row.points[row.points.length - 1];
     if (g.to <= g.now || !lastRun || lastRun.end < g.now - limit || !(last[1] > 0)) return null;
@@ -1292,16 +2875,22 @@
   }
 
   // Detail: the selected row as a smoothed line that breaks at resets, the
-  // even pace by the scheduled resets (rowPace) and, when the axis reaches
-  // ahead, the projection at the current rate. A pooled row adds a band from
-  // its lowest to its highest account.
+  // even pace by the scheduled resets (rowPace) and, when the axis reaches ahead, the
+  // projection at the current rate. A pooled row adds a band from its
+  // lowest to its highest account.
   function renderDetail(row, head, box) {
     var g = chartView, limit = gapLimit();
     snapPoints = row.points;
     var group = !!row.children;
+    // An inactive window ends at its last sample, without projection or
+    // even pace.
     var stretches = runs(row.points, limit, row.inactive ? row.lastAt : g.now);
     var lastRun = stretches[stretches.length - 1];
     var ahead = row.inactive ? null : projection(row, g, lastRun, limit);
+    // Hold the last value to the end of each stretch so the line reaches it;
+    // the last stretch only to the start of the projection. One account
+    // resetting raises a pooled total by its share; the total line breaks
+    // only when that share is a visible jump.
     var pieces = stretches.map(function (run) {
       var pts = run.pts.slice(), tail = pts[pts.length - 1], end = ahead && run === lastRun ? ahead.t0 : run.end;
       if (end > tail[0]) pts.push([end].concat(tail.slice(1)));
@@ -1311,55 +2900,65 @@
     pieces.forEach(function (piece) { resets = resets.concat(piece.split.resets); });
     var even = row.inactive ? { breaks: [], at: function () { return null; }, extended: function () { return null; } } : rowPace(row, g.now);
 
-    head.appendChild(el("span", { class: "detail-name", text: row.name + " · " + (historyWindow === "5h" ? "5 小时额度" : "7 天额度") }));
-    if (row.inactive) head.appendChild(badge("muted", "已停用"));
-    head.appendChild(el("span", { class: "muted", text: group ? row.children.length + " 个账号合计，阴影为账号间的最低到最高" : row.sub }));
+    head.appendChild(el("span", { class: "detail-name" }, (row.orphan ? [el("span", { class: SENSITIVE, text: row.name })] : maskedNodes(row.name)).concat([" · " + translate(historyWindow === "5h" ? "quota_5h" : "quota_7d")])));
+    if (row.inactive) head.appendChild(badge("muted", translate("inactive")));
+    head.appendChild(el("span", { class: "muted" + (group ? "" : " " + SENSITIVE), text: group ? translate("pooled_note", row.children.length) : row.sub }));
+    head.appendChild(el("span", { class: "detail-tools" }, [maskButton(), snapshotButton("snapshot_detail", function () { return [$("chart-detail-wrap")]; })]));
     if (row.inactive) {
-      head.appendChild(el("span", { class: "detail-stat" }, [document.createTextNode("最后读数"),
+      head.appendChild(el("span", { class: "detail-stat" }, [document.createTextNode(translate("stat_last")),
         el("strong", { text: pct(row.last) + " · " + fmtDateTime(unixDate(row.lastAt)) })]));
     }
+    // The difference from the even pace: green with more left than the pace
+    // leaves, red with less.
     var pace = even.at(g.now), diff = pace == null ? null : Math.round(row.last - pace);
-    (row.inactive ? [] : [[group ? "合计" : "当前", pct(row.last)], ["匀速", pct(pace)],
-      ["差值", fmtDiff(diff), diff > 0 ? "ahead" : diff < 0 ? "behind" : ""],
-      ["距重置", row.reset ? fmtCountdown(row.reset * 1000 - Date.now()) : "—"]]).forEach(function (stat) {
+    (row.inactive ? [] : [[translate(group ? "stat_total" : "stat_current"), pct(row.last)], [translate("stat_pace"), pct(pace)],
+      [translate("stat_diff"), fmtDiff(diff), diff > 0 ? "ahead" : diff < 0 ? "behind" : ""],
+      [translate("stat_to_reset"), row.reset ? fmtCountdown(row.reset * 1000 - Date.now()) : "—"]]).forEach(function (stat) {
       head.appendChild(el("span", { class: "detail-stat" }, [document.createTextNode(stat[0]), el("strong", { class: stat[2] || null, text: stat[1] })]));
     });
 
     var H = 206, top = 22, bottom = 24, plotH = H - top - bottom;
     function y(v) { return top + (1 - v / 100) * plotH; }
-    var root = svg("svg", { viewBox: "0 0 " + g.width + " " + H, role: "img", "aria-label": row.name + " 剩余百分比" });
+    var spoken = masked && (row.orphan || hasSecret(row.name)) ? accountAlias(row.account) : row.name;
+    var root = svg("svg", { viewBox: "0 0 " + g.width + " " + H, role: "img", "aria-label": translate("detail_aria", spoken) });
     var defs = hatchPattern(root);
     var fade = svg("linearGradient", { id: "chart-fade", x1: 0, x2: 0, y1: 0, y2: 1 });
-    fade.appendChild(svg("stop", { offset: "0%", "stop-color": cssVar("--muted"), "stop-opacity": 0.18 }));
-    fade.appendChild(svg("stop", { offset: "100%", "stop-color": cssVar("--muted"), "stop-opacity": 0 }));
+    fade.appendChild(svg("stop", { offset: "0%", "stop-color": cssVar("--text-secondary"), "stop-opacity": 0.18 }));
+    fade.appendChild(svg("stop", { offset: "100%", "stop-color": cssVar("--text-secondary"), "stop-opacity": 0 }));
     defs.appendChild(fade);
+    // Samples before the start of an axis that ends ahead of now lie left of
+    // the plot; the lines are cut at its edge.
     var clip = svg("clipPath", { id: "chart-plot" });
     clip.appendChild(svg("rect", { x: g.labelW, y: 0, width: g.plotW, height: H }));
     defs.appendChild(clip);
     [0, 50, 100].forEach(function (v) {
-      root.appendChild(svg("line", { x1: g.labelW, x2: g.labelW + g.plotW, y1: y(v), y2: y(v), stroke: cssVar(v ? "--line" : "--muted"), "stroke-dasharray": v ? "2 4" : "none" }));
-      root.appendChild(svgText({ x: g.labelW - 8, y: y(v) + 4, "text-anchor": "end", "font-size": 11, fill: cssVar("--muted") }, v + "%"));
+      root.appendChild(svg("line", { x1: g.labelW, x2: g.labelW + g.plotW, y1: y(v), y2: y(v), stroke: cssVar(v ? "--border-color" : "--border-primary"), "stroke-dasharray": v ? "2 4" : "none" }));
+      root.appendChild(svgText({ x: g.labelW - 8, y: y(v) + 4, "text-anchor": "end", "font-size": 11, fill: cssVar("--text-tertiary") }, v + "%"));
     });
-    var low = quotaThresholds().low;
+    var low = status.config ? Number(status.config.low_threshold) : 0;
     if (low > 0 && low < 100) {
-      root.appendChild(svg("line", { x1: g.labelW, x2: g.labelW + g.plotW, y1: y(low), y2: y(low), stroke: cssVar("--danger"), "stroke-opacity": 0.5, "stroke-dasharray": "4 4" }));
-      root.appendChild(svgText({ x: g.labelW - 8, y: y(low) + 4, "text-anchor": "end", "font-size": 11, fill: cssVar("--danger") }, low + "%"));
+      root.appendChild(svg("line", { x1: g.labelW, x2: g.labelW + g.plotW, y1: y(low), y2: y(low), stroke: cssVar("--viz-failure"), "stroke-opacity": 0.5, "stroke-dasharray": "4 4" }));
+      root.appendChild(svgText({ x: g.labelW - 8, y: y(low) + 4, "text-anchor": "end", "font-size": 11, fill: cssVar("--viz-failure") }, low + "%"));
     }
+    // The time the projection runs out goes on the time axis, in place of the
+    // tick labels it would cover.
     var outLabel = null;
     if (ahead && ahead.out != null) {
       var outText = historyWindow === "7d" ? fmtDateTime(unixDate(ahead.out)) : fmtClock(unixDate(ahead.out));
       var outW = outText.length * CHAR_W;
       outLabel = { text: outText, w: outW, x: Math.max(g.labelW + outW / 2, Math.min(g.width - outW / 2, g.x(ahead.out))) };
     }
+    // A tick at the edge of the plot keeps its label but not its grid line,
+    // which would run beside the edge line.
     var ticks = chartTicks(g);
     ticks.list.forEach(function (t) {
       var tx = g.x(t);
       if (tx > g.labelW + 4 && tx < g.labelW + g.plotW - 4) {
-        root.appendChild(svg("line", { x1: tx, x2: tx, y1: top, y2: top + plotH, stroke: cssVar("--line"), "stroke-dasharray": "2 4" }));
+        root.appendChild(svg("line", { x1: tx, x2: tx, y1: top, y2: top + plotH, stroke: cssVar("--border-color"), "stroke-dasharray": "2 4" }));
       }
       var text = ticks.label(t);
       if (outLabel && Math.abs(g.x(t) - outLabel.x) < (outLabel.w + text.length * CHAR_W) / 2 + 6) return;
-      root.appendChild(svgText({ x: g.x(t), y: H - 6, "text-anchor": "middle", "font-size": 11, fill: cssVar("--muted") }, text));
+      root.appendChild(svgText({ x: g.x(t), y: H - 6, "text-anchor": "middle", "font-size": 11, fill: cssVar("--text-tertiary") }, text));
     });
 
     var cursor = g.from;
@@ -1367,18 +2966,28 @@
       if (run.start > cursor + limit) hatchRect(root, g, cursor, run.start, top, plotH);
       cursor = run.end;
     });
+    // With a projection, the hatching starts where it does, the end of the line.
     hatchRect(root, g, ahead ? ahead.t0 : row.inactive ? cursor : dataEnd(g, cursor, limit), g.to, top, plotH);
+    // The first stretch on the axis: a sample before it, from before the
+    // range, can form a stretch of its own that ends left of the axis.
+    // A window without samples on the axis has no data up to now.
     var firstIn = stretches.filter(function (run) { return run.end > g.from; })[0];
     if (!firstIn || firstIn.start > g.from + limit) {
       root.appendChild(svgText({ x: (g.x(g.from) + g.x(firstIn ? firstIn.start : Math.min(g.now, g.to))) / 2, y: top + plotH / 2 + 4, "text-anchor": "middle", "font-size": 12,
-        fill: cssVar("--muted"), "class": "row-name" }, "无数据"));
+        fill: cssVar("--text-tertiary"), "class": "row-name" }, translate("no_data")));
     }
+
+    // The edges of the plot, solid like the 0% line, over the hatching and
+    // beneath the lines and their marks.
     [g.labelW, g.labelW + g.plotW].forEach(function (x) {
-      root.appendChild(svg("line", { x1: x, x2: x, y1: top, y2: top + plotH, stroke: cssVar("--muted") }));
+      root.appendChild(svg("line", { x1: x, x2: x, y1: top, y2: top + plotH, stroke: cssVar("--border-primary") }));
     });
 
     var plot = svg("g", { "clip-path": "url(#chart-plot)" });
     root.appendChild(plot);
+    // Drawn first, so the even-pace line lies beneath the curves. It is
+    // straight between two breaks, and its value just inside each end
+    // decides whether it continues from the previous piece or jumps.
     var times = [g.from, g.to].concat(even.breaks.filter(function (t) { return t > g.from && t < g.to; })).sort(function (a, b) { return a - b; });
     function pacePath(at) {
       var d = "", end = null;
@@ -1394,8 +3003,10 @@
       return d;
     }
     var paceD = pacePath(even.at), extendedD = pacePath(even.extended);
-    if (paceD) plot.appendChild(svg("path", { d: paceD, fill: "none", stroke: cssVar("--muted"), "stroke-opacity": 0.8, "stroke-width": 1.5, "stroke-dasharray": "6 4" }));
-    if (extendedD) plot.appendChild(svg("path", { d: extendedD, fill: "none", stroke: cssVar("--muted"), "stroke-opacity": 0.8, "stroke-width": 1.5, "stroke-dasharray": "8 3 1.5 3" }));
+    if (paceD) plot.appendChild(svg("path", { d: paceD, fill: "none", stroke: cssVar("--text-tertiary"), "stroke-opacity": 0.8, "stroke-width": 1.5, "stroke-dasharray": "6 4" }));
+    // The extension back to the cycle start: dash-dot, apart from the
+    // dashes of the even pace and the dots of the projection.
+    if (extendedD) plot.appendChild(svg("path", { d: extendedD, fill: "none", stroke: cssVar("--text-tertiary"), "stroke-opacity": 0.8, "stroke-width": 1.5, "stroke-dasharray": "8 3 1.5 3" }));
     $("legend-pace-extended").hidden = !extendedD;
     var estimatedShown = false;
     pieces.forEach(function (piece) {
@@ -1403,71 +3014,83 @@
         if (part.length < 2) return;
         var upper = curvePoints(declining(part, 4), 4).map(function (p) { return [g.x(p[0]), y(p[4])]; });
         var lower = curvePoints(declining(part, 3), 3).map(function (p) { return [g.x(p[0]), y(p[3])]; }).reverse();
-        plot.appendChild(svg("path", { d: monotonePath(upper) + monotonePath(lower).replace(/^M/, "L") + "Z", fill: cssVar("--muted"), "fill-opacity": 0.13 }));
+        plot.appendChild(svg("path", { d: monotonePath(upper) + monotonePath(lower).replace(/^M/, "L") + "Z", fill: cssVar("--text-secondary"), "fill-opacity": 0.13 }));
       });
+      // Each piece starts at its reset sample, so the return to full is a
+      // break in the line rather than a slope that never happened.
+      // A total with an account's share estimated (pooled) is dashed there.
       piece.split.parts.forEach(function (part) {
         estimatedRuns(declining(part, 1)).forEach(function (run) {
           var xy = curvePoints(run.pts, 1).map(function (p) { return [g.x(p[0]), y(p[1])]; });
           if (xy.length === 1) xy.push([xy[0][0] + 1, xy[0][1]]);
           var d = monotonePath(xy);
           if (!group) plot.appendChild(svg("path", { d: d + "L" + xy[xy.length - 1][0] + " " + y(0) + "L" + xy[0][0] + " " + y(0) + "Z", fill: "url(#chart-fade)" }));
-          var line = { d: d, fill: "none", stroke: cssVar("--text"), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" };
+          var line = { d: d, fill: "none", stroke: cssVar("--text-primary"), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" };
           if (run.estimated) { line["stroke-dasharray"] = "5 4"; line["stroke-opacity"] = 0.7; }
           plot.appendChild(svg("path", line));
           if (run.estimated) estimatedShown = true;
         });
       });
     });
+    // Like the extension's, the legend explains the dashes only when drawn.
     $("legend-estimated").hidden = !estimatedShown;
     var lastLabel = -99;
     resets.forEach(function (t) {
       if (t < g.from) return;
       var x = g.x(t);
-      root.appendChild(svg("line", { x1: x, x2: x, y1: top - 4, y2: top + plotH, stroke: cssVar("--muted"), "stroke-opacity": 0.7, "stroke-dasharray": "3 3" }));
+      root.appendChild(svg("line", { x1: x, x2: x, y1: top - 4, y2: top + plotH, stroke: cssVar("--text-tertiary"), "stroke-opacity": 0.7, "stroke-dasharray": "3 3" }));
       if (x - lastLabel > 52) {
-        root.appendChild(svgText({ x: x, y: top - 8, "text-anchor": "middle", "font-size": 11, fill: cssVar("--muted") }, "↻ " + fmtClock(unixDate(t))));
+        root.appendChild(svgText({ x: x, y: top - 8, "text-anchor": "middle", "font-size": 11, fill: cssVar("--text-tertiary") }, "↻ " + fmtClock(unixDate(t))));
         lastLabel = x;
       }
     });
+    var groups = group ? row.groups : [row.group];
     ignitionEvents(g).forEach(function (ev) {
+      if (groups.indexOf(ev.group) < 0) return;
       var x = g.x(ev.t), base = top + plotH;
       if (ev.failed) root.appendChild(svg("path", { d: "M" + (x - 4) + " " + (base - 8) + "L" + (x + 4) + " " + base + "M" + (x + 4) + " " + (base - 8) + "L" + (x - 4) + " " + base,
-        stroke: cssVar("--danger"), "stroke-width": 2.2, "stroke-linecap": "round" }));
-      else root.appendChild(svg("path", { d: "M" + x + " " + (base - 7) + "L" + (x + 4) + " " + base + "L" + (x - 4) + " " + base + "Z", fill: cssVar("--ok") }));
+        stroke: cssVar("--viz-failure"), "stroke-width": 2.2, "stroke-linecap": "round" }));
+      else root.appendChild(svg("path", { d: "M" + x + " " + (base - 7) + "L" + (x + 4) + " " + base + "L" + (x - 4) + " " + base + "Z", fill: cssVar("--viz-success") }));
     });
+    // The projection ends where the quota runs out, with the time on the
+    // time axis, or at the reset, the right end of the plot, with what is
+    // left beside it.
     var rightX = g.labelW + g.plotW + 10;
     if (ahead) {
       var px = g.x(ahead.end), py = y(ahead.out != null ? 0 : ahead.left);
-      root.appendChild(svg("line", { x1: g.x(ahead.t0), y1: y(ahead.v0), x2: px, y2: py, stroke: cssVar("--text"), "stroke-opacity": 0.75,
+      root.appendChild(svg("line", { x1: g.x(ahead.t0), y1: y(ahead.v0), x2: px, y2: py, stroke: cssVar("--text-primary"), "stroke-opacity": 0.75,
         "stroke-width": 2, "stroke-dasharray": "1 4", "stroke-linecap": "round" }));
-      root.appendChild(svg("circle", { cx: px, cy: py, r: 3, fill: cssVar("--text"), stroke: cssVar("--card"), "stroke-width": 1.5 }));
-      if (outLabel) root.appendChild(svgText({ x: outLabel.x, y: H - 6, "text-anchor": "middle", "font-size": 11, "font-weight": 650, fill: cssVar("--text") }, outLabel.text));
-      else root.appendChild(svgText({ x: rightX, y: py + 4, "font-size": 12, "font-weight": 650, fill: cssVar("--muted") }, pct(ahead.left)));
+      root.appendChild(svg("circle", { cx: px, cy: py, r: 3, fill: cssVar("--text-primary"), stroke: cssVar("--bg-primary"), "stroke-width": 1.5 }));
+      if (outLabel) root.appendChild(svgText({ x: outLabel.x, y: H - 6, "text-anchor": "middle", "font-size": 11, "font-weight": 650, fill: cssVar("--text-primary") }, outLabel.text));
+      else root.appendChild(svgText({ x: rightX, y: py + 4, "font-size": 12, "font-weight": 650, fill: cssVar("--text-secondary") }, pct(ahead.left)));
     }
     var last = row.points[row.points.length - 1];
     if (last && !row.inactive && lastRun.end >= g.now - limit) {
-      root.appendChild(svg("circle", { cx: g.x(ahead ? ahead.t0 : lastRun.end), cy: y(last[1]), r: 4, fill: cssVar("--text"), stroke: cssVar("--card"), "stroke-width": 2 }));
+      root.appendChild(svg("circle", { cx: g.x(ahead ? ahead.t0 : lastRun.end), cy: y(last[1]), r: 4, fill: cssVar("--text-primary"), stroke: cssVar("--bg-primary"), "stroke-width": 2 }));
     }
+    // An axis that ends now shows the current value and the even pace at the
+    // ends of their lines, with the difference between them. The difference
+    // sits halfway, and values too close to it move apart.
     if (g.to <= g.now && !row.inactive) {
       var yNow = y(row.last), yPace = pace == null ? null : y(pace);
-      if (yPace == null) root.appendChild(svgText({ x: rightX, y: yNow + 4, "font-size": 13, "font-weight": 650, fill: cssVar("--text") }, pct(row.last)));
+      if (yPace == null) root.appendChild(svgText({ x: rightX, y: yNow + 4, "font-size": 13, "font-weight": 650, fill: cssVar("--text-primary") }, pct(row.last)));
       else {
         var mid = (yNow + yPace) / 2, upper = yNow <= yPace;
         var yA = Math.min(upper ? yNow : yPace, mid - LABEL_H), yB = Math.max(upper ? yPace : yNow, mid + LABEL_H);
         var shift = Math.max(0, top - yA) - Math.max(0, yB - (top + plotH));
-        root.appendChild(svgText({ x: rightX, y: (upper ? yA : yB) + shift + 4, "font-size": 13, "font-weight": 650, fill: cssVar("--text") }, pct(row.last)));
-        root.appendChild(svgText({ x: rightX, y: (upper ? yB : yA) + shift + 4, "font-size": 12, fill: cssVar("--muted") }, pct(pace)));
+        root.appendChild(svgText({ x: rightX, y: (upper ? yA : yB) + shift + 4, "font-size": 13, "font-weight": 650, fill: cssVar("--text-primary") }, pct(row.last)));
+        root.appendChild(svgText({ x: rightX, y: (upper ? yB : yA) + shift + 4, "font-size": 12, fill: cssVar("--text-tertiary") }, pct(pace)));
         root.appendChild(svgText({ x: rightX, y: mid + shift + 4, "font-size": 12, "font-weight": 650,
-          fill: cssVar(diff > 0 ? "--ok" : diff < 0 ? "--danger" : "--muted") }, fmtDiff(diff)));
+          fill: cssVar(diff > 0 ? "--viz-success" : diff < 0 ? "--viz-failure" : "--text-secondary") }, fmtDiff(diff)));
       }
     }
 
-    var cross = svg("line", { y1: top, y2: top + plotH, stroke: cssVar("--muted"), visibility: "hidden", "pointer-events": "none" });
+    var cross = svg("line", { y1: top, y2: top + plotH, stroke: cssVar("--text-tertiary"), visibility: "hidden", "pointer-events": "none" });
     root.appendChild(cross);
-    var dot = svg("circle", { r: 4, fill: cssVar("--text"), stroke: cssVar("--card"), "stroke-width": 2, visibility: "hidden", "pointer-events": "none" });
+    var dot = svg("circle", { r: 4, fill: cssVar("--text-primary"), stroke: cssVar("--bg-primary"), "stroke-width": 2, visibility: "hidden", "pointer-events": "none" });
     root.appendChild(dot);
     var hit = svg("rect", { x: g.labelW, y: top, width: g.plotW, height: plotH, fill: "transparent", tabindex: "0",
-      "aria-label": "按左右方向键查看各时刻的数值" });
+      "aria-label": translate("detail_keys") });
     hit.addEventListener("pointermove", function (e) { hoverAt(e, root, row.id, "detail"); });
     root.appendChild(hit);
     root.addEventListener("pointerleave", function () { setHover(null); });
@@ -1494,14 +3117,15 @@
     function paceRow(t) {
       var value = even.at(t), extended = even.extended(t);
       if (value != null) tip.appendChild(el("div", { class: "row pace" }, [el("span", { class: "key" }),
-        el("span", { class: "name", text: "匀速参考" }), el("span", { class: "value", text: pct(value) })]));
+        el("span", { class: "name", text: translate("pace_reference") }), el("span", { class: "value", text: pct(value) })]));
       if (extended != null) tip.appendChild(el("div", { class: "row pace extended" }, [el("span", { class: "key" }),
-        el("span", { class: "name", text: "匀速参考（往回延长）" }), el("span", { class: "value", text: pct(extended) })]));
+        el("span", { class: "name", text: translate("pace_extended") }), el("span", { class: "value", text: pct(extended) })]));
     }
 
     hoverListeners.push(function (t) {
       if (t == null) { cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); tip.hidden = true; return; }
       cross.setAttribute("x1", g.x(t)); cross.setAttribute("x2", g.x(t)); cross.setAttribute("visibility", "visible");
+      // After now: the projection and the even pace at the pointer's time.
       if (t > g.now) {
         var projected = ahead ? ahead.at(t) : null;
         if (projected != null) { dot.setAttribute("cx", g.x(t)); dot.setAttribute("cy", y(projected)); dot.setAttribute("visibility", "visible"); }
@@ -1510,7 +3134,7 @@
         clear(tip);
         tip.appendChild(el("div", { class: "time", text: fmtDateTime(unixDate(t)) }));
         tip.appendChild(el("div", { class: "row projection strong" }, [el("span", { class: "key" }),
-          el("span", { class: "name", text: historyWindow === "5h" ? "按当前速度" : "按本周期日均" }), el("span", { class: "value", text: pct(projected) })]));
+          el("span", { class: "name", text: translate("projected_" + historyWindow) }), el("span", { class: "value", text: pct(projected) })]));
         paceRow(t);
         tip.hidden = false;
         placeTip(tip, box, g, t, 6);
@@ -1524,21 +3148,36 @@
       clear(tip);
       tip.appendChild(el("div", { class: "time", text: fmtDateTime(unixDate(t)) }));
       if (group) {
-        tipRow(tip, "合计" + (p && p[5] ? "（估算）" : ""), p ? p[1] : null, true);
+        tipRow(tip, translate("total") + (p && p[5] ? translate("estimated_suffix") : ""), p ? p[1] : null, true);
         row.children.slice(0, 6).forEach(function (c) {
           var q = valueAt(c.points, t);
           tipRow(tip, "　" + c.sub, q && t - q[0] <= limit ? q[1] : null, false);
         });
-        if (row.children.length > 6) tip.appendChild(el("div", { class: "row muted", text: "　… 另 " + (row.children.length - 6) + " 个账号" }));
+        if (row.children.length > 6) tip.appendChild(el("div", { class: "row muted", text: translate("more_accounts", row.children.length - 6) }));
       } else {
-        tipRow(tip, row.name + (p ? (p[2] === "passive" ? "（被动）" : "（主动）") : ""), p ? p[1] : null, true);
+        tipRow(tip, row.name + (p ? translate(p[2] === 1 ? "passive_sample" : "active_sample") : ""), p ? p[1] : null, true);
       }
       paceRow(t);
       var near = (g.to - g.from) / g.plotW * 8;
-      resets.forEach(function (r) { if (r >= g.from && Math.abs(r - t) <= near) tip.appendChild(el("div", { class: "note", text: fmtClock(unixDate(r)) + " 额度重置" })); });
+      resets.forEach(function (r) { if (r >= g.from && Math.abs(r - t) <= near) tip.appendChild(el("div", { class: "note", text: fmtClock(unixDate(r)) + " " + translate("quota_reset") })); });
       tip.hidden = false;
       placeTip(tip, box, g, t, 6);
     });
+  }
+
+  // The detail chart's heading goes, as a column (.side), into the blank
+  // left of the plot that lines the plot up with the overview; the plot
+  // stays where it is. The y-axis labels keep the right SIDE_GAP pixels of
+  // the blank. Where the blank is too narrow, in a chart below 640 pixels
+  // wide (labelW 120), or too short for the heading, such as with a long
+  // name, the heading stays above the chart.
+  var SIDE_GAP = 46;
+  function placeDetailHead(wrap, head, box, g) {
+    wrap.classList.remove("side");
+    if (g.labelW < 190 || g.width !== box.clientWidth) return;
+    wrap.style.setProperty("--detail-side", (g.labelW - SIDE_GAP) + "px");
+    wrap.classList.add("side");
+    if (head.offsetHeight > box.offsetHeight) wrap.classList.remove("side");
   }
 
   function hoverAt(e, root, rowId, source) {
@@ -1574,13 +3213,13 @@
       (r.children || [r]).forEach(function (c) {
         var values = c.points.filter(function (p) { return p[0] >= from; }).map(function (p) { return p[1]; });
         table.appendChild(el("tr", {}, [
-          el("td", { text: c.name }),
-          el("td", { text: c.sub }),
+          c.orphan ? el("td", { class: SENSITIVE, text: c.name }) : el("td", {}, maskedNodes(c.name)),
+          el("td", { class: SENSITIVE, text: c.sub }),
           el("td", { class: "num", text: pct(c.last) }),
           el("td", { class: "num", text: pct(values.length ? Math.min.apply(null, values) : null) }),
           el("td", { class: "num", text: pct(values.length ? Math.max.apply(null, values) : null) }),
           el("td", { class: "num", text: String(values.length) }),
-          el("td", { class: "num", text: c.inactive ? "已停用" : c.reset ? fmtCountdown(c.reset * 1000 - Date.now()) : "—" })
+          el("td", { class: "num", text: c.inactive ? translate("inactive") : c.reset ? fmtCountdown(c.reset * 1000 - Date.now()) : "—" })
         ]));
       });
     });
@@ -1589,19 +3228,22 @@
   // The level swatches of the legend, with the thresholds in use.
   function renderLegend() {
     var t = quotaThresholds();
-    $("legend-full").textContent = "满 100%";
-    $("legend-high").textContent = "高 > " + t.notice + "%";
-    $("legend-medium").textContent = "中 " + t.low + "–" + t.notice + "%";
-    $("legend-low").textContent = "低 ≤ " + t.low + "%";
-    $("legend-empty").textContent = "空 0%";
+    $("legend-full").textContent = translate("level_full") + " 100%";
+    $("legend-high").textContent = translate("level_high") + " > " + t.notice + "%";
+    $("legend-medium").textContent = translate("level_medium") + " " + t.low + "–" + t.notice + "%";
+    $("legend-low").textContent = translate("level_low") + " ≤ " + t.low + "%";
+    $("legend-empty").textContent = translate("level_empty") + " 0%";
   }
 
+  // The chart is cleared and drawn again, and drawing it measures its width,
+  // which lays the page out while the chart is empty. The card keeps its
+  // height meanwhile, or the shorter page would pull the scroll position up.
   function renderChart() {
     renderLegend();
     // The chart measures its width, so a hidden chart is drawn when its view
     // shows.
-    if ($("quota").hidden) return;
-    var card = $("chart-card");
+    if ($("view-quota").hidden) return;
+    var card = $("chart").parentNode;
     card.style.minHeight = card.offsetHeight + "px";
     try {
       drawChart();
@@ -1621,12 +3263,12 @@
     snapPoints = [];
     $("chart-detail-wrap").hidden = true;
     if (!history || !status) {
-      overview.appendChild(el("div", { class: "empty", text: historyFailed ? "读取历史失败：" + historyFailed : "加载中…" }));
+      overview.appendChild(el("div", { class: "empty", text: historyFailed ? translate("history_failed", historyFailed) : translate("loading") }));
       return;
     }
     var rows = chartRows();
     if (!rows.length) {
-      overview.appendChild(el("div", { class: "empty", text: "这个范围内还没有额度数据。" }));
+      overview.appendChild(el("div", { class: "empty", text: translate("no_history") }));
       return;
     }
     if (!findRow(rows, chartSelected)) chartSelected = rows[0].id;
@@ -1634,35 +3276,62 @@
     renderOverview(rows, overview, axisEnd(selected));
     $("chart-detail-wrap").hidden = false;
     renderDetail(selected, head, detail);
+    placeDetailHead($("chart-detail-wrap"), head, detail, chartView);
     renderChartTable(rows);
-    $("legend-projection").textContent = historyWindow === "5h" ? "按当前速度的延长线" : "按本周期日均的延长线";
+    $("legend-projection").textContent = translate("legend_projection_" + historyWindow);
   }
 
+  // The buttons are rebuilt only when the window or the language changes;
+  // otherwise the chosen range is marked in place, so the thumb stays on its
+  // buttons. Clicks are handled by bindSegmented.
   function renderRangeButtons() {
     var box = $("range-buttons");
-    var shown = chartWindow;
+    var shown = chartWindow + " " + lang;
     if (box.getAttribute("data-shown") !== shown) {
       box.setAttribute("data-shown", shown);
-      Array.prototype.forEach.call(box.querySelectorAll(".seg"), function (b) { box.removeChild(b); });
-      RANGES[chartWindow].forEach(function (r) {
-        box.appendChild(el("button", { type: "button", class: "seg", "data-value": r[0], text: r[2] === "h" ? r[1] + " 小时" : r[2] === "d" ? r[1] + " 天" : r[1] + " 个月" }));
+      Array.prototype.forEach.call(box.querySelectorAll(".seg"), function (b) {
+        thumbObserver.unobserve(b);
+        box.removeChild(b);
       });
+      RANGES[chartWindow].forEach(function (r) {
+        box.appendChild(el("button", { type: "button", class: "seg", "data-value": r[0], text: translate("range_" + r[2], r[1]) }));
+      });
+      observeOptions(box);
     }
     pressSegment("range-buttons", range);
   }
 
-  // Chart filters and expanded groups are kept in this browser's
-  // localStorage as {window, sort, ranges: {"5h": ..., "7d": ...}} and a
-  // list of expanded group names ("all" for the pooled total).
+  // With remember_chart_filters on, the chart filters are kept in this
+  // browser's localStorage as {window, sort, ranges: {"5h": ..., "7d": ...}}
+  // and restored when the page opens. Each window keeps its own range because
+  // the two windows offer different ranges.
+  // With remember_chart_expanded on, CHART_EXPANDED_STORE lists the
+  // expanded totals by the id of their row without "group:", the provider
+  // and the label, as in "claude|Claude"; one list serves both windows.
+  // The switches read the settings form, so a change applies before it is
+  // saved.
   var CHART_STORE = "phoenix-chart-filters";
   var CHART_EXPANDED_STORE = "phoenix-chart-expanded";
 
+  function rememberChart() {
+    var input = $("settings").elements["remember_chart_filters"];
+    return !!(input && input.checked);
+  }
+
+  function rememberExpanded() {
+    var input = $("settings").elements["remember_chart_expanded"];
+    return !!(input && input.checked);
+  }
+
+  // The expanded groups. Groups the chart does not show, such as those of
+  // the other window or of an account that is gone, stay in the list.
   function expandedGroups() {
     return Object.keys(chartExpanded).filter(function (id) {
       return chartExpanded[id] && id.indexOf("group:") === 0;
     }).map(function (id) { return id.slice(6); });
   }
 
+  // The saved groups; a record that is not a list of names counts as none.
   function storedExpanded() {
     var saved = null;
     try { saved = JSON.parse(localStorage.getItem(CHART_EXPANDED_STORE) || "null"); } catch (err) {}
@@ -1670,6 +3339,7 @@
     return saved.filter(function (name) { return typeof name === "string" && name; });
   }
 
+  // Writes the saved groups, or deletes the record when there is none.
   function writeExpanded(names) {
     try {
       if (names.length) localStorage.setItem(CHART_EXPANDED_STORE, JSON.stringify(names));
@@ -1677,15 +3347,34 @@
     } catch (err) {}
   }
 
+  // Adds or removes the group of row id in the saved list as the chart now
+  // shows it. The list is read again first, so that the groups another tab
+  // of this browser expanded or collapsed meanwhile are kept.
   function saveGroupExpanded(id) {
-    if (id.indexOf("group:") !== 0) return;
+    if (!rememberExpanded() || id.indexOf("group:") !== 0) return;
     var name = id.slice(6);
     var names = storedExpanded().filter(function (n) { return n !== name; });
     if (chartExpanded[id]) names.push(name);
     writeExpanded(names);
   }
 
+  // Adds the groups expanded now to the saved list, when the switch turns on.
+  function saveChartExpanded() {
+    if (!rememberExpanded()) return;
+    var names = storedExpanded();
+    expandedGroups().forEach(function (name) { if (names.indexOf(name) < 0) names.push(name); });
+    writeExpanded(names);
+  }
+
+  // Expands the saved groups. Names without a row stay in the list until
+  // the user collapses the group. With the switch off, as when it was
+  // turned off in config.yaml or another browser, the record is deleted,
+  // so that turning it on again does not bring back old groups.
   function restoreChartExpanded() {
+    if (!rememberExpanded()) {
+      writeExpanded([]);
+      return;
+    }
     storedExpanded().forEach(function (name) { chartExpanded["group:" + name] = true; });
   }
 
@@ -1698,6 +3387,7 @@
   }
 
   function saveChartFilters() {
+    if (!rememberChart()) return;
     var saved = storedChartFilters();
     var ranges = saved.ranges && typeof saved.ranges === "object" ? saved.ranges : {};
     ranges[chartWindow] = range;
@@ -1706,14 +3396,33 @@
     } catch (err) {}
   }
 
+  // Turning a chart switch on keeps the current state; turning it off
+  // forgets it.
+  function changeChartSwitch(input) {
+    var expanded = input.name === "remember_chart_expanded";
+    if (input.checked) {
+      if (expanded) saveChartExpanded();
+      else saveChartFilters();
+    } else {
+      try { localStorage.removeItem(expanded ? CHART_EXPANDED_STORE : CHART_STORE); } catch (err) {}
+    }
+  }
+
+  // The remembered range of a window, or its default when nothing valid is saved.
   function rangeFor(kind) {
-    var ranges = storedChartFilters().ranges;
+    var ranges = rememberChart() ? storedChartFilters().ranges : null;
     var saved = ranges && typeof ranges === "object" ? ranges[kind] : null;
     return RANGES[kind].some(function (r) { return r[0] === saved; }) ? saved : DEFAULT_RANGE[kind];
   }
 
+  // Restores the chart state when the page opens. A switch that is off
+  // deletes its record, as turning it off on this page would.
   function restoreChartFilters() {
     restoreChartExpanded();
+    if (!rememberChart()) {
+      try { localStorage.removeItem(CHART_STORE); } catch (err) {}
+      return;
+    }
     var saved = storedChartFilters();
     if (windowKinds().indexOf(saved.window) >= 0) chartWindow = saved.window;
     if (saved.sort === "default" || saved.sort === "low") chartSort = saved.sort;
@@ -1732,13 +3441,15 @@
   var historyPending = {};
   var historySeq = 0;
   var historyTicket = 0;
+  var historyRange = "";
   var historyLoading = "";
   var historyFailed = "";
 
   function historyKey(kind, name) { return kind + "|" + name; }
 
   // Requests a history, or joins the request for it that is under way unless
-  // fresh is set.
+  // fresh is set. The cache keeps the response of the latest request, and
+  // the promise resolves to it.
   function fetchHistory(kind, name, fresh) {
     var key = historyKey(kind, name);
     if (historyPending[key] && !fresh) return historyPending[key].promise;
@@ -1758,25 +3469,7 @@
     return entry.promise;
   }
 
-  // The history contract lists resets as [unix_seconds, remaining]: the time
-  // a reset happened and the remaining after it. Pace segments need
-  // [sample time, reset due], so each reset becomes [reset - period, reset]:
-  // during the cycle ending at the reset, that reset was the due one.
-  function normalizeHistory(data, kind) {
-    // The cached response object is normalized in place; guard against a
-    // second pass over the same object.
-    if (!data || data._phoenixNormalized) return;
-    data._phoenixNormalized = true;
-    var period = WINDOW_SECONDS[kind] || 0;
-    (data.series || []).forEach(function (s) {
-      var resets = Array.isArray(s.resets) ? s.resets : [];
-      s.resetTimes = resets.map(function (r) { return r[0]; });
-      s.resets = resets.map(function (r) { return [r[0] - period, r[0]]; });
-    });
-  }
-
   function showHistory(kind, name, data) {
-    normalizeHistory(data, kind);
     history = data;
     historyWindow = kind;
     historyRange = name;
@@ -1784,6 +3477,9 @@
     renderChart();
   }
 
+  // Loads the chosen chart; fresh skips a request already under way, for
+  // data that an action has just changed. Resolves to true when the chart
+  // was drawn from the response.
   function loadHistory(fresh) {
     var kind = chartWindow, name = range, key = historyKey(kind, name), ticket = ++historyTicket;
     historyLoading = key;
@@ -1798,7 +3494,8 @@
     }).catch(function (err) {
       if (ticket !== historyTicket) return false;
       historyLoading = "";
-      if (err.message !== "unauthorized") toast("读取历史失败：" + err.message);
+      if (err.message !== "unauthorized") toast(translate("history_failed", err.message));
+      // Without data of the chosen chart, the old chart gives way to the error.
       if (err.message !== "unauthorized" && historyKey(historyWindow, historyRange) !== key) {
         history = null;
         historyFailed = err.message;
@@ -1810,26 +3507,33 @@
 
   // The status shows a reading the drawn chart lacks: an active query after
   // the last sample of its window, or a remaining that differs from it.
+  // Passive readings that repeat the value are not written to the history,
+  // so they do not count.
   function historyBehind() {
     var last = {};
-    history.series.forEach(function (s) { if (s.points && s.points.length) last[s.auth_index + "|" + s.window] = s.points[s.points.length - 1]; });
+    history.series.forEach(function (s) { if (s.points && s.points.length) last[s.group + "|" + s.window] = s.points[s.points.length - 1]; });
     var loaded = new Date(history.to).getTime() / 1000;
+    // Without new readings the range still moves on, and an inactive
+    // window hides once its last sample leaves it.
     if (Date.now() / 1000 - loaded > Math.max(300, sampleStep())) return true;
     return (status.accounts || []).some(function (a) {
-      return (a.windows || []).some(function (w) {
-        var seen = parseTime(w.observed_at);
-        if ((w.kind || w.short) !== historyWindow || !seen) return false;
-        var t = seen.getTime() / 1000, p = last[a.auth_index + "|" + w.id];
-        if (!p) return t > loaded;
-        return t >= p[0] + 1 && (w.source === "active" || w.remaining !== p[1]);
+      return (a.groups || []).some(function (g) {
+        return (g.windows || []).some(function (w) {
+          var seen = parseTime(w.observed_at);
+          if (w.kind !== historyWindow || !seen) return false;
+          var t = seen.getTime() / 1000, p = last[g.key + "|" + w.id];
+          if (!p) return t > loaded;
+          return t >= p[0] + 1 && (w.source === "active" || w.remaining !== p[1]);
+        });
       });
     });
   }
 
   // Loads the drawn chart again when the status shows newer readings. While
   // the pointer is over the chart or a sample has the keyboard focus, a
-  // redraw would replace the crosshair and tooltip, so the new data waits.
-  var chartCard = $("chart-card");
+  // redraw would replace the crosshair and tooltip, or the focused element,
+  // so the new data waits until the pointer and the focus leave.
+  var chartCard = $("chart").parentNode;
   var chartPointer = false;
   var chartBehind = false;
 
@@ -1839,14 +3543,15 @@
     fetchHistory(historyWindow, historyRange, true).then(function (data) {
       if (ticket !== historyTicket || historyWindow !== chartWindow || historyRange !== range) return;
       history = data;
-      normalizeHistory(history, historyWindow);
       if (chartPointer || chartCard.contains(document.activeElement)) chartBehind = true;
       else renderChart();
     }).catch(function () { /* tried again after the next status */ });
   }
 
   // After the first chart loads, the other window's chart is fetched so that
-  // switching to it does not wait.
+  // switching to it does not wait. Both kinds are fetched, since a kind no
+  // account reports any more is offered while its history has samples in
+  // the range.
   function prefetchHistory() {
     ["5h", "7d"].forEach(function (kind) {
       var name = rangeFor(kind);
@@ -1857,198 +3562,593 @@
   }
 
   // ---- Settings ----
-  function setField(input, value) {
-    if (!input) return;
-    if (input.settingsDirty || document.activeElement === input) return;
-    if (input.type === "checkbox") input.checked = !!value;
-    else input.value = value == null ? "" : value;
+
+  function getPath(obj, path) {
+    return path.split(".").reduce(function (value, part) { return value && typeof value === "object" ? value[part] : undefined; }, obj);
   }
 
-  function setSecret(input, isSet, placeholder) {
-    if (!input) return;
-    if (input.settingsDirty || document.activeElement === input) return;
-    input.value = "";
-    input.placeholder = isSet ? "已设置（留空不修改）" : placeholder;
-  }
-
-  function setRadio(name, value) {
-    var inputs = document.querySelectorAll('input[name="' + name + '"]');
-    var dirty = false;
-    Array.prototype.forEach.call(inputs, function (i) { if (i.settingsDirty) dirty = true; });
-    if (dirty) return;
-    Array.prototype.forEach.call(inputs, function (i) { i.checked = i.value === value; });
-  }
-
-  function getRadio(name) {
-    var hit = document.querySelector('input[name="' + name + '"]:checked');
-    return hit ? hit.value : "off";
-  }
-
-  // Fills the settings from status.config. The ignition model is rendered
-  // verbatim from the config, never reset to a default by the page. Secrets
-  // arrive as "" with a *_set flag and are rendered empty with a placeholder.
-  function fillSettings() {
-    if (!status) return;
-    var cfg = status.config || {};
-    var tg = cfg.telegram || {};
-    setSecret($("bot-token"), !!tg.bot_token_set, "123456:ABC...");
-    setField($("chat-ids"), tg.chat_ids || "");
-    setField($("telegram-enabled"), !!tg.enabled);
-    var rs = cfg.reset || {};
-    setField($("reset-enabled"), rs.enabled !== false);
-    setField($("weekly-only"), rs.weekly_only !== false);
-    setField($("min-reset"), rs.minimum_reset_seconds != null ? rs.minimum_reset_seconds : 86400);
-    setField($("reset-credentials"), (rs.credentials || []).join(";"));
-    var al = cfg.alerts || {};
-    var th = Array.isArray(al.thresholds) ? al.thresholds : [50, 20, 10];
-    setField($("notice-threshold"), th[0] != null ? th[0] : 50);
-    setField($("low-threshold"), th[1] != null ? th[1] : 20);
-    setField($("critical-threshold"), th[2] != null ? th[2] : 10);
-    var rec = al.recovery_notify || null;
-    setRadio("recovery.five_hour", rec && rec.five_hour ? rec.five_hour : (al.notify_recovery ? "all" : "off"));
-    setRadio("recovery.seven_day", rec && rec.seven_day ? rec.seven_day : (al.notify_recovery ? "all" : "off"));
-    var rem = al.reset_reminder || null;
-    setRadio("reminder.five_hour", rem && rem.five_hour ? rem.five_hour : "off");
-    setRadio("reminder.seven_day", rem && rem.seven_day ? rem.seven_day : "off");
-    setField($("notify-errors"), !!al.notify_errors);
-    var ig = cfg.ignition || {};
-    setField($("ignition-enabled"), ig.enabled !== false);
-    setField($("start-hour"), ig.start_hour != null ? ig.start_hour : 7);
-    setField($("end-hour"), ig.end_hour != null ? ig.end_hour : 22);
-    setField($("end-grace"), ig.end_grace_minutes != null ? ig.end_grace_minutes : 30);
-    setField($("grace"), ig.grace_seconds != null ? ig.grace_seconds : 3);
-    setField($("failure-retry"), ig.failure_retry_seconds != null ? ig.failure_retry_seconds : 300);
-    setField($("max-transient"), ig.max_transient_failures != null ? ig.max_transient_failures : 3);
-    setField($("ignition-model"), ig.model != null ? ig.model : "");
-    setField($("cpa-base-url"), ig.cpa_base_url != null ? ig.cpa_base_url : "");
-    setField($("poll-interval"), cfg.poll_interval_seconds != null ? cfg.poll_interval_seconds : 300);
-    setField($("history-retention"), cfg.history_retention_days != null ? cfg.history_retention_days : 30);
-    setSecret($("models-api-key"), !!ig.models_api_key_set, "用于读取 CPA 模型列表");
-    renderIgnitionOff();
-    settingsFilled = true;
-  }
-
-  function renderIgnitionOff() {
-    var input = $("ignition-enabled");
-    var off = !(input && input.checked);
-    $("ignition-params").classList.toggle("off", off);
-    $("ignition-off").hidden = !off;
-  }
-
-  function splitList(v) {
-    return String(v || "").split(/[;,]/).map(function (x) { return x.trim(); }).filter(Boolean);
-  }
-
-  function numValue(input, fallback) {
-    var v = Number(input.value);
-    return isFinite(v) ? v : fallback;
-  }
-
-  // The patch for one settings section, built from the current form values
-  // on top of the config the status reports, so keys the page does not show
-  // are kept. Empty secret fields are omitted, so the backend keeps the
-  // stored value instead of clearing it.
-  function buildPatch(section) {
-    var cfg = status.config || {};
-    if (section === "telegram") {
-      var tg = JSON.parse(JSON.stringify(cfg.telegram || {}));
-      tg.enabled = $("telegram-enabled").checked;
-      tg.chat_ids = $("chat-ids").value;
-      var bot = $("bot-token").value.trim();
-      if (bot) tg.bot_token = bot; else delete tg.bot_token;
-      return { telegram: tg };
+  function setPath(obj, path, value) {
+    var parts = path.split(".");
+    var target = obj;
+    for (var i = 0; i < parts.length - 1; i++) {
+      if (!target[parts[i]] || typeof target[parts[i]] !== "object") target[parts[i]] = {};
+      target = target[parts[i]];
     }
-    if (section === "reset") {
-      var rs = JSON.parse(JSON.stringify(cfg.reset || {}));
-      rs.enabled = $("reset-enabled").checked;
-      rs.weekly_only = $("weekly-only").checked;
-      rs.minimum_reset_seconds = numValue($("min-reset"), 86400);
-      rs.credentials = splitList($("reset-credentials").value);
-      return { reset: rs };
-    }
-    if (section === "alerts") {
-      var al = JSON.parse(JSON.stringify(cfg.alerts || {}));
-      al.thresholds = [numValue($("notice-threshold"), 50), numValue($("low-threshold"), 20), numValue($("critical-threshold"), 10)];
-      var rec5 = getRadio("recovery.five_hour"), rec7 = getRadio("recovery.seven_day");
-      al.recovery_notify = { five_hour: rec5, seven_day: rec7 };
-      al.notify_recovery = rec5 !== "off" || rec7 !== "off";
-      al.reset_reminder = { five_hour: getRadio("reminder.five_hour"), seven_day: getRadio("reminder.seven_day") };
-      al.notify_errors = $("notify-errors").checked;
-      return { alerts: al };
-    }
-    if (section === "ignition") {
-      var ig = JSON.parse(JSON.stringify(cfg.ignition || {}));
-      ig.enabled = $("ignition-enabled").checked;
-      ig.start_hour = numValue($("start-hour"), 7);
-      ig.end_hour = numValue($("end-hour"), 22);
-      ig.end_grace_minutes = numValue($("end-grace"), 30);
-      ig.grace_seconds = numValue($("grace"), 3);
-      ig.failure_retry_seconds = numValue($("failure-retry"), 300);
-      ig.max_transient_failures = numValue($("max-transient"), 3);
-      var model = $("ignition-model").value.trim();
-      if (model) ig.model = model;
-      else if (cfg.ignition && cfg.ignition.model) ig.model = "";
-      else delete ig.model;
-      var mk = $("models-api-key").value.trim();
-      if (mk) ig.models_api_key = mk; else delete ig.models_api_key;
-      var cb = $("cpa-base-url").value.trim();
-      if (cb) ig.cpa_base_url = cb; else delete ig.cpa_base_url;
-      return { ignition: ig };
-    }
-    if (section === "advanced") {
-      return { poll_interval_seconds: numValue($("poll-interval"), 300), history_retention_days: numValue($("history-retention"), 30) };
-    }
-    return {};
+    target[parts[parts.length - 1]] = value;
   }
 
-  function thresholdsInOrder() {
-    var values = ["notice-threshold", "low-threshold", "critical-threshold"].map(function (id) {
-      return $(id).value === "" ? NaN : Number($(id).value);
+  // Quota groups offered as ignition checkboxes: the provider's groups, the
+  // groups seen on its accounts and any configured ones, in a stable order.
+  function groupChoices(p, selected) {
+    var names = p.groups.slice();
+    (status.accounts || []).forEach(function (a) {
+      if (a.provider !== p.id) return;
+      (a.groups || []).forEach(function (g) { if (names.indexOf(g.source_label) < 0) names.push(g.source_label); });
     });
+    (selected || []).forEach(function (name) { if (names.indexOf(name) < 0) names.push(name); });
+    return names;
+  }
+
+  function renderGroupChecks(p, selected) {
+    var box = document.querySelector("[data-groups='" + p.id + "']");
+    if (!box) return;
+    var existing = new Map();
+    Array.prototype.forEach.call(box.querySelectorAll("[data-group]"), function (input) { existing.set(input.getAttribute("data-group"), input); });
+    clear(box);
+    groupChoices(p, selected).forEach(function (name) {
+      var input = existing.get(name) || el("input", { type: "checkbox", "data-group": name });
+      if (!input.settingsDirty && !input.hasAttribute("aria-invalid")) input.checked = (selected || []).some(function (s) { return s.toLowerCase() === name.toLowerCase(); });
+      box.appendChild(el("label", { class: "inline" }, [input, document.createTextNode(name)]));
+    });
+  }
+
+  function providersWithGroups() {
+    return providerList().filter(function (p) { return p.groups && p.groups.length; });
+  }
+
+  function timezoneText() {
+    var offset = offsetSeconds() / 3600;
+    var name = status && status.timezone && status.timezone !== "Local" ? status.timezone : "";
+    var sign = offset >= 0 ? "+" : "-";
+    var utc = "UTC" + sign + Math.abs(offset);
+    var source = rawConfig.timezone || rawConfig.timezone_offset_hours !== undefined ? translate("tz_config") : translate("tz_cpa");
+    return translate("tz_note", name ? name + " (" + utc + ")" : utc, source);
+  }
+
+  function topKey(name) { return name.split(".")[0]; }
+
+  // Effective values come from the status config (defaults applied); saved
+  // secrets come from the raw plugin config.
+  function effectiveConfig() {
+    var effective = JSON.parse(JSON.stringify(status.config || {}));
+    effective.bark_url = rawConfig.bark_url || "";
+    effective.models_api_key = rawConfig.models_api_key || "";
+    var telegram = rawConfig.telegram || {};
+    effective.telegram = effective.telegram || {};
+    effective.telegram.bot_token = telegram.bot_token || "";
+    if (!effective.models_api_key) effective.models_api_key = (rawConfig.ignition && rawConfig.ignition.models_api_key) || "";
+    var webhook = rawConfig.webhook || {};
+    effective.webhook = effective.webhook || {};
+    effective.webhook.url = webhook.url || "";
+    effective.webhook.body = webhook.body || "";
+    effective.webhook.headers = webhook.headers || {};
+    // Plugins without MCP report neither field.
+    if (effective.mcp_enabled === undefined) effective.mcp_enabled = !!rawConfig.mcp_enabled;
+    if (!effective.mcp_listen) effective.mcp_listen = rawConfig.mcp_listen || MCP_LISTEN;
+    return effective;
+  }
+
+  // Fields with data-format edit an object as text: "headers" as one
+  // "Name: value" line per header, "json" as JSON.
+  function formatValue(format, value) {
+    if (!value || typeof value !== "object" || !Object.keys(value).length) return "";
+    if (format === "headers") return Object.keys(value).map(function (name) { return name + ": " + value[name]; }).join("\n");
+    return JSON.stringify(value);
+  }
+
+  // parseValue returns the object for the text of a data-format field, null
+  // for empty text, or throws with a message for the field.
+  function parseValue(format, text) {
+    text = text.trim();
+    if (!text) return null;
+    if (format === "headers") {
+      var headers = {};
+      text.split(/\r?\n/).forEach(function (line) {
+        if (!line.trim()) return;
+        var at = line.indexOf(":");
+        var name = at > 0 ? line.slice(0, at).trim() : "";
+        if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) throw new Error(translate("headers_invalid"));
+        headers[name] = line.slice(at + 1).trim();
+      });
+      return headers;
+    }
+    var value;
+    try { value = JSON.parse(text); } catch (err) { throw new Error(translate("json_invalid")); }
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(translate("json_invalid"));
+    return value;
+  }
+
+  function fillInput(input, effective) {
+    var value = getPath(effective, input.name);
+    var format = input.getAttribute("data-format");
+    if (format) {
+      input.value = formatValue(format, value);
+      input.setCustomValidity("");
+    } else if (input.type === "checkbox") input.checked = !!value;
+    else if (input.type === "radio") input.checked = input.value === value;
+    else input.value = value === undefined || value === null ? "" : value;
+  }
+
+  // keys, when given, limits the refill to those top-level keys and skips the
+  // focused field, so a refill after a save leaves the field being edited alone.
+  function fillSettings(keys) {
+    var effective = effectiveConfig();
+    var active = document.activeElement;
+    Array.prototype.forEach.call($("settings").elements, function (input) {
+      if (!input.name) return;
+      if (keys && (!keys[topKey(input.name)] || input === active)) return;
+      if (input.settingsDirty || input.hasAttribute("aria-invalid")) return;
+      if (input.type === "radio" && saveControls(input).some(function (peer) { return peer.settingsDirty || peer.hasAttribute("aria-invalid"); })) return;
+      fillInput(input, effective);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".mode-switch"), function (box) { placeThumb(box, false); });
+    providersWithGroups().forEach(function (p) {
+      var box = document.querySelector("[data-groups='" + p.id + "']");
+      if (!keys || (keys.providers && !(box && box.contains(active)))) {
+        renderGroupChecks(p, getPath(effective, "providers." + p.id + ".groups"));
+      }
+    });
+    settingsFilled = true;
+    $("timezone-note").textContent = timezoneText();
+    renderIgnitionOff();
+  }
+
+  // Segmented controls (.segmented button groups and .mode-switch radio
+  // groups): a thumb sits under the selected option. Options differ in width,
+  // so the thumb is measured to the option. bounce slides it there and plays
+  // the squash animation; any other placement jumps without animating.
+  // Code that changes the selection places the thumb itself; thumbObserver
+  // places it again whenever a control or one of its options changes size,
+  // such as after a language change, when the window is resized, and when a
+  // hidden control (the page before the key is entered, the closed settings)
+  // becomes visible.
+  var thumbObserver = new ResizeObserver(function (entries) {
+    entries.forEach(function (entry) {
+      var box = entry.target.closest(".segmented, .mode-switch");
+      if (box) placeThumb(box, false);
+    });
+  });
+
+  function selectedOption(box) {
+    if (box.classList.contains("mode-switch")) {
+      var input = box.querySelector("input:checked");
+      return input && input.closest(".mode-option");
+    }
+    return box.querySelector('.seg[aria-pressed="true"]:not([hidden])');
+  }
+
+  function placeThumb(box, bounce) {
+    var thumb = box.querySelector(".seg-thumb");
+    var option = selectedOption(box);
+    if (!option) { thumb.hidden = true; return; }
+    if (!option.offsetWidth) return; // not displayed; the observer places it once shown
+    if (thumb.hidden) bounce = false; // nothing to slide from
+    thumb.hidden = false;
+    if (!bounce) thumb.style.transition = "none";
+    // Fractional sizes, unlike offsetWidth, so the thumb fills grid columns
+    // exactly. A pressed button is scaled around its center; the size is
+    // taken without the scale.
+    var rect = option.getBoundingClientRect(), outer = box.getBoundingClientRect();
+    var scale = parseFloat(getComputedStyle(option).scale) || 1;
+    var w = rect.width / scale, h = rect.height / scale;
+    thumb.style.setProperty("--thumb-x", (rect.left + rect.width / 2 - w / 2 - outer.left - box.clientLeft) + "px");
+    thumb.style.setProperty("--thumb-y", (rect.top + rect.height / 2 - h / 2 - outer.top - box.clientTop) + "px");
+    thumb.style.setProperty("--thumb-w", w + "px");
+    thumb.style.setProperty("--thumb-h", h + "px");
+    if (bounce) thumb.classList.remove("bounce");
+    void thumb.offsetWidth; // apply the jump before the transition returns, or restart the animation
+    if (bounce) thumb.classList.add("bounce");
+    else thumb.style.transition = "";
+  }
+
+  // Observes the options of a control; called again after they are rebuilt.
+  function observeOptions(box) {
+    Array.prototype.forEach.call(box.querySelectorAll(".seg, .mode-option"), function (option) {
+      thumbObserver.observe(option);
+    });
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll(".segmented, .mode-switch"), function (box) {
+    // Dropping bounce once it has played keeps the squash from replaying
+    // when the thumb is displayed again.
+    var thumb = el("span", { class: "seg-thumb", "aria-hidden": "true", hidden: true });
+    thumb.addEventListener("animationend", function () { thumb.classList.remove("bounce"); });
+    box.insertBefore(thumb, box.firstChild);
+    thumbObserver.observe(box);
+    observeOptions(box);
+  });
+  Array.prototype.forEach.call(document.querySelectorAll(".mode-switch"), function (box) {
+    box.addEventListener("change", function () { placeThumb(box, true); });
+  });
+
+  // The top-level config key a settings input belongs to.
+  function inputTop(input) {
+    if (input.hasAttribute && input.hasAttribute("data-group")) return "providers";
+    return input.name ? topKey(input.name) : "";
+  }
+
+  // The values of the inputs of some top-level keys as the user left them,
+  // taken when the change is made. A save that waits in the queue builds its
+  // patch from these, so a refill of the fields in the meantime does not
+  // change what it saves.
+  function captureIntent(tops) {
+    var intent = { inputs: [], states: [], submitted: [] };
+    Array.prototype.forEach.call($("settings").elements, function (input) {
+      if (tops.indexOf(inputTop(input)) < 0) return;
+      intent.inputs.push(input);
+      intent.states.push({ value: input.value, checked: input.checked, edit: input.settingsEdit || 0 });
+    });
+    return intent;
+  }
+
+  // The patch for one top-level key. CPA merges top-level keys only, so
+  // objects are sent whole, starting from the saved object to keep keys the
+  // page does not show. intent, from captureIntent, holds the values to
+  // save; without it the inputs are read as they are now.
+  function buildPatch(top, intent) {
+    var patch = {};
+    if (intent && !intent.submitted) intent.submitted = [];
+    var base = rawConfig[top];
+    var state = function (input) {
+      var i = intent ? intent.inputs.indexOf(input) : -1;
+      return i >= 0 ? intent.states[i] : { value: input.value, checked: input.checked };
+    };
+    if (top === "ignition" && !base) base = status.config && status.config.ignition;
+    if (base && typeof base === "object") patch[top] = JSON.parse(JSON.stringify(base));
+    Array.prototype.forEach.call($("settings").elements, function (input) {
+      if (!input.name || topKey(input.name) !== top) return;
+      var value, saved = state(input);
+      var format = input.getAttribute("data-format");
+      if (format) {
+        // Text that does not parse keeps the saved value.
+        try { value = parseValue(format, saved.value); } catch (err) { return; }
+        if (value === null) {
+          var parts = input.name.split(".");
+          var parent = getPath(patch, parts.slice(0, -1).join("."));
+          if (parent) delete parent[parts[parts.length - 1]];
+          if (intent) intent.submitted.push(input);
+          return;
+        }
+      } else if (input.type === "checkbox") value = saved.checked;
+      else if (input.type === "radio") {
+        if (!saved.checked) return;
+        value = saved.value;
+        if (intent) intent.inputs.forEach(function (peer) { if (peer !== input && peer.name === input.name) intent.submitted.push(peer); });
+      } else if (input.type === "number") {
+        if (saved.value === "") return;
+        value = Number(saved.value);
+      } else value = saved.value.trim();
+      setPath(patch, input.name, value);
+      if (intent) intent.submitted.push(input);
+    });
+    if (top === "providers") {
+      if (!patch.providers) patch.providers = {};
+      providerList().forEach(function (p) { if (!patch.providers[p.id]) patch.providers[p.id] = {}; });
+      providersWithGroups().forEach(function (p) {
+        patch.providers[p.id].groups = Array.prototype.filter.call(
+          document.querySelectorAll("[data-groups='" + p.id + "'] [data-group]"), function (input) {
+            if (intent) intent.submitted.push(input);
+            return state(input).checked;
+          }
+        ).map(function (input) { return input.getAttribute("data-group"); });
+      });
+    }
+    // Turning MCP on without a key also saves a new key, since the plugin
+    // does not listen without one.
+    if (top === "mcp_enabled" && patch.mcp_enabled && !mcpKey().trim()) patch.mcp_key = newMcpKey();
+    // Save the same URL and listen defaults that config.Parse applies, so
+    // status comparisons do not wait on a trailing slash or an empty field.
+    if (top === "bark_url" || top === "cpa_base_url") patch[top] = patch[top].replace(/\/+$/, "");
+    if (top === "cpa_base_url" && !patch[top]) patch[top] = "http://127.0.0.1:8317";
+    if (top === "mcp_listen" && !patch[top]) patch[top] = "127.0.0.1:8318";
+    // A fixed offset from older versions is removed so the time zone follows CPA.
+    if (rawConfig.timezone_offset_hours !== undefined) patch.timezone_offset_hours = null;
+    // The single switches are replaced by recovery_notify and reset_reminder.
+    if (top === "recovery_notify" && rawConfig.notify_recovery !== undefined) patch.notify_recovery = null;
+    if (top === "reset_reminder" && rawConfig.notify_reset_reminders !== undefined) patch.notify_reset_reminders = null;
+    return patch;
+  }
+
+  // Settings save serially. Each item owns its result and draft; section
+  // headings and advanced legends summarize progress without hiding failures.
+  var saveQueue = Promise.resolve();
+  var saveSerial = 0;
+
+  function saveHost(input) {
+    var group = input.closest("fieldset") || input.closest(".settings-section");
+    return group && group.querySelector(group.tagName === "FIELDSET" ? "legend" : ".card-title");
+  }
+
+  function saveControls(input) {
+    var group = input.closest(".thresholds, .mode-switch");
+    if (group) return Array.prototype.slice.call(group.querySelectorAll("input"));
+    return /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(input.tagName) ? [input] : [];
+  }
+
+  function saveItemKey(input) {
+    var kind = input.getAttribute("data-account-field");
+    if (kind) return input.closest(".account-setting").getAttribute("data-account") + ":" + kind;
+    if (input.closest(".thresholds")) return "thresholds";
+    if (input.hasAttribute("data-group")) return input.closest("[data-groups]").getAttribute("data-groups") + ":" + input.getAttribute("data-group");
+    return input.name || input.id;
+  }
+
+  function saveItemLabel(input) {
+    if (input.id === "account-order-state") return translate("save_order");
+    var kind = input.getAttribute("data-account-field");
+    if (kind) return translate(kind === "name" ? "rename" : "weight");
+    if (input.id === "mcp-key-new") return translate("mcp_key");
+    if (input.closest(".thresholds")) return translate("thresholds");
+    var mode = input.closest(".mode-switch");
+    if (mode) return mode.getAttribute("aria-label");
+    var service = input.getAttribute("data-service");
+    if (service) return providerTitle(service) + " · " + translate(input.getAttribute("data-label") || "col_ignition_model", providerTitle(service));
+    if (input.hasAttribute("data-group")) return providerTitle(input.closest("[data-groups]").getAttribute("data-groups")) + " · " + input.getAttribute("data-group");
+    var label = input.closest("label"), text = label && label.querySelector("span");
+    return text ? text.textContent : input.name || input.id;
+  }
+
+  function saveEntry(host, input) {
+    if (!host) return null;
+    input = input || host;
+    var key = saveItemKey(input);
+    if (!host.saveEntries) host.saveEntries = new Map();
+    var entry = host.saveEntries.get(key);
+    if (!entry) {
+      entry = { host: host };
+      host.saveEntries.set(key, entry);
+    }
+    var old = entry.input;
+    // Results outlive their DOM binding. Recreated account fields inherit
+    // drafts and pending counts; queued completions use the current binding.
+    if (old && old !== input && (old.accountDirty || old.accountPending || entry.failure) && input.hasAttribute("data-account-field")) {
+      ["value", "accountSaved", "accountEdit", "accountDirty", "accountPending"].forEach(function (name) { input[name] = old[name]; });
+    }
+    entry.input = input;
+    entry.controls = saveControls(input);
+    entry.controls.forEach(function (control) {
+      if (entry.failure) control.setAttribute("aria-invalid", "true");
+      else control.removeAttribute("aria-invalid");
+    });
+    return entry;
+  }
+
+  // Re-render local status messages in the selected language; upstream text
+  // and browser validation messages remain verbatim.
+  function saveText(text) {
+    var keys = ["save_saved", "save_saving", "save_waiting", "save_applied", "save_unconfirmed",
+      "save_applied_verified", "save_applied_unverified", "mcp_error", "weight_invalid",
+      "thresholds_order", "management_key_refused", "api_key_refused", "headers_invalid", "json_invalid"];
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i], languages = Object.keys(I18N);
+      for (var j = 0; j < languages.length; j++) {
+        var template = I18N[languages[j]][key], at = template.indexOf("{0}");
+        if (at < 0 && text === template) return translate(key);
+        if (at >= 0) {
+          var before = template.slice(0, at), after = template.slice(at + 3);
+          if (text.slice(0, before.length) === before && text.slice(text.length - after.length) === after) {
+            return translate(key, text.slice(before.length, text.length - after.length));
+          }
+        }
+      }
+    }
+    return text;
+  }
+
+  function renderSaveState(host) {
+    if (!host || !host.saveEntries) return;
+    var entries = Array.from(host.saveEntries.values()), failures = entries.filter(function (entry) { return entry.failure; });
+    var latest = entries.filter(function (entry) { return entry.state; }).sort(function (a, b) { return b.order - a.order; })[0];
+    failures.sort(function (a, b) { return b.failure.order - a.failure.order; });
+    var failed = failures[0], state = failed ? "failed" : latest ? latest.state : "";
+    var text = failed ? translate("save_field_failed", saveItemLabel(failed.input)) : latest ? saveText(latest.text) : "";
+    entries.forEach(function (entry) {
+      entry.controls.forEach(function (control) {
+        if (entry.failure) control.setAttribute("aria-invalid", "true");
+        else control.removeAttribute("aria-invalid");
+      });
+    });
+    var node = host.querySelector(".save-state");
+    if (!node) { node = el("span", { class: "save-state", role: "status" }); host.appendChild(node); }
+    node.setAttribute("data-state", state);
+    clear(node);
+    if (text) {
+      if (failed) {
+        var compact = el("span", { "data-save-part": "compact" });
+        compact.textContent = translate("save_failed_compact");
+        node.appendChild(compact);
+      }
+      var message = el("span", { "data-save-part": failed ? "summary" : "progress" });
+      if (host.id === "account-order-state") maskedNodes(text).forEach(function (part) { message.appendChild(part); });
+      else message.textContent = text;
+      node.appendChild(message);
+      if (failed) {
+        var reason = el("span", { "data-save-part": "reason" });
+        var detail = translate("save_failure_reason", saveText(failed.failure.text));
+        if (host.id === "account-order-state") maskedNodes(detail).forEach(function (part) { reason.appendChild(part); });
+        else reason.textContent = detail;
+        node.appendChild(reason);
+      }
+      if (failures.length > 1) {
+        var count = el("span", { "data-save-part": "count" });
+        count.textContent = translate("save_more_failed", failures.length - 1);
+        node.appendChild(count);
+      }
+    }
+  }
+
+  function renderSaveStates() {
+    Array.prototype.forEach.call(document.querySelectorAll(".settings-section > .card-title, fieldset > legend"), renderSaveState);
+  }
+
+  function updateSaveEntry(entry, state, text) {
+    entry.state = state;
+    entry.text = text;
+    if (state === "failed") entry.failure = { text: text, order: ++saveSerial };
+    else if (state === "waiting" || state === "saved" || state === "verified" || state === "unverified") entry.failure = null;
+    renderSaveState(entry.host);
+  }
+
+  function setSaveState(host, state, text, input) {
+    var entry = saveEntry(host, input);
+    if (!entry) return null;
+    entry.owner = null;
+    entry.order = ++saveSerial;
+    updateSaveEntry(entry, state, text);
+    return entry;
+  }
+
+  // Edits invalidate late replies without clearing an unresolved failure.
+  function editSaveState(host, input) {
+    var entry = saveEntry(host, input);
+    if (!entry) return;
+    entry.owner = null;
+    if (!entry.failure) entry.state = "";
+    renderSaveState(host);
+  }
+
+  var THRESHOLDS = ["notice_threshold", "low_threshold", "critical_threshold"];
+
+  // The three thresholds must not increase from first to third. They save
+  // together, so a value held back by the order saves once the order holds.
+  function thresholdsInOrder() {
+    var form = $("settings");
+    var values = THRESHOLDS.map(function (name) { return form.elements[name].value === "" ? NaN : Number(form.elements[name].value); });
     return values.every(isFinite) && values[0] >= values[1] && values[1] >= values[2];
   }
 
-  // ---- Save queue + applied confirmation ----
-  // Settings save serially. Each section owns its result; a late reply
-  // cannot label a newer edit.
-  var saveQueue = Promise.resolve();
-  var saveOwners = {};
-
-  function setSaveState(section, state, text) {
-    var node = $("save-" + section);
-    if (!node) return;
-    node.setAttribute("data-state", state || "");
-    node.textContent = text || "";
+  // Each control owns an edit generation, including changes made while a
+  // different control of the same top-level key is awaiting confirmation.
+  function noteEdit(input) {
+    var controls = input.type === "radio" ? saveControls(input) : [input];
+    controls.forEach(function (control) { control.settingsEdit = (control.settingsEdit || 0) + 1; });
   }
 
-  function claimState(section) {
-    var owner = {};
-    saveOwners[section] = owner;
-    setSaveState(section, "waiting", "保存中…");
-    return function (state, text) {
-      if (saveOwners[section] !== owner) return false;
-      setSaveState(section, state, text);
-      return true;
-    };
+  // Clear only drafts actually submitted by this save and unchanged since
+  // its intent was captured. Independent failures remain owned by their item.
+  function refillSaved(intent) {
+    var keys = {}, any = false;
+    intent.submitted.forEach(function (input) {
+      var saved = intent.states[intent.inputs.indexOf(input)];
+      if (!saved || (input.settingsEdit || 0) !== saved.edit || input.hasAttribute("aria-invalid")) return;
+      input.settingsDirty = false;
+      keys[inputTop(input)] = true;
+      any = true;
+    });
+    if (any) fillSettings(keys);
+    if (keys.ignition) renderIgnitionOff();
   }
 
-  function editSaveState(section) {
-    var node = $("save-" + section);
-    if (!node) return;
-    if (node.getAttribute("data-state") === "failed") return;
-    saveOwners[section] = null;
-    setSaveState(section, "", "");
+  function saveField(event) {
+    var input = event.target;
+    var top = input.hasAttribute("data-group") ? "providers" : input.name && topKey(input.name);
+    if (!top) return;
+    var host = saveHost(input);
+    var tops = [top];
+    // Browsers fill the password saved for this site, usually the management
+    // key, into password fields. A value the browser fills in while the field
+    // is not focused comes from autofill on page load; it is not saved, and
+    // the field shows the saved value again. The management key is refused
+    // with a message. Other new keys are checked against /v1/models before
+    // saving; refusals retain the draft and inconclusive checks allow saving.
+    var checked = Promise.resolve(null);
+    if (input.type === "password") {
+      var value = input.value.trim();
+      if (autofilled(input) && document.activeElement !== input) {
+        fillInput(input, effectiveConfig());
+        return;
+      }
+      if (key && value === key) {
+        setSaveState(host, "failed", translate("management_key_refused"), input);
+        return;
+      }
+      if (value) checked = checkKey(value);
+    }
+    if (input.type === "number") {
+      if (!input.checkValidity()) {
+        setSaveState(host, "failed", input.validationMessage, input);
+        input.reportValidity();
+        return;
+      }
+      if (input.value === "") { fillInput(input, effectiveConfig()); return; }
+    }
+    if (THRESHOLDS.indexOf(top) >= 0) {
+      if (!thresholdsInOrder()) { setSaveState(host, "failed", translate("thresholds_order"), input); return; }
+      tops = THRESHOLDS;
+    }
+    var format = input.getAttribute("data-format");
+    if (format) {
+      try {
+        parseValue(format, input.value);
+        input.setCustomValidity("");
+      } catch (err) {
+        input.setCustomValidity(err.message);
+        input.reportValidity();
+        setSaveState(host, "failed", err.message, input);
+        return;
+      }
+    }
+    if (input.name === "ignition.enabled") renderIgnitionOff();
+    var say = claimState(host, input);
+    noteEdit(input);
+    var intent = captureIntent(tops);
+    saveQueue = saveQueue.then(function () { return checked; }).then(function (check) {
+      // A key edited again during the check is checked by its own change event.
+      if (input.type === "password" && input.value.trim() !== value) return;
+      if (check && check.refused) {
+        say("failed", translate("api_key_refused"));
+        return;
+      }
+      var patch = {};
+      tops.forEach(function (name) {
+        var part = buildPatch(name, intent);
+        Object.keys(part).forEach(function (k) { patch[k] = part[k]; });
+      });
+      return patchConfig(patch).then(function (token) {
+        // Once applied, the fields show the values the plugin uses.
+        showApplied(say, token, check, /^mcp_/.test(top)).then(function (applied) { if (applied) refillSaved(intent); });
+        return loadConfig();
+      }).catch(function (err) {
+        say("failed", err.message);
+      });
+    });
   }
 
-  // Every config write carries a new config_token. The plugin reports, as
-  // config_applied_token in the status, the token of the config it has
-  // applied. A save counts as applied when that token is its own or one
-  // this page saved after it.
+  // checkKey asks CPA whether it accepts value as an API key for /v1/models,
+  // the request the plugin makes with models_api_key. It resolves to ok when
+  // CPA answers the request, refused on HTTP 401 and 403, and neither, with
+  // the reason, when the check could not tell: then the key is saved anyway.
+  function checkKey(value) {
+    return fetch("/v1/models", { headers: { "Authorization": "Bearer " + value, "Accept": "application/json" } }).then(function (res) {
+      if (res.status === 401 || res.status === 403) return { refused: true };
+      if (res.ok) return { ok: true };
+      return { reason: "HTTP " + res.status };
+    }, function () { return { reason: translate("network_error") }; });
+  }
+
+  // ---- Applied config ----
+
+  // Every config write of the page carries a new config_token. The plugin
+  // reports, as config_applied_token in the status, the token of the config
+  // it has applied, MCP included. A save counts as applied when that token
+  // is its own or one this page saved after it, since a later config
+  // contains the earlier change. savedTokens lists the tokens of this
+  // page's saves, oldest first.
   var savedTokens = [];
+  // Saves still waiting to be applied: {token, since, done}.
   var applyWaits = [];
   var applyTimer = null;
   var APPLY_TIMEOUT = 15000;
-  var POLL_TIMEOUT = 4000;
 
   // 16 random hexadecimal digits.
   function newConfigToken() {
@@ -2059,16 +4159,15 @@
     return text;
   }
 
+  // Whether the applied token covers the save with token: it is that save
+  // or a later one of this page.
   function tokenApplied(tokens, token, applied) {
     var saved = tokens.indexOf(token);
     return saved >= 0 && !!applied && tokens.indexOf(applied) >= saved;
   }
 
-  function lastToken() { return savedTokens.length ? savedTokens[savedTokens.length - 1] : ""; }
-
   // Writes a patch of the plugin config with a new token, and resolves to
-  // the token once CPA has saved it. Falls back to PUT /settings only when
-  // the PATCH endpoint answers 404/405.
+  // the token once CPA has saved it.
   function patchConfig(patch) {
     var token = newConfigToken(), body = {};
     Object.keys(patch).forEach(function (name) { body[name] = patch[name]; });
@@ -2076,17 +4175,17 @@
     return api("PATCH", CONFIG_API, body).then(function () {
       savedTokens.push(token);
       if (savedTokens.length > 200) savedTokens.shift();
-      return { token: token, fallback: false };
-    }, function (err) {
-      if (err && (err.status === 404 || err.status === 405)) {
-        var fb = {};
-        Object.keys(patch).forEach(function (name) { fb[name] = patch[name]; });
-        return api("PUT", API + "/settings", fb).then(function () { return { token: token, fallback: true }; });
-      }
-      throw err;
+      return token;
     });
   }
 
+  function lastToken() { return savedTokens.length ? savedTokens[savedTokens.length - 1] : ""; }
+
+  // Resolves to true once the plugin has applied the save with token, or
+  // to false at APPLY_TIMEOUT. The deadline is a timer of its own, so a
+  // status request that hangs does not delay it, and a status that reports
+  // the token after it no longer counts. The status is read every second
+  // while a save waits.
   function whenApplied(token) {
     if (tokenApplied(savedTokens, token, status && status.config_applied_token)) return Promise.resolve(true);
     return new Promise(function (resolve) {
@@ -2111,6 +4210,10 @@
     });
   }
 
+  // A status request of the poll gives up after this long, so the next one
+  // can start.
+  var POLL_TIMEOUT = 4000;
+
   function pollApplied() {
     if (applyTimer || !applyWaits.length) return;
     applyTimer = setTimeout(function () {
@@ -2122,56 +4225,214 @@
     }, 1000);
   }
 
-  // The save state after CPA saved it: waiting until the plugin applies it,
-  // then applied, or unconfirmed after the timeout. A fallback save counts
-  // as saved at once, since it carries no token to confirm.
-  function showApplied(say, token, fallback) {
-    if (fallback) { say("saved", "已保存"); return Promise.resolve(true); }
-    say("waiting", "已保存，等待生效");
+  // Ownership is per item, so a late reply cannot label a newer edit and a
+  // different item's success cannot clear this item's failure.
+  function claimState(host, input) {
+    var entry = setSaveState(host, "saving", translate("save_saving"), input), owner = {};
+    if (entry) entry.owner = owner;
+    return function (state, text) {
+      if (!entry || entry.owner !== owner) return false;
+      updateSaveEntry(entry, state, text);
+      return true;
+    };
+  }
+
+  // The save state of a field after CPA saved it, through say from
+  // claimState: waiting until the plugin applies it, then applied, or
+  // unconfirmed after the timeout. A change of MCP settings shows the MCP
+  // error instead when the endpoint does not start. check is the result of
+  // checkKey for an API key. The save waits for its token even when a newer
+  // save owns the field's state.
+  function showApplied(say, token, check, mcp) {
+    say("waiting", translate("save_waiting"));
     return whenApplied(token).then(function (applied) {
-      say(applied ? "saved" : "unverified", applied ? "已生效" : "未能验证");
+      var error = mcp && status && status.mcp && status.mcp.enabled && status.mcp.error;
+      if (!applied) say("unverified", translate("save_unconfirmed"));
+      else if (error) say("failed", translate("mcp_error", error));
+      else if (check && check.ok) say("verified", translate("save_applied_verified"));
+      else if (check) say("unverified", translate("save_applied_unverified", check.reason));
+      else say("saved", translate("save_applied"));
       return applied;
     });
   }
 
-  function captureEdits(section) {
-    var map = new Map();
-    var box = document.querySelector('.settings-section[data-section="' + section + '"]');
-    if (box) Array.prototype.forEach.call(box.querySelectorAll("input"), function (input) { map.set(input, input.settingsEdit || 0); });
-    return map;
+  // ---- Ignition and MCP settings ----
+
+  // With ignition off, its settings stay editable but are grayed out, with
+  // a note that they do not apply.
+  function renderIgnitionOff() {
+    var input = $("settings").elements["ignition.enabled"];
+    var off = !(input && input.checked);
+    $("ignition-params").classList.toggle("off", off);
+    $("ignition-off").hidden = !off;
   }
 
-  // Clear only drafts actually submitted by this save and unchanged since
-  // its intent was captured, then refill from the freshly applied config.
-  function refillSaved(section, edits) {
-    var box = document.querySelector('.settings-section[data-section="' + section + '"]');
-    if (box) Array.prototype.forEach.call(box.querySelectorAll("input"), function (input) {
-      if (edits && edits.get(input) === (input.settingsEdit || 0)) input.settingsDirty = false;
-    });
-    fillSettings();
+  var MCP_LISTEN = "127.0.0.1:8318";
+  var MCP_URL_STORE = "phoenix-mcp-url";
+  var mcpKeyShown = false;
+
+  // 32 random bytes in base64url after the llmcp_ prefix.
+  function newMcpKey() {
+    var bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    var text = "";
+    for (var i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
+    return "llmcp_" + btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
 
-  function saveSection(section) {
-    if (section === "alerts" && !thresholdsInOrder()) {
-      ["notice-threshold", "low-threshold", "critical-threshold"].forEach(function (id) { $(id).setAttribute("aria-invalid", "true"); });
-      setSaveState(section, "failed", "阈值须满足：提醒 ≥ 偏低 ≥ 告急，未保存");
-      return;
-    }
-    if (section === "alerts") {
-      ["notice-threshold", "low-threshold", "critical-threshold"].forEach(function (id) { $(id).removeAttribute("aria-invalid"); });
-    }
-    var say = claimState(section);
-    var patch, edits;
+  function mcpKey() { return typeof rawConfig.mcp_key === "string" ? rawConfig.mcp_key : ""; }
+
+  function maskedKey(value) { return value ? value.slice(0, 6) + "••••••••••••" + value.slice(-4) : ""; }
+
+  // The public address as clients use it: https:// in front of an address
+  // without a scheme. "" when value is empty, null when it is not an http or
+  // https address. The host is ASCII letters, digits and "-" in parts joined
+  // by ".", without bracketed IPv6 addresses; the path is printable ASCII
+  // without "#", "?" and "\", and the port at most 65535. The ends are
+  // trimmed of Unicode white space. internal/web/testdata/public_urls.json
+  // lists the cases.
+  var PUBLIC_URL_TRIM = /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g;
+  var PUBLIC_URL_FORM = /^[Hh][Tt][Tt][Pp][Ss]?:\/\/[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*(?::([0-9]{1,5}))?(\/[\x21\x22\x24-\x3e\x40-\x5b\x5d-\x7e]*)?$/;
+  function publicUrl(value) {
+    var text = String(value || "").replace(PUBLIC_URL_TRIM, "");
+    if (!text) return "";
+    var full = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(text) ? text : "https://" + text;
+    var m = PUBLIC_URL_FORM.exec(full);
+    return m && !(m[1] && Number(m[1]) > 65535) ? full : null;
+  }
+
+  // The public address kept in this browser, trimmed as publicUrl trims
+  // it. Another tab may have changed it since this one filled its field, so
+  // the configs read it here; the field serves only where localStorage is
+  // not available.
+  function storedPublicUrl() {
+    try { return localStorage.getItem(MCP_URL_STORE) || ""; } catch (err) {}
+    var field = $("mcp-public-url");
+    return field ? field.value.replace(PUBLIC_URL_TRIM, "") : "";
+  }
+
+  // Shows the public address another tab saved (a storage event with key,
+  // null when the storage was cleared) in the field and the configs.
+  function syncPublicUrl(key) {
+    if (key !== MCP_URL_STORE && key !== null) return;
+    $("mcp-public-url").value = storedPublicUrl();
+    renderMcp();
+  }
+
+  // Keeps the public address typed in the field, or deletes it when empty.
+  function savePublicUrl(value) {
+    var text = String(value || "").replace(PUBLIC_URL_TRIM, "");
     try {
-      patch = buildPatch(section);
-      edits = captureEdits(section);
-    } catch (err) { say("failed", err.message); return; }
+      if (text) localStorage.setItem(MCP_URL_STORE, text);
+      else localStorage.removeItem(MCP_URL_STORE);
+    } catch (err) {}
+  }
+
+  // The address clients use, without the path /mcp: the public address
+  // kept in this browser while it is valid, with /mcp and trailing slashes
+  // taken off its path, or http:// and the listen address. A listen address
+  // without a host or on all interfaces is reached through the host of this
+  // page.
+  function mcpBaseUrl() {
+    var stored = publicUrl(storedPublicUrl());
+    if (stored) {
+      var path = PUBLIC_URL_FORM.exec(stored)[2] || "";
+      return stored.slice(0, stored.length - path.length) + path.replace(/\/+$/, "").replace(/\/mcp$/, "");
+    }
+    var input = $("settings").elements["mcp_listen"];
+    var listen = (input && input.value.trim()) || (status && status.mcp && status.mcp.listen) || MCP_LISTEN;
+    var at = listen.lastIndexOf(":");
+    var host = at >= 0 ? listen.slice(0, at) : listen, port = at >= 0 ? listen.slice(at) : "";
+    if (!host || host === "0.0.0.0" || host === "[::]" || host === "::") host = location.hostname || "127.0.0.1";
+    return "http://" + host + port;
+  }
+
+  // A POSIX shell word for text: single quotes, with ' written as '\''.
+  function shellQuote(text) {
+    return "'" + String(text).replace(/'/g, "'\\''") + "'";
+  }
+
+  // The commands quote the address and the header for the shell; the JSON
+  // is built by JSON.stringify.
+  function mcpSnippets(url, secret) {
+    var auth = shellQuote("Authorization: Bearer " + secret);
+    return [
+      ["mcp_claude", "claude mcp add --transport http phoenix " + shellQuote(url) + " --header " + auth],
+      ["mcp_json", JSON.stringify({ mcpServers: { phoenix: { type: "http", url: url, headers: { Authorization: "Bearer " + secret } } } }, null, 2)],
+      ["mcp_stdio", "npx mcp-remote " + shellQuote(url) + " --header " + auth]
+    ];
+  }
+
+  // The key, the state the plugin reports and the client configs. The
+  // configs show the key masked until it is shown; copying copies it whole.
+  function renderMcp() {
+    if (!$("mcp-key-view")) return;
+    var secret = mcpKey();
+    var view = $("mcp-key-view");
+    view.textContent = secret ? (mcpKeyShown ? secret : maskedKey(secret)) : translate("mcp_key_unset");
+    view.classList.toggle("muted", !secret);
+    $("mcp-key-show").hidden = !secret;
+    $("mcp-key-show").textContent = translate(mcpKeyShown ? "mcp_hide" : "mcp_show");
+    $("mcp-key-copy").hidden = !secret;
+
+    var box = $("mcp-status");
+    clear(box);
+    var mcp = status && status.mcp;
+    if (!mcp) box.appendChild(badge("muted", translate("mcp_unknown")));
+    else if (mcp.running) {
+      box.appendChild(badge("success", translate("mcp_running")));
+      box.appendChild(el("span", { class: "mono", text: (mcp.listen || "") + (mcp.path || "/mcp") }));
+    } else {
+      box.appendChild(badge(mcp.enabled && mcp.error ? "failure" : "muted", translate("mcp_stopped")));
+      if (mcp.error) box.appendChild(el("span", { class: "error-text", text: mcp.error }));
+    }
+
+    var publicField = $("mcp-public-url");
+    var invalid = publicUrl(storedPublicUrl()) === null;
+    $("mcp-public-url-error").hidden = !invalid;
+    if (invalid) publicField.setAttribute("aria-invalid", "true");
+    else publicField.removeAttribute("aria-invalid");
+    var url = mcpBaseUrl() + "/mcp";
+    var snippets = $("mcp-snippets");
+    clear(snippets);
+    var shown = secret ? (mcpKeyShown ? secret : maskedKey(secret)) : "<key>";
+    var full = mcpSnippets(url, secret || "<key>");
+    mcpSnippets(url, shown).forEach(function (s, i) {
+      var copy = el("button", { type: "button", class: "btn btn-ghost btn-sm", text: translate("copy"), onclick: function () { copyText(full[i][1], copy); } });
+      snippets.appendChild(el("div", { class: "snippet" }, [
+        el("div", { class: "snippet-head" }, [el("span", { class: "field-label", text: translate(s[0]) }), copy]),
+        el("pre", { class: "mono" }, [el("code", { text: s[1] })])
+      ]));
+    });
+    if (!secret) snippets.appendChild(el("p", { class: "hint", text: translate("mcp_no_key") }));
+  }
+
+  // Copies text, through a selected text area where the Clipboard API is
+  // not available, as in an iframe without the permission.
+  function copyText(text, button) {
+    var done = function () { toast(translate("copied")); };
+    var fallback = function () {
+      var area = el("textarea", { class: "copy-buffer", readonly: true });
+      area.value = text;
+      document.body.appendChild(area);
+      area.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (err) {}
+      document.body.removeChild(area);
+      if (ok) done(); else toast(translate("copy_failed"));
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback);
+    else fallback();
+  }
+
+  // A new key replaces the old one at once; replacing a key asks first.
+  function generateMcpKey() {
+    if (mcpKey() && !confirm(translate("mcp_regenerate_confirm"))) return;
+    var button = $("mcp-key-new"), say = claimState(saveHost(button), button), secret = newMcpKey();
     saveQueue = saveQueue.then(function () {
-      return patchConfig(patch).then(function (res) {
-        return showApplied(say, res.token, res.fallback).then(function (applied) {
-          if (applied) refillSaved(section, edits);
-          return loadStatus().catch(function () {});
-        });
+      return patchConfig({ mcp_key: secret }).then(function (token) {
+        showApplied(say, token, null, true);
+        return loadConfig();
       }).catch(function (err) {
         say("failed", err.message);
       });
@@ -2186,26 +4447,49 @@
     try { return input.matches(":-webkit-autofill"); } catch (err) { return false; }
   }
 
-  // One line per channel.
+  // One line per channel; a webhook also shows the start of its response and,
+  // without a success condition, that only the HTTP status was checked.
   function renderTestResults(results) {
     var box = $("test-results");
     clear(box);
     (results || []).forEach(function (r) {
-      var children = [el("span", { text: r.ok ? r.channel + "：已发送" : r.channel + "：失败，" + (r.error || "") })];
-      if (r.ok && r.response) children.push(el("span", { class: "hint", text: "响应：" + r.response }));
-      if (r.ok && r.unchecked) children.push(el("span", { class: "hint", text: "只检查了 HTTP 状态码，请到客户端确认是否收到。" }));
+      var children = [el("span", { text: r.ok ? translate("test_ok", r.channel) : translate("test_failed", r.channel, r.error) })];
+      if (r.ok && r.response) children.push(el("span", { class: "hint", text: translate("test_response", r.response) }));
+      if (r.ok && r.unchecked) children.push(el("span", { class: "hint", text: translate("test_unchecked") }));
       box.appendChild(el("div", { class: "test-result " + (r.ok ? "ok" : "failed") }, children));
     });
   }
 
+  function loadConfig() {
+    return api("GET", CONFIG_API).then(function (data) {
+      rawConfig = data || {};
+      if (pendingOrder) rawConfig.account_order = pendingOrder.slice();
+    });
+  }
+
+  // Opening the page also checks for a newer release, after the first status
+  // so that this status does not replace the result. The plugin reads GitHub
+  // at most once a minute; failures stay silent like the periodic check.
+  function checkUpdate() {
+    api("POST", API + "/check-update", {}).then(function (data) {
+      if (data.status) { status = data.status; renderStatus(); }
+    }).catch(function () {});
+  }
+
   // ---- Startup ----
+
   function start() {
     $("key-section").hidden = true;
-    loadStatus().then(function () {
+    $("app").hidden = false;
+    Promise.all([loadStatus(), loadConfig()]).then(function () {
+      // The status may have arrived before the config with the saved order.
+      sortAccounts();
+      renderAccounts();
+      fillSettings();
       restoreChartFilters();
       return loadHistory();
     }).then(function (loaded) { if (loaded) prefetchHistory(); }).catch(function (err) {
-      if (err.message !== "unauthorized") toast("加载失败：" + err.message);
+      if (err.message !== "unauthorized") toast(translate("load_failed", err.message));
     });
     clearInterval(refreshTimer);
     refreshTimer = setInterval(function () {
@@ -2214,25 +4498,103 @@
     }, 30000);
   }
 
+  $("key-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    key = $("key-input").value.trim();
+    if (!key) return;
+    sessionStorage.setItem(KEY_STORE, key);
+    start();
+  });
+  $("refresh-all").addEventListener("click", function (e) {
+    runAction(e.currentTarget, API + "/refresh", {}, translate("refreshed_all"));
+  });
+  $("test-notify").addEventListener("click", function (e) {
+    // The test waits for the saves under way and for the plugin to apply
+    // the latest of them. When it is not applied in time, the test is not
+    // sent, since it would use the settings before the change.
+    var button = e.currentTarget;
+    button.disabled = true;
+    var results = $("test-results");
+    clear(results);
+    saveQueue.then(function () {
+      var token = lastToken();
+      if (!token || tokenApplied(savedTokens, token, status && status.config_applied_token)) return true;
+      results.appendChild(el("div", { class: "test-result hint", text: translate("test_waiting") }));
+      return whenApplied(token);
+    }).then(function (applied) {
+      if (!applied) {
+        clear(results);
+        results.appendChild(el("div", { class: "test-result failed", text: translate("test_not_applied") }));
+        return null;
+      }
+      return api("POST", API + "/test-notify", {});
+    }).then(function (data) {
+      if (!data) return;
+      if (data.status) { status = data.status; renderStatus(); }
+      renderTestResults(data.results);
+      if (data.ok) toast(translate("test_sent"));
+      else if (!data.results) toast(translate("failed", data.error));
+      else toast(translate(data.results.some(function (r) { return r.ok; }) ? "test_some_failed" : "test_all_failed"));
+    }).catch(function (err) {
+      clear(results);
+      if (err.message !== "unauthorized") toast(translate("failed", err.message));
+    }).then(function () { button.disabled = false; });
+  });
+  $("settings").addEventListener("change", saveField);
+  // Keep failed drafts visible while invalidating responses for older edits.
+  $("settings").addEventListener("input", function (e) {
+    var accountField = e.target.hasAttribute("data-account-field");
+    if (accountField) {
+      e.target.accountDirty = true;
+      e.target.accountEdit = (e.target.accountEdit || 0) + 1;
+    } else e.target.settingsDirty = true;
+    var top = inputTop(e.target);
+    if (top) noteEdit(e.target);
+    var host = accountField ? accountFieldHost(e.target) : top ? saveHost(e.target) : null;
+    if (host) editSaveState(host, e.target);
+  });
+  $("mask-toggle").addEventListener("click", toggleMask);
+
+  // The quota and settings views; the last one shown is kept in this
+  // browser. The chart is drawn when its view shows, since it measures its
+  // width.
   var VIEW_STORE = "phoenix-view";
-  function showView(name) {
+  function showView(name, bounce) {
     var settings = name === "settings";
-    $("quota").hidden = settings;
-    $("settings").hidden = !settings;
-    Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (b) {
-      b.classList.toggle("active", b.dataset.view === name);
-    });
+    $("view-quota").hidden = settings;
+    $("view-settings").hidden = !settings;
+    pressSegment("view-buttons", settings ? "settings" : "quota", bounce);
     try { localStorage.setItem(VIEW_STORE, settings ? "settings" : "quota"); } catch (err) {}
     if (!settings && history && status) renderChart();
   }
-
-  function pressSegment(id, value) {
+  $("view-buttons").addEventListener("click", function (e) {
+    var button = e.target.closest(".seg");
+    if (button && button.getAttribute("aria-pressed") !== "true") showView(button.getAttribute("data-value"), true);
+  });
+  $("settings").elements["remember_chart_filters"].addEventListener("change", function (e) { changeChartSwitch(e.target); });
+  $("settings").elements["remember_chart_expanded"].addEventListener("change", function (e) { changeChartSwitch(e.target); });
+  $("settings").addEventListener("submit", function (e) { e.preventDefault(); });
+  // Enter commits a text or number field; leaving it fires the change that saves it.
+  $("settings").addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && e.target.tagName === "INPUT" && /^(text|number|password)$/.test(e.target.type)) {
+      e.preventDefault();
+      e.target.blur();
+    }
+  });
+  $("events-more").addEventListener("click", function () { eventsExpanded = !eventsExpanded; renderEvents(); });
+  $("events-5h").addEventListener("change", function (e) {
+    showFiveHourResets = e.target.checked;
+    try { localStorage.setItem(EVENTS_STORE, showFiveHourResets ? "1" : "0"); } catch (err) {}
+    if (status) renderEvents();
+  });
+  // bounce is set when the user picks the value, so the thumb slides there.
+  function pressSegment(id, value, bounce) {
     var box = $(id);
     Array.prototype.forEach.call(box.querySelectorAll(".seg"), function (b) {
       b.setAttribute("aria-pressed", b.getAttribute("data-value") === value ? "true" : "false");
     });
+    placeThumb(box, !!bounce);
   }
-
   // Delegated, so it also covers buttons added later. Clicking the pressed
   // button only retries a chart that failed to load.
   function bindSegmented(id, onPick) {
@@ -2244,11 +4606,10 @@
         return;
       }
       var value = button.getAttribute("data-value");
-      pressSegment(id, value);
+      pressSegment(id, value, true);
       onPick(value);
     });
   }
-
   bindSegmented("range-buttons", function (value) {
     range = value;
     saveChartFilters();
@@ -2266,96 +4627,7 @@
     saveChartFilters();
     renderChart();
   });
-
-  Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (b) {
-    b.onclick = function () { showView(b.dataset.view); };
-  });
-  $("refresh").addEventListener("click", function (e) {
-    runAction(e.currentTarget, API + "/refresh", {}, "已刷新全部额度");
-  });
-  $("events-more").addEventListener("click", function () { eventsExpanded = !eventsExpanded; renderEvents(); });
-  $("events-5h").addEventListener("change", function (e) {
-    showFiveHourResets = e.target.checked;
-    try { localStorage.setItem(EVENTS_STORE, showFiveHourResets ? "1" : "0"); } catch (err) {}
-    if (status) renderEvents();
-  });
-  $("test").addEventListener("click", function (e) {
-    // The test waits for the saves under way and for the plugin to apply
-    // the latest of them. When it is not applied in time, the test is not
-    // sent, since it would use the settings before the change.
-    var button = e.currentTarget;
-    button.disabled = true;
-    var results = $("test-results");
-    clear(results);
-    saveQueue.then(function () {
-      var token = lastToken();
-      if (!token || tokenApplied(savedTokens, token, status && status.config_applied_token)) return true;
-      results.appendChild(el("div", { class: "test-result hint", text: "等待插件应用新设置…" }));
-      return whenApplied(token);
-    }).then(function (applied) {
-      if (!applied) {
-        clear(results);
-        results.appendChild(el("div", { class: "test-result failed", text: "配置尚未生效，未发送测试" }));
-        return null;
-      }
-      return api("POST", API + "/test-notify", {});
-    }).then(function (data) {
-      if (!data) return;
-      if (data.status) { status = data.status; renderStatus(); }
-      renderTestResults(data.results);
-      if (data.ok) toast("测试通知已发送");
-      else if (!data.results) toast("失败：" + (data.error || ""));
-      else toast(data.results.some(function (r) { return r.ok; }) ? "部分渠道测试失败" : "测试推送失败");
-    }).catch(function (err) {
-      clear(results);
-      if (err.message !== "unauthorized") toast("失败：" + err.message);
-    }).then(function () { button.disabled = false; });
-  });
-
-  var settingsForm = $("settings-form");
-  settingsForm.addEventListener("change", function (e) {
-    var input = e.target;
-    var sectionEl = input.closest(".settings-section");
-    if (!sectionEl) return;
-    var section = sectionEl.dataset.section;
-    if (input.type === "password") {
-      // A value the browser fills in while the field is not focused comes
-      // from autofill on page load; it is not saved, and the field shows
-      // the saved value again. The management key is refused with a message.
-      if (autofilled(input) && document.activeElement !== input) { fillSettings(); return; }
-      if (input.id === "models-api-key" && key && input.value.trim() === key) {
-        setSaveState(section, "failed", "这是 CPA 管理密钥，未保存。请填写 access.api-keys 中的 key");
-        return;
-      }
-    }
-    if (input.type === "number") {
-      if (!input.checkValidity()) {
-        setSaveState(section, "failed", input.validationMessage);
-        input.reportValidity();
-        return;
-      }
-      if (input.value === "") { fillSettings(); return; }
-    }
-    if (input.id === "ignition-enabled") renderIgnitionOff();
-    saveSection(section);
-  });
-  // Keep failed drafts visible while invalidating responses for older edits.
-  settingsForm.addEventListener("input", function (e) {
-    var input = e.target;
-    input.settingsDirty = true;
-    input.settingsEdit = (input.settingsEdit || 0) + 1;
-    var sectionEl = input.closest(".settings-section");
-    if (sectionEl) editSaveState(sectionEl.dataset.section);
-  });
-  settingsForm.addEventListener("submit", function (e) { e.preventDefault(); });
-  // Enter commits a text or number field; leaving it fires the change that saves it.
-  settingsForm.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && e.target.tagName === "INPUT" && /^(text|number|password)$/.test(e.target.type)) {
-      e.preventDefault();
-      e.target.blur();
-    }
-  });
-
+  renderRangeButtons();
   chartCard.addEventListener("pointerenter", function () { chartPointer = true; });
   chartCard.addEventListener("pointerleave", function () {
     chartPointer = false;
@@ -2365,20 +4637,25 @@
     if (chartBehind && !chartPointer && !chartCard.contains(e.relatedTarget)) renderChart();
   });
   window.addEventListener("resize", function () { if (history) renderChart(); });
+  window.addEventListener("storage", function (e) {
+    if (e.key === "cli-proxy-theme") { applyTheme(); renderChart(); }
+    if (e.key === "cli-proxy-language") applyLanguage();
+    syncPublicUrl(e.key);
+  });
+  if (window.matchMedia) {
+    var media = window.matchMedia("(prefers-color-scheme: dark)");
+    if (media.addEventListener) media.addEventListener("change", function () { applyTheme(); renderChart(); });
+  }
 
-  $("key-ok").onclick = function () {
-    var v = $("mgmt-key").value.trim();
-    if (!v) { $("key-error").textContent = "请先输入管理密钥。"; return; }
-    key = v;
-    try { sessionStorage.setItem(KEY_STORE, v); } catch (e) {}
-    $("key-section").hidden = true;
-    $("mgmt-key").value = "";
-    start();
-  };
-
-  renderRangeButtons();
+  // Checked without reading the parent, so the layout also clears the
+  // Management Center's toolbar when it is served from another origin.
+  if (window.self !== window.top) document.documentElement.classList.add("embedded");
+  applyTheme();
+  applyLanguage();
+  watchParent();
   var storedView = "quota";
   try { storedView = localStorage.getItem(VIEW_STORE) || "quota"; } catch (err) {}
   showView(storedView);
+  key = sessionStorage.getItem(KEY_STORE) || centerKey();
   if (key) start(); else askForKey("");
 })();

@@ -12,15 +12,46 @@ import (
 )
 
 // maskedConfig returns the config for the status payload with every secret
-// replaced by "" plus a *_set flag.
+// replaced by "" plus a *_set flag. Top-level keys follow Lamplighter's
+// config layout (notice/low/critical_threshold, recovery_notify,
+// reset_reminder, models_api_key, cpa_base_url, providers, remember_*);
+// the nested alerts./ignition. forms are kept for compatibility.
 func (rt *runtime) maskedConfig() map[string]any {
 	cfg := rt.cfg
+	thresholds := append([]int{0, 0, 0}, cfg.Alerts.Thresholds...)
+	if len(thresholds) > 3 {
+		thresholds = thresholds[:3]
+	}
+	modelsKeySet := strings.TrimSpace(cfg.Ignition.ModelsAPIKey) != ""
 	return map[string]any{
 		"enabled":                cfg.Enabled,
 		"poll_interval_seconds":  cfg.PollIntervalSeconds,
 		"history_retention_days": cfg.HistoryRetentionDays,
 		"data_dir":               cfg.DataDir,
 		"config_token":           "",
+		"notice_threshold":       thresholds[0],
+		"low_threshold":          thresholds[1],
+		"critical_threshold":     thresholds[2],
+		"recovery_notify": map[string]any{
+			"five_hour": cfg.Alerts.RecoveryNotify.FiveHour,
+			"seven_day": cfg.Alerts.RecoveryNotify.SevenDay,
+		},
+		"reset_reminder": map[string]any{
+			"five_hour": cfg.Alerts.ResetReminder.FiveHour,
+			"seven_day": cfg.Alerts.ResetReminder.SevenDay,
+		},
+		"models_api_key":          map[bool]string{true: "已设置", false: ""}[modelsKeySet],
+		"cpa_base_url":            cfg.Ignition.CPABaseURL,
+		"remember_chart_filters":  cfg.RememberChartFilters,
+		"remember_chart_expanded": cfg.RememberChartExpanded,
+		"providers": map[string]any{
+			"codex": map[string]any{
+				"ignite": cfg.Providers.Codex.Ignite,
+				// The panel's per-provider model input is a view onto
+				// ignition.model (single source of truth).
+				"model": cfg.Ignition.Model,
+			},
+		},
 		"telegram": map[string]any{
 			"bot_token":     "",
 			"bot_token_set": strings.TrimSpace(cfg.Telegram.BotToken) != "",
@@ -62,7 +93,7 @@ func (rt *runtime) maskedConfig() map[string]any {
 			"max_transient_failures": cfg.Ignition.MaxTransientFailures,
 			"model":                  cfg.Ignition.Model,
 			"models_api_key":         "",
-			"models_api_key_set":     strings.TrimSpace(cfg.Ignition.ModelsAPIKey) != "",
+			"models_api_key_set":     modelsKeySet,
 			"cpa_base_url":           cfg.Ignition.CPABaseURL,
 		},
 	}
@@ -96,6 +127,7 @@ func (rt *runtime) statusLocked() map[string]any {
 		}
 		return indices[i] < indices[j]
 	})
+	titles := displayTitles(rt.accounts, indices)
 	for _, idx := range indices {
 		acct := rt.accounts[idx]
 		windows := []map[string]any{}
@@ -141,16 +173,35 @@ func (rt *runtime) statusLocked() map[string]any {
 			}
 			stale = fresh && available
 		}
+		planName, planWeight := codexPlan(acct.Plan)
+		title := titles[idx]
+		if title == "" {
+			title = acct.Title
+		}
+		// One Lamplighter-style quota group per credential (Codex-only):
+		// the panel's cards, chart and event labels all walk groups.
+		groups := []map[string]any{{
+			"key":          groupKey(idx),
+			"label":        title,
+			"source_label": "GPT",
+			"windows":      windows,
+		}}
 		account := map[string]any{
 			"auth_index":         acct.AuthIndex,
 			"auth_id":            acct.AuthID,
 			"provider":           acct.Provider,
-			"title":              acct.Title,
+			"title":              title,
+			"email":              acct.Email,
+			"name":               acct.Name,
+			"note":               acct.Note,
+			"unavailable":        acct.Unavailable,
 			"error":              errStr,
 			"cooldown_until":     formatTimePtr(acct.CooldownUntil),
 			"stale_cooldown":     stale,
 			"credential_problem": rt.credentialProblemFor(idx),
-			"plan":               acct.Plan,
+			"plan":               planName,
+			"default_weight":     planWeight,
+			"groups":             groups,
 			"windows":            windows,
 		}
 		accounts = append(accounts, account)
@@ -170,19 +221,30 @@ func (rt *runtime) statusLocked() map[string]any {
 		}
 		usage[idx] = snap
 
-		// Ignition target for this credential.
+		// Ignition target for this credential, in Lamplighter's TargetView
+		// shape. next_due stays empty while ignition is disabled, the
+		// credential has a confirmed problem, or a non-5h window is
+		// exhausted (refreshTargets); the row itself is always listed so
+		// the manual reset button stays available (Phoenix delta).
 		ts := rt.state.target(idx)
 		var reset time.Time
 		if w, ok := acct.Windows[windowFiveHour]; ok {
 			reset = w.Reset
 		}
-		nextDue := ignitionDueAt(rt.cfg.Ignition, ts, reset, now)
+		blockedWindow, blockedUntil := exhaustedWindow(acct, now)
+		nextDue := time.Time{}
+		if rt.cfg.Ignition.Enabled && rt.cfg.Providers.Codex.Ignite && rt.credentialProblemFor(idx) == "" && blockedWindow == "" {
+			nextDue = ignitionDueAt(rt.cfg.Ignition, ts, reset, now)
+		}
 		target := map[string]any{
+			"key":                  groupKey(idx),
 			"auth_index":           idx,
 			"group":                idx,
-			"label":                acct.Title,
+			"label":                title,
+			"provider":             "codex",
 			"next_due":             formatTimePtr(nextDue),
 			"reset":                formatTimePtr(reset),
+			"rolling":              ts.RollingReset,
 			"last_success":         formatTimePtr(ts.LastSuccess),
 			"last_attempt":         formatTimePtr(ts.LastAttempt),
 			"last_model":           ts.LastModel,
@@ -190,21 +252,35 @@ func (rt *runtime) statusLocked() map[string]any {
 			"status":               targetStatusFor(rt, idx, ts, now),
 			"consecutive_failures": ts.ConsecutiveFailures,
 			"circuit_until":        formatTimePtr(ts.CircuitUntil),
+			"circuit_reason":       ts.CircuitReason,
+			"blocked_window":       blockedWindow,
+			"blocked_until":        formatTimePtr(blockedUntil),
 		}
 		targets = append(targets, target)
 	}
 	events := make([]map[string]any, 0, len(rt.events))
 	for _, e := range rt.events {
+		// Lamplighter Event shape: kind is the event type, level the
+		// severity, group the quota-group key. Phoenix's own fields
+		// (notify/auth_index/window/event) are kept alongside.
 		row := map[string]any{
 			"time":    e.Time.Format(time.RFC3339),
-			"kind":    e.Kind,
+			"level":   e.Kind,
+			"kind":    e.Event,
 			"message": e.Message,
+		}
+		if e.Event == "" {
+			row["kind"] = e.Kind
+		}
+		if e.AuthIndex != "" {
+			row["group"] = groupKey(e.AuthIndex)
+			row["auth_index"] = e.AuthIndex
+			if t, ok := titles[e.AuthIndex]; ok {
+				row["label"] = t
+			}
 		}
 		if e.Notify != "" {
 			row["notify"] = e.Notify
-		}
-		if e.AuthIndex != "" {
-			row["auth_index"] = e.AuthIndex
 		}
 		if e.Window != "" {
 			row["window"] = e.Window
@@ -224,13 +300,23 @@ func (rt *runtime) statusLocked() map[string]any {
 	if !rt.nextPoll.IsZero() {
 		nextPoll = rt.nextPoll.Format(time.RFC3339)
 	}
+	lang := rt.lang
+	if lang == "" {
+		lang = "zh"
+	}
+	nextModels := map[string]any{}
+	if next := rt.cachedNextModelLocked(); next != "" {
+		nextModels["codex"] = next
+	}
 	return map[string]any{
 		"plugin":               "phoenix",
 		"version":              pluginVersion,
 		"enabled":              rt.cfg.Enabled,
 		"running":              true,
 		"now":                  now.Format(time.RFC3339),
+		"timezone":             zoneName(now),
 		"utc_offset_seconds":   offset,
+		"language":             lang,
 		"last_poll":            lastPoll,
 		"next_poll":            nextPoll,
 		"config_applied_token": rt.configAppliedToken,
@@ -239,6 +325,18 @@ func (rt *runtime) statusLocked() map[string]any {
 		"accounts":             accounts,
 		"targets":              targets,
 		"events":               events,
+		"config_error":         rt.configErr,
+		"list_error":           rt.listErr,
+		"notify_error":         rt.lastNotifyErr,
+		"models_error":         rt.modelsErr,
+		"next_models":          nextModels,
+		"providers": []map[string]any{{
+			"id":         "codex",
+			"title":      "GPT",
+			"ignite":     true,
+			"model_hint": map[string]any{"zh": "最新的 Luna", "en": "latest Luna"},
+		}},
+		"group_order": []string{"GPT"},
 		"errors": map[string]any{
 			"config_error": rt.configErr,
 			"list_error":   rt.listErr,
@@ -263,11 +361,156 @@ func targetStatusFor(rt *runtime, authIndex string, ts *targetState, now time.Ti
 	return ts.ignitionStatus(now)
 }
 
+// exhaustedWindow returns the used-up non-5h window holding ignition back
+// (Lamplighter cooldown.exhaustedWindow): remaining <= 0.01 with a reset
+// still in the future (or unknown).
+func exhaustedWindow(acct *accountState, now time.Time) (string, time.Time) {
+	if w, ok := acct.Windows[windowSevenDay]; ok {
+		if w.Remaining <= exhaustedRemaining && (w.Reset.IsZero() || w.Reset.After(now)) {
+			return windowSevenDay, w.Reset
+		}
+	}
+	return "", time.Time{}
+}
+
 func formatTimePtr(t time.Time) any {
 	if t.IsZero() {
 		return nil
 	}
 	return t.Format(time.RFC3339)
+}
+
+// groupKey is the Lamplighter quota-group key for a Phoenix credential:
+// provider:authIndex:rawKey with the Codex raw key "codex:main".
+func groupKey(authIndex string) string {
+	return "codex:" + authIndex + ":codex:main"
+}
+
+// codexPlan maps a wham/usage plan_type to Lamplighter's display name and
+// pooled weight (providers.PlanOf / codexPlans: price relative to Plus;
+// Free and Go get a tenth). Unknown plans keep their raw name, weight 1.
+func codexPlan(raw string) (string, float64) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "free":
+		return "Free", 0.1
+	case "go":
+		return "Go", 0.1
+	case "plus":
+		return "Plus", 1
+	case "prolite":
+		return "Pro $100", 5
+	case "pro":
+		return "Pro $200", 10
+	case "promax":
+		return "Pro $500", 25
+	case "team", "self_serve_business_usage_based":
+		return "Business", 1
+	case "self_serve_business_prolite":
+		return "Business Premium", 5
+	case "business", "enterprise", "ent26", "enterprise_cbp_automation", "enterprise_cbp_usage_based":
+		return "Enterprise", 1
+	}
+	if raw == "" {
+		return "", 1
+	}
+	return raw, 1
+}
+
+// maskedSuffix is Lamplighter's account suffix from an email: the last two
+// runes of the local part ("#xy"), the whole local part when it is one
+// rune, or "#<ordinal>" when there is no email.
+func maskedSuffix(email string, ordinal int) string {
+	local, _, _ := strings.Cut(email, "@")
+	runes := []rune(local)
+	switch {
+	case len(runes) >= 2:
+		return "#" + string(runes[len(runes)-2:])
+	case len(runes) == 1:
+		return "#" + local
+	}
+	return "#" + strconv.Itoa(ordinal)
+}
+
+// accountNameFromNote is the account name in a CPA credential note: its
+// first line, cut to 20 runes with an ellipsis.
+func accountNameFromNote(note string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(note), "\n")
+	runes := []rune(strings.TrimSpace(line))
+	if len(runes) > 20 {
+		return string(runes[:20]) + "…"
+	}
+	return string(runes)
+}
+
+// emailFromAuthID extracts an email-like address from a Codex auth id
+// ("codex-<uuid>-<email>-<plan>"); "" when the id carries no "@".
+func emailFromAuthID(authID string) string {
+	at := strings.Index(authID, "@")
+	if at < 0 {
+		return ""
+	}
+	start := strings.LastIndex(authID[:at], "-") + 1
+	end := strings.Index(authID[at:], "-")
+	var domain string
+	if end < 0 {
+		domain = authID[at+1:]
+	} else {
+		domain = authID[at+1 : at+end]
+	}
+	if domain == "" {
+		return ""
+	}
+	return authID[start:at] + "@" + domain
+}
+
+// displayTitles computes the panel account titles Lamplighter-style
+// (loadCreds + labelFor): "GPT" plus a suffix — "#<name>" from the
+// credential note's first line, else the masked email, else nothing when
+// there is a single Codex account. A named suffix shared by two accounts
+// gains the masked email, exactly like Lamplighter.
+func displayTitles(accounts map[string]*accountState, indices []string) map[string]string {
+	out := map[string]string{}
+	masked := map[string]string{}
+	for i, idx := range indices {
+		acct := accounts[idx]
+		email := acct.Email
+		if !strings.Contains(email, "@") {
+			email = emailFromAuthID(acct.AuthID)
+		}
+		masked[idx] = maskedSuffix(email, i+1)
+	}
+	suffix := map[string]string{}
+	taken := map[string]int{}
+	for _, idx := range indices {
+		acct := accounts[idx]
+		if name := accountNameFromNote(acct.Note); name != "" {
+			suffix[idx] = "#" + name
+		} else if len(indices) > 1 {
+			suffix[idx] = masked[idx]
+		}
+		taken[suffix[idx]]++
+	}
+	for _, idx := range indices {
+		acct := accounts[idx]
+		if accountNameFromNote(acct.Note) != "" && taken[suffix[idx]] > 1 {
+			suffix[idx] += masked[idx]
+		}
+		out[idx] = "GPT" + suffix[idx]
+	}
+	return out
+}
+
+// zoneName returns a display name for the plugin's local time zone. Go
+// reports "Local" when it was loaded from /etc/localtime, which the panel
+// hides; the zone abbreviation is more useful there.
+func zoneName(now time.Time) string {
+	if name := now.Location().String(); name != "" && name != "Local" {
+		return name
+	}
+	if name, _ := now.Zone(); name != "" {
+		return name
+	}
+	return ""
 }
 
 // historyResponse builds the GET /history payload for a range and window
@@ -288,8 +531,20 @@ func (rt *runtime) historyResponse(rangeName, window string, now time.Time) map[
 		histDir = rt.dataDir + "/history"
 	}
 	labels := map[string]string{}
-	for idx, acct := range rt.accounts {
-		labels[idx] = acct.Title
+	{
+		idxs := make([]string, 0, len(rt.accounts))
+		for idx := range rt.accounts {
+			idxs = append(idxs, idx)
+		}
+		sort.Slice(idxs, func(i, j int) bool {
+			ni, ei := strconv.Atoi(idxs[i])
+			nj, ej := strconv.Atoi(idxs[j])
+			if ei == nil && ej == nil {
+				return ni < nj
+			}
+			return idxs[i] < idxs[j]
+		})
+		labels = displayTitles(rt.accounts, idxs)
 	}
 	rt.mu.Unlock()
 	rt.histMu.Lock()
@@ -326,11 +581,16 @@ func (rt *runtime) historyResponse(rangeName, window string, now time.Time) map[
 			resets = [][2]any{}
 		}
 		series = append(series, map[string]any{
-			"auth_index": key,
-			"label":      label,
-			"window":     window,
-			"points":     points,
-			"resets":     resets,
+			"group":        groupKey(key),
+			"auth_index":   key,
+			"label":        label,
+			"source_label": "GPT",
+			"provider":     "codex",
+			"window":       window,
+			"window_label": window,
+			"kind":         window,
+			"points":       points,
+			"resets":       resets,
 		})
 	}
 	events := []map[string]any{}
@@ -338,11 +598,25 @@ func (rt *runtime) historyResponse(rangeName, window string, now time.Time) map[
 		if rec.Kind != "e" || rec.Time < from.Unix() {
 			continue
 		}
+		// Like Lamplighter's history events, only ignition outcomes mark
+		// the chart.
+		switch rec.Event {
+		case "ignite", "ignite_manual", "ignite_failed", "ignite_paused":
+		default:
+			continue
+		}
 		row := map[string]any{
 			"time":       time.Unix(rec.Time, 0).Format(time.RFC3339),
+			"level":      rec.Level,
 			"kind":       rec.Event,
+			"group":      groupKey(rec.Group),
 			"message":    rec.Message,
 			"auth_index": rec.Group,
+		}
+		if rec.Group != "" {
+			if t, ok := labels[rec.Group]; ok && t != "" {
+				row["label"] = t
+			}
 		}
 		if rec.Window != "" {
 			row["window"] = rec.Window

@@ -212,10 +212,8 @@ func historyRangeSpan(name, window string, now time.Time) time.Duration {
 }
 
 // historyBucket returns the bucket length in seconds for a span, following
-// the audit contract: spans up to 2 days keep (near-)raw samples at a 60s
-// nominal bucket, then 600s over 2d, 900s over 4d, 1800s over 8d and 3600s
-// over 15d. A 60s bucket loses nothing in practice because the active poll
-// interval is at least 60s.
+// Lamplighter: spans up to 2 days keep raw samples (bucket 0), then 600s
+// over 2d, 900s over 4d, 1800s over 8d and 3600s over 15d.
 func historyBucket(span time.Duration) int64 {
 	const day = 24 * time.Hour
 	switch {
@@ -228,12 +226,13 @@ func historyBucket(span time.Duration) int64 {
 	case span > 2*day:
 		return 600
 	}
-	return 60
+	return 0
 }
 
 // bucketSamples reduces samples to the last sample per bucket (bucket <= 0
 // keeps every sample) and prepends the last sample before from, so each
-// series reaches the left edge of the range.
+// series reaches the left edge of the range. Points are
+// [unix seconds, remaining, 1 for a passive sample] like Lamplighter's.
 func bucketSamples(samples []historyRecord, from int64, bucket int64) [][3]any {
 	if bucket <= 0 {
 		bucket = 1
@@ -257,20 +256,30 @@ func bucketSamples(samples []historyRecord, from int64, bucket int64) [][3]any {
 	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
 	var points [][3]any
 	if before != nil {
-		points = append(points, [3]any{before.Time, before.Remaining, before.Source})
+		passive := 0.0
+		if before.Source == "passive" {
+			passive = 1
+		}
+		points = append(points, [3]any{before.Time, before.Remaining, passive})
 	}
 	for _, b := range order {
 		rec := kept[b]
-		points = append(points, [3]any{rec.Time, rec.Remaining, rec.Source})
+		passive := 0.0
+		if rec.Source == "passive" {
+			passive = 1
+		}
+		points = append(points, [3]any{rec.Time, rec.Remaining, passive})
 	}
 	return points
 }
 
-// resetMarkers returns [reset_time_unix, remaining_after_reset] pairs:
-// when a sample reports a materially different reset time (>60s) from the
-// previous sample of the same series, a window reset happened at that new
-// reset time, and the sample's remaining is the remaining after the reset.
-// The frontend derives pace segments as [reset - period, reset] from these.
+// resetMarkers returns [sample_time_unix, scheduled_reset_unix] pairs in
+// Lamplighter's shape: a marker is recorded when a sample reports a
+// materially different reset time (>60s) from the previous sample of the
+// same series (or the reset appears/disappears), so the frontend can draw
+// pace segments and reset lines from them. A change sampled before the
+// range start replaces the list with that single marker, so the pace line
+// still starts at the left edge.
 func resetMarkers(samples []historyRecord, from int64) [][2]any {
 	var out [][2]any
 	var prevReset int64
@@ -278,8 +287,11 @@ func resetMarkers(samples []historyRecord, from int64) [][2]any {
 	for i := range samples {
 		rec := samples[i]
 		if !seen || (rec.Reset == 0) != (prevReset == 0) || absInt64(rec.Reset-prevReset) > 60 {
-			if rec.Time >= from && rec.Reset != 0 {
-				out = append(out, [2]any{rec.Reset, rec.Remaining})
+			change := [2]any{rec.Time, rec.Reset}
+			if rec.Time < from {
+				out = [][2]any{change}
+			} else {
+				out = append(out, change)
 			}
 		}
 		prevReset = rec.Reset

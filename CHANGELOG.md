@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.10 - 2026-11-23
+
+- 面板按 Lamplighter 完全复刻：page.html/page.css/page.js 以 Lamplighter 原文件为底本逐字复制（628 行 CSS、暖灰纸面、三主题、1200px 容器、图表/筛选/排序/刷新/横幅/事件/设置分区、i18n 与语言/主题跟随、config_token 保存流），只做品牌与 Phoenix 差异手术；logo 用用户提供的图（web/logo.jpg，白底圆角小框 30×30 原样使用，base64 内嵌进插件，无远程请求）。
+- 点火模型与点火目标完全按 Lamplighter：模型来自服务表 `providers.codex.model`（占位“自动：最新的 Luna”，`next_models` 追加），已配置的 gpt-6-luna 优先且永不重置；目标为 7 列表格，`POST /ignite {target: "codex:<idx>:codex:main"}`。
+- 重置按 Lamplighter 的呈现适配：图表重置标记、重置提醒、重置列与 Phoenix reset credit 机制对接；动作接口统一 `{ok, status}`，`/reset` 同步返回，`/ignite` 接受 `{target}`。
+- 后端对齐 Lamplighter 的 status/history 形状：`groups[]` 层、顶层错误/语言/时区/providers/next_models/group_order、history 桶/points/resets 字段；PUT `/settings` 接受顶层键与 `providers.codex.model`，`reset.credentials` 字符串先归一化为数组再合并。
+- 修复 `status()` 持锁调用 `cachedNextModel()` 导致的死锁（拆为 `cachedNextModelLocked()`）；修复 PUT 回退路径丢字符串 `reset.credentials` 的问题。
+- 已知限制（宿主侧，未修）：CPA 8.1.1 的 Codex 凭证已迁入 kv.db，插件宿主 AuthList/AuthGet 只认文件凭证，主动轮询与取 token 重置对 kv 凭证不可见；面板数据来自持久化状态 + 被动 usage 填充，点火走 host.model.execute 不受影响。
+
 ## 0.0.9 - 2026-11-23
 
 - 修复轮询在测试服务器上取不到任何额度的问题：轮询、重置与点火回退用 `Provider == "codex"` 精确匹配过滤凭证，宿主在该环境下返回的条目 `Provider` 为空、只有 `Type` 是 codex，导致全部凭证被静默跳过——无账号、无历史、无报错。现按 Lamplighter 的 `loadCreds` 做法归一化（`Provider` 优先、`Type` 兜底、转小写并去空格），并在有凭证但无一匹配为 Codex 时把原因写进 `listErr`（面板通知横幅展示）与 CPA 日志，不再静默空面板。
