@@ -4,10 +4,10 @@
 // title, one line per field):
 //
 //	🟢 GPT 额度状态通知
-//	账号：user@example.com
+//	账号： user@example.com
 //	模型：Codex / GPT
-//	5H：85% ｜ 23:22 恢复（剩余 03h33m）
-//	7D：78% ｜ 11/26 04:20 恢复（剩余 2d08h）
+//	５Ｈ：85% ｜ 23:22 恢复（剩余 03h33m）
+//	７Ｄ：78% ｜ 11/26 04:20 恢复（剩余 2d08h）
 //	状态：Normal（额度充足）
 //	时间：2026-11-23 19:49:00
 //
@@ -107,15 +107,17 @@ func modelLine(provider, label string) string {
 }
 
 // accountLine renders the 账号 line: the account email when known,
-// otherwise the credential index.
+// otherwise the credential index. The label is separated from the
+// address by a space, so a client that auto-detects links from the plain
+// text only links the address itself, not the label with it.
 func accountLine(g Group) string {
 	if strings.TrimSpace(g.Account) != "" {
-		return "账号：" + strings.TrimSpace(g.Account)
+		return "账号： " + strings.TrimSpace(g.Account)
 	}
 	if index := groupAuthIndex(g); index != "" {
 		return "账号：凭证 " + index
 	}
-	return "账号：" + g.Label
+	return "账号： " + g.Label
 }
 
 // windowShort renders a window kind as the templates do: "5H" / "7D".
@@ -166,8 +168,11 @@ func formatQuotaReset(t, now time.Time) string {
 	return t.Format("01/02 15:04")
 }
 
-// quotaWindowLine renders one quota line: "5H：85% ｜ 23:22 恢复（剩余 03h33m）".
-// Without a reset time it is just "5H：85%". Empty when the window is nil.
+// quotaWindowLine renders one quota line: "５Ｈ：85% ｜ 23:22 恢复（剩余 03h33m）".
+// The window label uses full-width characters so it is as wide as the
+// two-character labels of the other lines (账号、模型、状态、时间) and the
+// colons line up. Without a reset time it is just "５Ｈ：85%". Empty when
+// the window is nil.
 func quotaWindowLine(short string, w *quota.Window, now time.Time) string {
 	if w == nil {
 		return ""
@@ -194,10 +199,10 @@ func groupWindow(g Group, kind string) *quota.Window {
 func phoenixBody(g Group, status string, withWindows bool, now time.Time) string {
 	lines := []string{accountLine(g), "模型：" + modelLine(groupProvider(g), cleanLabel(g.Label))}
 	if withWindows {
-		if l := quotaWindowLine("5H", groupWindow(g, quota.KindFiveHour), now); l != "" {
+		if l := quotaWindowLine("５Ｈ", groupWindow(g, quota.KindFiveHour), now); l != "" {
 			lines = append(lines, l)
 		}
-		if l := quotaWindowLine("7D", groupWindow(g, quota.KindSevenDay), now); l != "" {
+		if l := quotaWindowLine("７Ｄ", groupWindow(g, quota.KindSevenDay), now); l != "" {
 			lines = append(lines, l)
 		}
 	}
