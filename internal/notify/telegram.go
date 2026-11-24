@@ -33,11 +33,13 @@ type Telegram struct {
 
 // messageEntity is one Telegram message entity. Offset and Length are in
 // UTF-16 code units, as the Bot API requires; byte and rune offsets are
-// wrong once the text carries emoji or CJK characters.
+// wrong once the text carries emoji or CJK characters. URL is only set
+// for text_link entities.
 type messageEntity struct {
 	Type   string `json:"type"`
 	Offset int    `json:"offset"`
 	Length int    `json:"length"`
+	URL    string `json:"url,omitempty"`
 }
 
 // emailPattern finds email addresses in notification text. It stops at
@@ -46,16 +48,20 @@ type messageEntity struct {
 // included in the link.
 var emailPattern = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
 
-// emailEntities returns one "email" entity per address in text, with
-// offsets and lengths in UTF-16 code units. It returns nil when the text
+// emailLinkEntities returns one "text_link" entity per address in text,
+// pointing at its mailto: URL, with offsets and lengths in UTF-16 code
+// units. A plain "email" entity leaves the link range up to the client,
+// and some clients link the whole word around the address; a text_link
+// pins the range and the destination. It returns nil when the text
 // carries no address, so the request sends no entities field at all.
-func emailEntities(text string) []messageEntity {
+func emailLinkEntities(text string) []messageEntity {
 	var out []messageEntity
 	for _, loc := range emailPattern.FindAllStringIndex(text, -1) {
 		out = append(out, messageEntity{
-			Type:   "email",
+			Type:   "text_link",
 			Offset: utf16Len(text[:loc[0]]),
 			Length: utf16Len(text[loc[0]:loc[1]]),
+			URL:    "mailto:" + text[loc[0]:loc[1]],
 		})
 	}
 	return out
@@ -121,14 +127,15 @@ func (t *Telegram) Send(ctx context.Context, msg Message) error {
 }
 
 func (t *Telegram) sendOne(ctx context.Context, chatID, text string) error {
-	// Explicit email entities tell the client exactly what is a link.
-	// Without them a client that auto-detects links can swallow the
-	// "账号：" prefix into the link along with the address.
+	// Explicit link entities tell the client exactly what is a link and
+	// where it goes. The 账号 line also separates the label from the
+	// address with a space, so a client that auto-detects links from the
+	// plain text only links the address itself.
 	reqBody := struct {
 		ChatID   string          `json:"chat_id"`
 		Text     string          `json:"text"`
 		Entities []messageEntity `json:"entities,omitempty"`
-	}{ChatID: chatID, Text: text, Entities: emailEntities(text)}
+	}{ChatID: chatID, Text: text, Entities: emailLinkEntities(text)}
 	raw, err := json.Marshal(reqBody)
 	if err != nil {
 		return err
