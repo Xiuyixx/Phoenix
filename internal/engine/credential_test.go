@@ -97,7 +97,7 @@ func TestSuspendedAccountPausesIgnitionUntilTheCredentialChanges(t *testing.T) {
 		t.Fatalf("want one suspension notification, got %+v", sender.sent)
 	}
 	msg := suspended[0]
-	if msg.Title != "🔴 Claude 账号已停用" || !strings.Contains(msg.Body, "账号已被停用，请检查凭证。申诉：https://forms.gle/hGzM9MEUv2azZsrb9") ||
+	if msg.Title != "🔴 Claude 账号已停用" || !strings.Contains(msg.Body, "账号已被停用，请检查凭证。（403 · TOS_VIOLATION）申诉：https://forms.gle/hGzM9MEUv2azZsrb9") ||
 		strings.Contains(msg.Body, "{") {
 		t.Fatalf("message %+v", msg)
 	}
@@ -568,7 +568,7 @@ func TestCredentialProblemWithoutMessage(t *testing.T) {
 	if len(ev) != 1 || ev[0].Params["summary"] != "" || ev[0].Detail != "403 · TOS_VIOLATION · 账号已停用" {
 		t.Fatalf("events %+v", ev)
 	}
-	if len(sender.sent) != 1 || strings.Contains(sender.sent[0].Body, "HTTP 403") || strings.Contains(sender.sent[0].Body, "TOS_VIOLATION") || !strings.Contains(sender.sent[0].Body, "账号已被停用，请检查凭证。") {
+	if len(sender.sent) != 1 || !strings.Contains(sender.sent[0].Body, "403 · TOS_VIOLATION") || strings.Contains(sender.sent[0].Body, "HTTP 403") || !strings.Contains(sender.sent[0].Body, "账号已被停用，请检查凭证。") {
 		t.Fatalf("notification %+v", sender.sent)
 	}
 }
