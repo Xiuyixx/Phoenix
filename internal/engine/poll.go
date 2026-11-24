@@ -394,7 +394,75 @@ func (e *Engine) poll(ctx context.Context, cfg config.Config, slot time.Time, on
 	e.mu.Unlock()
 	e.dirty = true
 	e.checkCooldowns(ctx, cfg)
+	e.checkStaleQuotas(ctx, cfg)
 	e.flushCredentialNotices(ctx, start)
+}
+
+// checkStaleQuotas sends one notification per account whose quota data has
+// not refreshed for staleQuotaAge, and records an event. A fresh reading
+// clears the record, so a later stale episode notifies again. An account
+// with a credential problem already has its own notification, and one that
+// never reported quota yet is skipped.
+func (e *Engine) checkStaleQuotas(ctx context.Context, cfg config.Config) {
+	if e.state == nil {
+		return
+	}
+	now := e.now()
+	type stale struct {
+		cred     *Cred
+		label    string
+		group    *GroupView
+		lastSeen time.Time
+	}
+	var found []stale
+	e.mu.Lock()
+	for _, cred := range e.creds {
+		if st := e.state.Credentials[cred.AuthIndex]; st != nil && (st.Reason != "" || st.QueryReason != "") {
+			continue
+		}
+		var newest int64
+		var newestGroup *GroupView
+		for _, g := range e.groups {
+			if g.AuthIndex != cred.AuthIndex {
+				continue
+			}
+			if st := e.state.Groups[g.Key]; st != nil && st.LastSeen > newest {
+				newest = st.LastSeen
+				newestGroup = g
+			}
+		}
+		if newest == 0 || now.Sub(time.Unix(newest, 0)) <= staleQuotaAge {
+			continue
+		}
+		if e.state.StaleNotices[cred.AuthIndex] == newest {
+			continue
+		}
+		found = append(found, stale{cred: cred, label: labelFor(providers.Title(cred.Provider), cred), group: newestGroup, lastSeen: time.Unix(newest, 0)})
+	}
+	e.mu.Unlock()
+	for _, s := range found {
+		group := notify.Group{Key: "", Label: s.label, Provider: s.cred.Provider, Account: s.cred.Email}
+		if s.group != nil {
+			group = notifyGroup(s.cred, s.group)
+		}
+		msg := notify.StaleQuotaMessage(e.language(), group, s.lastSeen, cfg.Location(), now)
+		e.addEventDetail("warn", "quota_stale", group.Key, s.label,
+			fmt.Sprintf("额度数据已过期，上次刷新 %s", s.lastSeen.In(cfg.Location()).Format("01/02 15:04")), msg.Title,
+			map[string]string{"last_seen": eventTime(s.lastSeen)})
+		if e.alerts == nil || e.alerts.Sender == nil {
+			continue
+		}
+		switch err := e.alerts.Sender.Send(ctx, msg); {
+		case errors.Is(err, notify.ErrNotConfigured):
+			// Notifications are off.
+		case err != nil:
+			e.notifyFailed("", msg, err)
+		default:
+			e.state.StaleNotice(s.cred.AuthIndex, s.lastSeen.Unix())
+			e.dirty = true
+			e.notified("", msg)
+		}
+	}
 }
 
 // refreshCred runs the active query of one credential.
@@ -433,6 +501,12 @@ func (e *Engine) queryCred(ctx context.Context, cfg config.Config, cred *Cred, t
 	if track {
 		e.noteCredentialOK(ctx, cred, sourceQuery)
 	}
+	// A fresh reading ends a stale-data episode: a later stale episode
+	// notifies again.
+	if e.state != nil && len(e.state.StaleNotices) > 0 {
+		delete(e.state.StaleNotices, cred.AuthIndex)
+		e.dirty = true
+	}
 	// The plan comes first, so that a changed plan resets the notification
 	// baselines before the new windows are compared with them.
 	confirmed := e.notePlan(ctx, p, cred, credential, groups, now)
@@ -444,6 +518,11 @@ const (
 	// planCheckPeriod is how often the plan of an account is requested on
 	// its own, for providers whose usage response does not state it.
 	planCheckPeriod = 24 * time.Hour
+	// staleQuotaAge is how long the quota data of an account may go
+	// unrefreshed before its staleness is notified once, six missed polls
+	// at the default interval. A credential problem of the account has its
+	// own notification, so a stale reading alone does not repeat it.
+	staleQuotaAge = 30 * time.Minute
 	// planRecheckPeriod is how long the plan is requested with every active
 	// query after the windows of the account changed.
 	planRecheckPeriod = time.Hour
@@ -753,6 +832,12 @@ func (e *Engine) applyGroups(ctx context.Context, cfg config.Config, cred *Cred,
 		}
 		e.recordQuotaTransitions(group, previous[group.Key], now)
 		e.recordSamples(group, source, now)
+		if len(group.Windows) > 0 && e.state != nil {
+			// A successful reading refreshes the group, even when its
+			// alerts wait for a plan recheck: LastSeen measures the data,
+			// not the notifications.
+			e.state.Group(group.Key).LastSeen = now.Unix()
+		}
 		if e.alerts != nil && alerts {
 			e.alerts.ProcessGroup(ctx, e.state, notifyGroup(cred, group), now)
 		}
