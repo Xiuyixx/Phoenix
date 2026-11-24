@@ -172,8 +172,8 @@ func TestPollBuildsAccountsWithSuffixes(t *testing.T) {
 	for _, account := range status.Accounts {
 		titles = append(titles, account.Title)
 	}
-	if strings.Join(titles, ",") != "GPT#am,GPT#rk,Claude,Antigravity" &&
-		strings.Join(titles, ",") != "GPT#rk,GPT#am,Claude,Antigravity" {
+	if strings.Join(titles, ",") != "GPT#alice.work@example.com,GPT#bob.team@example.net,Claude,Antigravity" &&
+		strings.Join(titles, ",") != "GPT#bob.team@example.net,GPT#alice.work@example.com,Claude,Antigravity" {
 		t.Fatalf("titles %v", titles)
 	}
 	for _, req := range h.requests {
@@ -204,21 +204,21 @@ func TestNotesNameAccounts(t *testing.T) {
 	for _, cred := range creds {
 		suffixes = append(suffixes, cred.Suffix)
 	}
-	if got := strings.Join(suffixes, ","); got != "#主力号,#am,#工作,#a very long account …" {
+	if got := strings.Join(suffixes, ","); got != "#主力号,#bob.team@example.net,#工作,#a very long account …" {
 		t.Fatalf("suffixes %s", got)
 	}
 
 	h.auths[1].Note = "主力号"
 	creds, _ = e.loadCreds(e.config())
-	if creds[0].Suffix != "#主力号#rk" || creds[1].Suffix != "#主力号#am" {
+	if creds[0].Suffix != "#主力号#alice.work@example.com" || creds[1].Suffix != "#主力号#bob.team@example.net" {
 		t.Fatalf("same names %q %q", creds[0].Suffix, creds[1].Suffix)
 	}
 
 	// A name equal to another account's email suffix also gets its own.
-	h.auths[0].Note = "am"
+	h.auths[0].Note = "bob.team@example.net"
 	h.auths[1].Note = ""
 	creds, _ = e.loadCreds(e.config())
-	if creds[0].Suffix != "#am#rk" || creds[1].Suffix != "#am" {
+	if creds[0].Suffix != "#bob.team@example.net#alice.work@example.com" || creds[1].Suffix != "#bob.team@example.net" {
 		t.Fatalf("name like an email suffix %q %q", creds[0].Suffix, creds[1].Suffix)
 	}
 }
