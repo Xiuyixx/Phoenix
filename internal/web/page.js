@@ -193,7 +193,7 @@
       ignite_confirm: "立即向 {0} 发送一次点火请求？这会开始一个新的 5 小时窗口。",
       ignited: "{0} 点火成功",
       manual_actions: "立即操作",
-      reset_now: "立即重置", reset_done: "{0} 已重置",
+      reset_action: "立即重置", reset_done: "{0} 已重置",
       telegram_title: "Telegram 推送", telegram_enabled: "启用 Telegram 推送",
       telegram_bot_token: "Bot Token", telegram_chat_ids: "接收 ID",
       telegram_hint: "多个接收 ID 用分号分隔；账号停用或报错时直接通知。",
@@ -379,7 +379,7 @@
       ignite_confirm: "Send an ignition request to {0} now? This starts a new 5-hour window.",
       ignited: "{0} ignited",
       manual_actions: "Manual actions",
-      reset_now: "Reset now", reset_done: "{0} reset",
+      reset_action: "Reset now", reset_done: "{0} reset",
       telegram_title: "Telegram", telegram_enabled: "Enable Telegram notifications",
       telegram_bot_token: "Bot Token", telegram_chat_ids: "Chat IDs",
       telegram_hint: "Separate multiple chat IDs with semicolons; account errors and suspensions notify directly.",
@@ -1373,7 +1373,7 @@
       // Reset is Codex-only: the reset button stays on Codex rows, before
       // the ignite button, and Claude/Antigravity rows get ignite alone.
       if (t.provider === "codex") {
-        var resetButton = el("button", { type: "button", class: "btn btn-secondary btn-sm", text: translate("reset_now"), onclick: function () {
+        var resetButton = el("button", { type: "button", class: "btn btn-secondary btn-sm", text: translate("reset_action"), onclick: function () {
           runAction(resetButton, API + "/reset", { auth_index: t.auth_index }, translate("reset_done", t.label));
         } });
         actions.push(resetButton);
