@@ -316,18 +316,21 @@ func sendTelegramRaw(t *testing.T, server *httptest.Server, msg Message) {
 // at the wrong place. The 账号 line is "账号： user@example.com" after the
 // "🟢 GPT 额度状态通知" title: 13 UTF-16 units of title, 2 of the
 // blank line, 4 of "账号： " with the space, so the address starts at 19
-// and is 16 long, linked to its mailto: URL.
+// and is 16 long, linked to its mailto: URL. The title itself is sent
+// as a bold entity covering its 13 units.
 func TestTelegramEmailLinksUseUTF16Offsets(t *testing.T) {
 	server, got := newTelegramRawServer(t)
 	sendTelegramRaw(t, server, Message{
 		Title: "🟢 GPT 额度状态通知",
-		Body:  "账号： user@example.com\n模型：Codex / GPT\n时间：2026-11-23 19:49:00",
+		Body:  "账号： user@example.com\n模型： Codex / GPT\n时间： 2026-11-23 19:49:00",
 	})
 	req := got.first(t)
-	if req.Text != "🟢 GPT 额度状态通知\n\n账号： user@example.com\n模型：Codex / GPT\n时间：2026-11-23 19:49:00" {
+	if req.Text != "🟢 GPT 额度状态通知\n\n账号： user@example.com\n模型： Codex / GPT\n时间： 2026-11-23 19:49:00" {
 		t.Fatalf("text changed: %q", req.Text)
 	}
-	if len(req.Entities) != 1 || req.Entities[0].Type != "text_link" || req.Entities[0].Offset != 19 || req.Entities[0].Length != 16 || req.Entities[0].URL != "mailto:user@example.com" {
+	if len(req.Entities) != 2 ||
+		req.Entities[0].Type != "bold" || req.Entities[0].Offset != 0 || req.Entities[0].Length != 13 ||
+		req.Entities[1].Type != "text_link" || req.Entities[1].Offset != 19 || req.Entities[1].Length != 16 || req.Entities[1].URL != "mailto:user@example.com" {
 		t.Fatalf("entities %+v", req.Entities)
 	}
 }
@@ -342,9 +345,10 @@ func TestTelegramEmailLinksCoverTitleAndBody(t *testing.T) {
 		Body:  "账号：other@example.com",
 	})
 	req := got.first(t)
-	if len(req.Entities) != 2 ||
-		req.Entities[0].Type != "text_link" || req.Entities[0].Offset != 3 || req.Entities[0].Length != 16 || req.Entities[0].URL != "mailto:user@example.com" ||
-		req.Entities[1].Type != "text_link" || req.Entities[1].Offset != 24 || req.Entities[1].Length != 17 || req.Entities[1].URL != "mailto:other@example.com" {
+	if len(req.Entities) != 3 ||
+		req.Entities[0].Type != "bold" || req.Entities[0].Offset != 0 || req.Entities[0].Length != 19 ||
+		req.Entities[1].Type != "text_link" || req.Entities[1].Offset != 3 || req.Entities[1].Length != 16 || req.Entities[1].URL != "mailto:user@example.com" ||
+		req.Entities[2].Type != "text_link" || req.Entities[2].Offset != 24 || req.Entities[2].Length != 17 || req.Entities[2].URL != "mailto:other@example.com" {
 		t.Fatalf("entities %+v", req.Entities)
 	}
 
@@ -354,24 +358,25 @@ func TestTelegramEmailLinksCoverTitleAndBody(t *testing.T) {
 		Body:  "账号：user@example.com\n🧪 抄送：other@example.net",
 	})
 	req = got.first(t)
-	if len(req.Entities) != 2 ||
-		req.Entities[0].Type != "text_link" || req.Entities[0].Offset != 6 || req.Entities[0].Length != 16 || req.Entities[0].URL != "mailto:user@example.com" ||
-		req.Entities[1].Type != "text_link" || req.Entities[1].Offset != 29 || req.Entities[1].Length != 17 || req.Entities[1].URL != "mailto:other@example.net" {
+	if len(req.Entities) != 3 ||
+		req.Entities[0].Type != "bold" || req.Entities[0].Offset != 0 || req.Entities[0].Length != 1 ||
+		req.Entities[1].Type != "text_link" || req.Entities[1].Offset != 6 || req.Entities[1].Length != 16 || req.Entities[1].URL != "mailto:user@example.com" ||
+		req.Entities[2].Type != "text_link" || req.Entities[2].Offset != 29 || req.Entities[2].Length != 17 || req.Entities[2].URL != "mailto:other@example.net" {
 		t.Fatalf("entities %+v", req.Entities)
 	}
 }
 
-// TestTelegramNoEmailSendsNoEntities checks that a message without an
-// address sends no entities field at all, and the text is untouched.
-func TestTelegramNoEmailSendsNoEntities(t *testing.T) {
+// TestTelegramTitleIsBold checks that a message without an address sends
+// exactly one entity, the bold title, and the text is untouched.
+func TestTelegramTitleIsBold(t *testing.T) {
 	server, got := newTelegramRawServer(t)
 	sendTelegramRaw(t, server, Message{Title: "t", Body: "b"})
-	raw := got.firstRaw(t)
-	if _, ok := raw["entities"]; ok {
-		t.Fatalf("entities must be absent, got %s", raw["entities"])
-	}
-	if req := got.first(t); req.Text != "t\n\nb" {
+	req := got.first(t)
+	if req.Text != "t\n\nb" {
 		t.Fatalf("text %q", req.Text)
+	}
+	if len(req.Entities) != 1 || req.Entities[0].Type != "bold" || req.Entities[0].Offset != 0 || req.Entities[0].Length != 1 {
+		t.Fatalf("entities %+v", req.Entities)
 	}
 }
 
