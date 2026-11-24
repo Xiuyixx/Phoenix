@@ -24,8 +24,8 @@ const PluginID = "phoenix"
 // carry no icon unless the user sets bark_icon.
 const DefaultBarkIcon = ""
 
-// oldBarkIcon is the CPA Management Center logo, the default before v0.1.17.
-// Saved configs that still hold it get the new default.
+// oldBarkIcon is the CPA Management Center logo. Saved configs that still
+// hold it get the new default.
 const oldBarkIcon = "https://raw.githubusercontent.com/router-for-me/Cli-Proxy-API-Management-Center/main/logo.jpg"
 
 // Provider holds the per-provider monitoring and ignition switches.
