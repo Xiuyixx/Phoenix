@@ -71,7 +71,7 @@ import (
 )
 
 // pluginVersion is set at build time with -ldflags "-X main.pluginVersion=...".
-var pluginVersion = "0.1.8"
+var pluginVersion = "0.1.9"
 
 var (
 	instanceMu sync.Mutex
