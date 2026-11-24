@@ -105,6 +105,18 @@ func TestTelegramSendReportsHTTPErrorWithoutToken(t *testing.T) {
 	}
 }
 
+// A 200 with ok:false is a failed delivery, not a success: the message
+// would otherwise be lost while the panel reports it as sent.
+func TestTelegramSendReportsOkFalse(t *testing.T) {
+	server, _ := newTelegramServer(t, http.StatusOK, `{"ok":false,"description":"Forbidden: bot was blocked by the user"}`, map[string]bool{"111": true})
+	telegram, _ := NewTelegram(config.Telegram{Enabled: true, BotToken: "tok", ChatIDs: "111"})
+	telegram.BaseURL = server.URL
+	err := telegram.Send(context.Background(), Message{Title: "t", Body: "b"})
+	if err == nil || !strings.Contains(err.Error(), "ok=false") || !strings.Contains(err.Error(), "bot was blocked by the user") {
+		t.Fatalf("err %v", err)
+	}
+}
+
 func TestTelegramSendReportsPartialFailure(t *testing.T) {
 	server, got := newTelegramServer(t, http.StatusForbidden, `{"ok":false}`, map[string]bool{"222": true})
 	telegram, _ := NewTelegram(config.Telegram{Enabled: true, BotToken: "tok", ChatIDs: "111;222"})
