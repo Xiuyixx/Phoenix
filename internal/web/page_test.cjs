@@ -1406,3 +1406,11 @@ test("the reset button asks for confirmation before consuming a credit", () => {
   // would burn a credit on a single mistap.
   assert.match(source, /resetButton = el\("button"[^]*?confirm\(translate\("reset_confirm", t\.label\)\)[^]*?runAction\(resetButton, API \+ "\/reset"/);
 });
+
+test("the manual action buttons keep a gap between them", () => {
+  // The reset and ignite buttons sit side by side in the actions cell
+  // with no text node between them, so without an explicit gap they
+  // touch and are easy to mistap.
+  const css = fs.readFileSync(path.join(__dirname, "page.css"), "utf8");
+  assert.match(css, /td\.actions \.btn \+ \.btn \{ margin-left: 8px; \}/);
+});
