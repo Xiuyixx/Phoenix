@@ -252,6 +252,7 @@ type telegramRequest struct {
 		Type   string `json:"type"`
 		Offset int    `json:"offset"`
 		Length int    `json:"length"`
+		URL    string `json:"url"`
 	} `json:"entities"`
 }
 
@@ -310,30 +311,31 @@ func sendTelegramRaw(t *testing.T, server *httptest.Server, msg Message) {
 	}
 }
 
-// TestTelegramEmailEntitiesUseUTF16Offsets pins the reported bug: the
+// TestTelegramEmailLinksUseUTF16Offsets pins the reported bug: the
 // message carries emoji and CJK text, so byte and rune offsets both point
-// at the wrong place. The 账号 line is "账号：user@example.com" after the
+// at the wrong place. The 账号 line is "账号： user@example.com" after the
 // "🟢 GPT 额度状态通知" title: 13 UTF-16 units of title, 2 of the
-// blank line, 3 of "账号：", so the address starts at 18 and is 16 long.
-func TestTelegramEmailEntitiesUseUTF16Offsets(t *testing.T) {
+// blank line, 4 of "账号： " with the space, so the address starts at 19
+// and is 16 long, linked to its mailto: URL.
+func TestTelegramEmailLinksUseUTF16Offsets(t *testing.T) {
 	server, got := newTelegramRawServer(t)
 	sendTelegramRaw(t, server, Message{
 		Title: "🟢 GPT 额度状态通知",
-		Body:  "账号：user@example.com\n模型：Codex / GPT\n时间：2026-11-23 19:49:00",
+		Body:  "账号： user@example.com\n模型：Codex / GPT\n时间：2026-11-23 19:49:00",
 	})
 	req := got.first(t)
-	if req.Text != "🟢 GPT 额度状态通知\n\n账号：user@example.com\n模型：Codex / GPT\n时间：2026-11-23 19:49:00" {
+	if req.Text != "🟢 GPT 额度状态通知\n\n账号： user@example.com\n模型：Codex / GPT\n时间：2026-11-23 19:49:00" {
 		t.Fatalf("text changed: %q", req.Text)
 	}
-	if len(req.Entities) != 1 || req.Entities[0].Type != "email" || req.Entities[0].Offset != 18 || req.Entities[0].Length != 16 {
+	if len(req.Entities) != 1 || req.Entities[0].Type != "text_link" || req.Entities[0].Offset != 19 || req.Entities[0].Length != 16 || req.Entities[0].URL != "mailto:user@example.com" {
 		t.Fatalf("entities %+v", req.Entities)
 	}
 }
 
-// TestTelegramEmailEntitiesCoverTitleAndBody checks that addresses in the
+// TestTelegramEmailLinksCoverTitleAndBody checks that addresses in the
 // title and in the body each get an entity, and that an emoji between two
 // addresses shifts the second offset by two UTF-16 units.
-func TestTelegramEmailEntitiesCoverTitleAndBody(t *testing.T) {
+func TestTelegramEmailLinksCoverTitleAndBody(t *testing.T) {
 	server, got := newTelegramRawServer(t)
 	sendTelegramRaw(t, server, Message{
 		Title: "通知 user@example.com",
@@ -341,8 +343,8 @@ func TestTelegramEmailEntitiesCoverTitleAndBody(t *testing.T) {
 	})
 	req := got.first(t)
 	if len(req.Entities) != 2 ||
-		req.Entities[0].Type != "email" || req.Entities[0].Offset != 3 || req.Entities[0].Length != 16 ||
-		req.Entities[1].Type != "email" || req.Entities[1].Offset != 24 || req.Entities[1].Length != 17 {
+		req.Entities[0].Type != "text_link" || req.Entities[0].Offset != 3 || req.Entities[0].Length != 16 || req.Entities[0].URL != "mailto:user@example.com" ||
+		req.Entities[1].Type != "text_link" || req.Entities[1].Offset != 24 || req.Entities[1].Length != 17 || req.Entities[1].URL != "mailto:other@example.com" {
 		t.Fatalf("entities %+v", req.Entities)
 	}
 
@@ -353,8 +355,8 @@ func TestTelegramEmailEntitiesCoverTitleAndBody(t *testing.T) {
 	})
 	req = got.first(t)
 	if len(req.Entities) != 2 ||
-		req.Entities[0].Type != "email" || req.Entities[0].Offset != 6 || req.Entities[0].Length != 16 ||
-		req.Entities[1].Type != "email" || req.Entities[1].Offset != 29 || req.Entities[1].Length != 17 {
+		req.Entities[0].Type != "text_link" || req.Entities[0].Offset != 6 || req.Entities[0].Length != 16 || req.Entities[0].URL != "mailto:user@example.com" ||
+		req.Entities[1].Type != "text_link" || req.Entities[1].Offset != 29 || req.Entities[1].Length != 17 || req.Entities[1].URL != "mailto:other@example.net" {
 		t.Fatalf("entities %+v", req.Entities)
 	}
 }
@@ -373,23 +375,23 @@ func TestTelegramNoEmailSendsNoEntities(t *testing.T) {
 	}
 }
 
-// TestEmailEntities scans addresses directly: trailing punctuation (a
+// TestEmailLinkEntities scans addresses directly: trailing punctuation (a
 // Chinese full stop, an ASCII period) is never part of the link, and
 // offsets count UTF-16 code units.
-func TestEmailEntities(t *testing.T) {
+func TestEmailLinkEntities(t *testing.T) {
 	cases := []struct {
 		text string
 		want []messageEntity
 	}{
-		{"账号：user@example.com。", []messageEntity{{Type: "email", Offset: 3, Length: 16}}},
-		{"user@example.com.", []messageEntity{{Type: "email", Offset: 0, Length: 16}}},
-		{"a@b.co and c@d.org", []messageEntity{{Type: "email", Offset: 0, Length: 6}, {Type: "email", Offset: 11, Length: 7}}},
-		{"🟢 user@example.com", []messageEntity{{Type: "email", Offset: 3, Length: 16}}},
+		{"账号：user@example.com。", []messageEntity{{Type: "text_link", Offset: 3, Length: 16, URL: "mailto:user@example.com"}}},
+		{"user@example.com.", []messageEntity{{Type: "text_link", Offset: 0, Length: 16, URL: "mailto:user@example.com"}}},
+		{"a@b.co and c@d.org", []messageEntity{{Type: "text_link", Offset: 0, Length: 6, URL: "mailto:a@b.co"}, {Type: "text_link", Offset: 11, Length: 7, URL: "mailto:c@d.org"}}},
+		{"🟢 user@example.com", []messageEntity{{Type: "text_link", Offset: 3, Length: 16, URL: "mailto:user@example.com"}}},
 		{"no email here", nil},
 		{"", nil},
 	}
 	for _, tc := range cases {
-		got := emailEntities(tc.text)
+		got := emailLinkEntities(tc.text)
 		if len(got) != len(tc.want) {
 			t.Fatalf("%q: got %+v, want %+v", tc.text, got, tc.want)
 		}
