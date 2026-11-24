@@ -116,8 +116,31 @@ func TestTransientFailureBacksOffThenOpensCircuit(t *testing.T) {
 	if o := schedule().RecordFailure(ts, now, err); o.CircuitOpened || o.RetryIn != 15*time.Minute {
 		t.Fatalf("second failure %+v", o)
 	}
-	if o := schedule().RecordFailure(ts, now, err); !o.CircuitOpened {
-		t.Fatalf("third failure must pause, got %+v", o)
+	if o := schedule().RecordFailure(ts, now, err); !o.CircuitOpened || !o.Until.Equal(local(11, 0)) {
+		t.Fatalf("third failure must pause one hour, got %+v", o)
+	}
+}
+
+// TestAuthUnavailableWrapping402IsTransientAndCapped covers the akk@
+// outage: the upstream answers 402 deactivated_workspace, CPA surfaces it
+// as auth_unavailable, and the ignition fails three times. The 402 must
+// stay transient (the auth may come back), and the circuit it opens must
+// last one hour, not until the next daily start.
+func TestAuthUnavailableWrapping402IsTransientAndCapped(t *testing.T) {
+	ts := &store.TargetState{}
+	now := local(10, 0)
+	err := errors.New(`host_call_failed: auth_unavailable: no auth available (providers=codex, model=gpt-6-luna; last upstream error: {"error": {"message": "Payment Required", "code": "deactivated_workspace"}, "status": 402}) (HTTP 503)`)
+	if Classify(err) != Transient {
+		t.Fatalf("402 wrapped in auth_unavailable must be transient, got %v", Classify(err))
+	}
+	for i := 0; i < 2; i++ {
+		if o := schedule().RecordFailure(ts, now, err); o.CircuitOpened {
+			t.Fatalf("failure %d must not open the circuit: %+v", i+1, o)
+		}
+	}
+	o := schedule().RecordFailure(ts, now, err)
+	if !o.CircuitOpened || !o.Until.Equal(local(11, 0)) {
+		t.Fatalf("third failure must pause one hour, got %+v", o)
 	}
 }
 
@@ -131,6 +154,7 @@ func TestClassify(t *testing.T) {
 		{&host.Error{Code: "host_call_failed", Message: "All credentials for model x are cooling down", Status: 429}, Transient},
 		{&host.Error{Code: "host_call_failed", Message: "upstream error", Status: 401}, Hard},
 		{&host.Error{Code: "host_call_failed", Message: "upstream error", Status: 502}, Transient},
+		{&host.Error{Code: "host_call_failed", Message: "upstream error", Status: 402}, Transient},
 		{ErrNotConfirmed, Hard},
 		{errors.Join(ErrNoModel, errors.New("auth_not_found")), Hard},
 	}
