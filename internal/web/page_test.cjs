@@ -1348,13 +1348,22 @@ test("the client commands quote the address and the key for the shell, and the J
 test("I18N keys are unique and reset_now stays the countdown state", () => {
   // Extract a language block by brace matching: a later key with the same
   // name would silently win in the object literal, so check the raw text.
+  // Braces inside string literals do not count.
   function block(lang) {
     const start = source.indexOf("    " + lang + ": {");
     assert.ok(start >= 0, lang);
     let depth = 0;
+    let quote = null;
     for (let i = start; i < source.length; i++) {
-      if (source[i] === "{") depth++;
-      if (source[i] === "}") {
+      const ch = source[i];
+      if (quote) {
+        if (ch === "\\") { i++; continue; }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") { quote = ch; continue; }
+      if (ch === "{") depth++;
+      if (ch === "}") {
         depth--;
         if (depth === 0) return source.slice(start, i + 1);
       }
@@ -1364,9 +1373,16 @@ test("I18N keys are unique and reset_now stays the countdown state", () => {
   const dict = {};
   for (const lang of ["zh", "en"]) {
     const text = block(lang);
-    const keys = [...text.matchAll(/^\s{6}([A-Za-z0-9_]+):/gm)].map((m) => m[1]);
+    const body = text.slice(text.indexOf("{"));
+    // Strip string literals first: several keys share one line, and
+    // colons inside values (e.g. {"code":0}) are not keys.
+    const stripped = body.replace(/"(?:\\.|[^"\\])*"/g, '""').replace(/'(?:\\.|[^'\\])*'/g, "''");
+    const keys = [...stripped.matchAll(/([A-Za-z0-9_]+)\s*:/g)].map((m) => m[1]);
     assert.equal(new Set(keys).size, keys.length, lang + " has duplicate I18N keys");
-    dict[lang] = vm.runInContext("(" + text.slice(text.indexOf("{")) + ")", vm.createContext({}));
+    dict[lang] = vm.runInContext("(" + body + ")", vm.createContext({}));
+    // The extraction must see every key, or a duplicate on a shared line
+    // would slip through unnoticed.
+    assert.equal(keys.length, Object.keys(dict[lang]).length, lang + " key extraction is incomplete");
   }
   // reset_now is the countdown state ("already reset"); the reset button
   // has its own key so it cannot shadow it again.
@@ -1374,10 +1390,19 @@ test("I18N keys are unique and reset_now stays the countdown state", () => {
   assert.equal(dict.en.reset_now, "reset");
   assert.equal(dict.zh.reset_action, "立即重置");
   assert.equal(dict.en.reset_action, "Reset now");
+  assert.equal(dict.zh.reset_confirm, "立即为 {0} 消耗一张 reset credit 并重置额度？此操作不可撤销。");
+  assert.equal(dict.en.reset_confirm, "Consume a reset credit and reset the quota for {0} now? This cannot be undone.");
   const ctx = context(["translate", "fmtCountdown"], { I18N: dict, lang: "zh" });
   assert.equal(ctx.fmtCountdown(0), "已重置");
   assert.equal(ctx.translate("reset_action"), "立即重置");
   ctx.lang = "en";
   assert.equal(ctx.fmtCountdown(0), "reset");
   assert.equal(ctx.translate("reset_action"), "Reset now");
+});
+
+test("the reset button asks for confirmation before consuming a credit", () => {
+  // The reset button consumes a real, irreversible reset credit, so it
+  // must confirm like the ignite button does; a bare runAction call
+  // would burn a credit on a single mistap.
+  assert.match(source, /resetButton = el\("button"[^]*?confirm\(translate\("reset_confirm", t\.label\)\)[^]*?runAction\(resetButton, API \+ "\/reset"/);
 });
