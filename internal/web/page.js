@@ -167,7 +167,7 @@
       last_poll: "上次查询 {0}（{1}）", next_poll: "下次 {0}（{1}）",
       config_error: "配置无法解析，仍在使用上一份配置：{0}",
       models_error: "模型列表不可用：{0}",
-      notify_off: "未设置 Telegram Bot Token 或 Webhook 地址，通知已关闭。",
+      notify_off: "未设置 Bark 地址、Telegram Bot Token 或 Webhook 地址，通知已关闭。",
       notify_error: "通知设置无效，未启用：{0}",
       no_models_key: "未设置模型列表 API key，自动点火无法选择模型。",
       remaining_aria: "{0} {1} 剩余",
@@ -193,14 +193,13 @@
       ignite_confirm: "立即向 {0} 发送一次点火请求？这会开始一个新的 5 小时窗口。",
       ignited: "{0} 点火成功",
       manual_actions: "立即操作",
-      reset_action: "立即重置", reset_done: "{0} 已重置",
+      reset_action: "立即重置", reset_done: "{0} 已重置", reset_confirm: "立即为 {0} 消耗一张 reset credit 并重置额度？此操作不可撤销。",
       telegram_title: "Telegram 推送", telegram_enabled: "启用 Telegram 推送",
       telegram_bot_token: "Bot Token", telegram_chat_ids: "接收 ID",
       telegram_hint: "多个接收 ID 用分号分隔；账号停用或报错时直接通知。",
-      notify_off_telegram: "未设置 Telegram Bot Token，通知已关闭。",
       reset_settings: "自动重置", reset_enabled: "启用自动重置",
       reset_weekly_only: "仅每周窗口用尽时重置",
-      reset_min_interval: "最短重置间隔（秒）",
+      reset_min_interval: "重置要求的最短剩余时间（秒）",
       reset_credentials: "重置凭证",
       reset_credentials_hint: "凭证序号，逗号分隔；留空为全部 Codex 凭证。",
       reset_hint: "每周窗口用尽且账号持有 reset credit 时，自动消耗一张重置限额并清除 CPA 本地冷却。",
@@ -353,7 +352,7 @@
       last_poll: "last query {0} ({1})", next_poll: "next {0} ({1})",
       config_error: "The config cannot be parsed; the previous config stays in use: {0}",
       models_error: "Model list unavailable: {0}",
-      notify_off: "No Telegram Bot Token or Webhook URL is set, so notifications are off.",
+      notify_off: "No Bark URL, Telegram Bot Token or Webhook URL is set, so notifications are off.",
       notify_error: "The notification settings are invalid, so the channel is off: {0}",
       no_models_key: "No model list API key is set, so ignition cannot pick a model.",
       remaining_aria: "{0} {1} remaining",
@@ -379,14 +378,13 @@
       ignite_confirm: "Send an ignition request to {0} now? This starts a new 5-hour window.",
       ignited: "{0} ignited",
       manual_actions: "Manual actions",
-      reset_action: "Reset now", reset_done: "{0} reset",
+      reset_action: "Reset now", reset_done: "{0} reset", reset_confirm: "Consume a reset credit and reset the quota for {0} now? This cannot be undone.",
       telegram_title: "Telegram", telegram_enabled: "Enable Telegram notifications",
       telegram_bot_token: "Bot Token", telegram_chat_ids: "Chat IDs",
       telegram_hint: "Separate multiple chat IDs with semicolons; account errors and suspensions notify directly.",
-      notify_off_telegram: "Telegram Bot Token is not set, so notifications are off.",
       reset_settings: "Auto reset", reset_enabled: "Enable auto reset",
       reset_weekly_only: "Only reset when the weekly window is exhausted",
-      reset_min_interval: "Minimum reset interval (s)",
+      reset_min_interval: "Minimum remaining time required to reset (s)",
       reset_credentials: "Reset credentials",
       reset_credentials_hint: "Credential indexes, comma separated; empty means all Codex credentials.",
       reset_hint: "When the weekly window is exhausted and the account holds a reset credit, one credit is consumed and the CPA local cooldown is cleared.",
@@ -997,11 +995,12 @@
     if (status.notify_error) box.appendChild(notice(translate("notify_error", status.notify_error)));
     if (status.mcp && status.mcp.enabled && !status.mcp.running && status.mcp.error) box.appendChild(notice(translate("mcp_error", status.mcp.error)));
     // No channel is how notifications are turned off, so it is a hint in the
-    // settings rather than a notice: Telegram and webhook are both off
-    // only when neither is configured.
+    // settings rather than a notice: all three channels are off only when
+    // none is configured. Bark has no enabled flag: a non-empty URL (the
+    // status payload reports it as "已设置") means it is on.
     var telegram = status.config && status.config.telegram;
     var webhook = status.config && status.config.webhook;
-    $("notify-off").hidden = !!(telegram && telegram.enabled && telegram.bot_token_set) || !!(webhook && webhook.url_set);
+    $("notify-off").hidden = !!(telegram && telegram.enabled && telegram.bot_token_set) || !!(webhook && webhook.url_set) || !!(status.config && status.config.bark_url);
     // models_api_key_set is the status flag for a configured key; the
     // models_api_key in the status payload itself is always "" (masked).
     // The string fallback covers a status from before the flag existed.
@@ -1374,6 +1373,7 @@
       // the ignite button, and Claude/Antigravity rows get ignite alone.
       if (t.provider === "codex") {
         var resetButton = el("button", { type: "button", class: "btn btn-secondary btn-sm", text: translate("reset_action"), onclick: function () {
+          if (!confirm(translate("reset_confirm", t.label))) return;
           runAction(resetButton, API + "/reset", { auth_index: t.auth_index }, translate("reset_done", t.label));
         } });
         actions.push(resetButton);
