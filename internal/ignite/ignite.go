@@ -222,8 +222,16 @@ func CooldownWait(err error) (time.Duration, bool) {
 	return wait, wait <= maxCooldownWait
 }
 
-// RecordFailure updates the failure state. Hard errors and the last allowed
-// transient error pause the target until the next daily start.
+// maxTransientCircuitPause caps how long the circuit stays open after
+// consecutive transient failures. A transient failure (overload, cooldown,
+// an auth that comes back) may clear soon, so pausing until the next daily
+// start would skip whole quota windows for nothing. Hard errors still
+// pause until the next daily start.
+const maxTransientCircuitPause = time.Hour
+
+// RecordFailure updates the failure state. Hard errors pause the target
+// until the next daily start; the last allowed transient error pauses it
+// until the next daily start or one hour from now, whichever comes first.
 //
 // A short CPA cooldown is waited out instead: the retry runs when the
 // cooldown ends plus the grace period, and the failure is not counted. Only
@@ -240,8 +248,13 @@ func (s Schedule) RecordFailure(ts *store.TargetState, now time.Time, err error)
 	ts.ConsecutiveFailures++
 	ts.LastError = truncate(errorText(err), 500)
 	ts.LastFailureEpoch = epoch(now)
-	if Classify(err) == Hard || ts.ConsecutiveFailures >= s.Cfg.MaxTransientFailures {
+	if kind := Classify(err); kind == Hard || ts.ConsecutiveFailures >= s.Cfg.MaxTransientFailures {
 		until := s.NextDailyStart(now)
+		if kind != Hard {
+			if cap := now.Add(maxTransientCircuitPause); until.After(cap) {
+				until = cap
+			}
+		}
 		untilEpoch := float64(until.Unix())
 		ts.CircuitOpenUntilEpoch = untilEpoch
 		ts.RetryAtEpoch = untilEpoch
