@@ -45,11 +45,11 @@ func TestQuotaStatusMessage(t *testing.T) {
 			trigger:  "5h",
 			title:    "🟢 GPT 额度状态通知",
 			body: "账号： user@example.com\n" +
-				"模型：Codex / GPT\n" +
-				"５Ｈ：85% ｜ 23:22 恢复（剩余 03h33m）\n" +
-				"７Ｄ：78% ｜ 11/26 04:20 恢复（剩余 2d08h）\n" +
-				"状态：Normal（额度充足）\n" +
-				"时间：2026-11-23 19:49:00",
+				"模型： Codex / GPT\n" +
+				"５Ｈ： 85% ｜ 23:22 恢复（剩余 03h33m）\n" +
+				"７Ｄ： 78% ｜ 11/26 04:20 恢复（剩余 2d08h）\n" +
+				"状态： Normal（额度充足）\n" +
+				"时间： 2026-11-23 19:49:00",
 		},
 		{
 			name:     "warning",
@@ -59,11 +59,11 @@ func TestQuotaStatusMessage(t *testing.T) {
 			trigger:  "5h",
 			title:    "🟡 GPT 额度不足预警",
 			body: "账号： user@example.com\n" +
-				"模型：Codex / GPT\n" +
-				"５Ｈ：15% ｜ 23:22 恢复（剩余 03h33m）\n" +
-				"７Ｄ：68% ｜ 11/26 04:20 恢复（剩余 2d08h）\n" +
-				"状态：Warning（5H 额度不足）\n" +
-				"时间：2026-11-23 19:49:00",
+				"模型： Codex / GPT\n" +
+				"５Ｈ： 15% ｜ 23:22 恢复（剩余 03h33m）\n" +
+				"７Ｄ： 68% ｜ 11/26 04:20 恢复（剩余 2d08h）\n" +
+				"状态： Warning（5H 额度不足）\n" +
+				"时间： 2026-11-23 19:49:00",
 		},
 		{
 			name:     "exhausted",
@@ -73,11 +73,11 @@ func TestQuotaStatusMessage(t *testing.T) {
 			trigger:  "5h",
 			title:    "🔴 GPT 额度耗尽警报",
 			body: "账号： user@example.com\n" +
-				"模型：Codex / GPT\n" +
-				"５Ｈ：0% ｜ 23:22 恢复（剩余 03h33m）\n" +
-				"７Ｄ：65% ｜ 11/26 04:20 恢复（剩余 2d08h）\n" +
-				"状态：Exhausted（5H 额度已耗尽）\n" +
-				"时间：2026-11-23 19:49:00",
+				"模型： Codex / GPT\n" +
+				"５Ｈ： 0% ｜ 23:22 恢复（剩余 03h33m）\n" +
+				"７Ｄ： 65% ｜ 11/26 04:20 恢复（剩余 2d08h）\n" +
+				"状态： Exhausted（5H 额度已耗尽）\n" +
+				"时间： 2026-11-23 19:49:00",
 		},
 		{
 			name:     "exhausted 7d names the 7d window",
@@ -87,11 +87,11 @@ func TestQuotaStatusMessage(t *testing.T) {
 			trigger:  "7d",
 			title:    "🔴 GPT 额度耗尽警报",
 			body: "账号： user@example.com\n" +
-				"模型：Codex / GPT\n" +
-				"５Ｈ：60% ｜ 23:22 恢复（剩余 03h33m）\n" +
-				"７Ｄ：0% ｜ 11/26 04:20 恢复（剩余 2d08h）\n" +
-				"状态：Exhausted（7D 额度已耗尽）\n" +
-				"时间：2026-11-23 19:49:00",
+				"模型： Codex / GPT\n" +
+				"５Ｈ： 60% ｜ 23:22 恢复（剩余 03h33m）\n" +
+				"７Ｄ： 0% ｜ 11/26 04:20 恢复（剩余 2d08h）\n" +
+				"状态： Exhausted（7D 额度已耗尽）\n" +
+				"时间： 2026-11-23 19:49:00",
 		},
 	}
 	for _, tc := range cases {
@@ -137,20 +137,20 @@ func TestNotifyBodyVariants(t *testing.T) {
 	if title != "⏰ GPT 重置提醒" {
 		t.Errorf("reminder title = %q", title)
 	}
-	if !strings.Contains(body, "状态：Reminder（5H 窗口将于 57m 后重置）") {
+	if !strings.Contains(body, "状态： Reminder（5H 窗口将于 57m 后重置）") {
 		t.Errorf("reminder body = %q", body)
 	}
-	if !strings.Contains(body, "５Ｈ：74% ｜ 23:22 恢复（剩余 03h33m）") {
+	if !strings.Contains(body, "５Ｈ： 74% ｜ 23:22 恢复（剩余 03h33m）") {
 		t.Errorf("reminder body = %q", body)
 	}
 
 	// Account without an email falls back to the credential index.
 	noEmail := Group{Key: "codex:145daf564d1e787a:codex:main", Label: "GPT", Provider: "codex"}
 	body = phoenixBody(noEmail, "认证失败（HTTP 401），请检查凭证。", false, now)
-	if !strings.HasPrefix(body, "账号：凭证 145daf564d1e787a\n模型：Codex / GPT\n") {
+	if !strings.HasPrefix(body, "账号：凭证 145daf564d1e787a\n模型： Codex / GPT\n") {
 		t.Errorf("no-email body = %q", body)
 	}
-	if strings.Contains(body, "５Ｈ：") {
+	if strings.Contains(body, "５Ｈ： ") {
 		t.Errorf("credential body should not carry quota lines, got %q", body)
 	}
 
@@ -166,14 +166,14 @@ func TestNotifyBodyVariants(t *testing.T) {
 	if title != "🟢 Gemini 额度状态通知" {
 		t.Errorf("antigravity title = %q", title)
 	}
-	if !strings.Contains(body, "模型：Antigravity / Gemini\n") {
+	if !strings.Contains(body, "模型： Antigravity / Gemini\n") {
 		t.Errorf("antigravity body = %q", body)
 	}
 	// A group with only a 7d window shows only the 7D line.
-	if strings.Contains(body, "５Ｈ：") {
+	if strings.Contains(body, "５Ｈ： ") {
 		t.Errorf("one-window body should not show 5H, got %q", body)
 	}
-	if !strings.Contains(body, "７Ｄ：90% ｜ 11/25 19:49 恢复（剩余 2d00h）") {
+	if !strings.Contains(body, "７Ｄ： 90% ｜ 11/25 19:49 恢复（剩余 2d00h）") {
 		t.Errorf("antigravity body = %q", body)
 	}
 }
