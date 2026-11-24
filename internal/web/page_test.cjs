@@ -1418,7 +1418,9 @@ test("the manual action buttons keep a gap between them", () => {
 test("a recorded ignition error stays visible when nothing is counted", () => {
   // A manual tap records its error without touching the automatic
   // failure count, so the status must show the error on its own instead
-  // of reporting the target as normal.
+  // of reporting the target as normal. The reason itself stays out of
+  // the column: it goes to the hover tooltip, or the table turns into a
+  // wall of long error text.
   const I18N = {
     zh: { last_failed: "上次点火失败", failures: "失败 {0} 次", normal: "正常", rolling: "窗口未开始", paused_until: "暂停至 {0}" },
     en: { last_failed: "Last ignition failed", failures: "{0} failures", normal: "Normal", rolling: "Window not started", paused_until: "Paused until {0}" },
@@ -1426,7 +1428,8 @@ test("a recorded ignition error stays visible when nothing is counted", () => {
   const ctx = context(["translate", "parseTime", "fmtDateTime", "targetStatus"], { I18N, lang: "zh" });
   // Objects built inside the VM context carry another prototype, so compare
   // their plain JSON form like the other targetStatus-style tests do.
-  assert.deepEqual(plain(ctx.targetStatus({ last_error: "host call failed: overloaded", consecutive_failures: 0 })), { kind: "warning", text: "上次点火失败", title: "host call failed: overloaded" });
-  assert.deepEqual(plain(ctx.targetStatus({ last_error: "host call failed: overloaded", consecutive_failures: 2 })), { kind: "warning", text: "失败 2 次", title: "host call failed: overloaded" });
+  assert.deepEqual(plain(ctx.targetStatus({ last_error: "host call failed: overloaded", consecutive_failures: 0 })), { kind: "warning", text: "上次点火失败", hover: "host call failed: overloaded" });
+  assert.deepEqual(plain(ctx.targetStatus({ last_error: "host call failed: overloaded", consecutive_failures: 2 })), { kind: "warning", text: "失败 2 次", hover: "host call failed: overloaded" });
   assert.deepEqual(plain(ctx.targetStatus({ consecutive_failures: 0 })), { kind: "success", text: "正常" });
+  assert.match(source, /if \(st\.hover && !\(masked && hasSecret\(st\.hover\)\)\) statusCell\.title = st\.hover;/);
 });
