@@ -27,10 +27,10 @@ func TestStatusAccountOrderUsesCredentialFileNames(t *testing.T) {
 		order []string
 		want  []string
 	}{
-		{"default", nil, []string{"codex-b.json", "codex-a.json", "claude.json", "ag.json"}},
+		{"default", nil, []string{"codex-a.json", "codex-b.json", "claude.json", "ag.json"}},
 		{"cross provider", []string{"ag.json", "codex-a.json"}, []string{"ag.json", "codex-a.json", "codex-b.json", "claude.json"}},
 		{"unknown and duplicate", []string{"missing.json", "claude.json", "codex-a.json", "claude.json", "codex-b.json"}, []string{"claude.json", "codex-a.json", "codex-b.json", "ag.json"}},
-		{"not ID or index", []string{"different-id", "1"}, []string{"codex-b.json", "codex-a.json", "claude.json", "ag.json"}},
+		{"not ID or index", []string{"different-id", "1"}, []string{"codex-a.json", "codex-b.json", "claude.json", "ag.json"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := e.config()
