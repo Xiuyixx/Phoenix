@@ -352,6 +352,7 @@ tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover td { background: color-mix(in srgb, var(--text-primary) 3%, transparent); }
 td.num, th.num { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 td.actions { text-align: right; }
+td.actions .btn + .btn { margin-left: 8px; }
 .cell-note { margin-top: 4px; font-size: 11.5px; color: var(--text-tertiary); max-width: 280px; }
 #ignition-note { margin: 12px 0 0; font-size: 12.5px; }
 
