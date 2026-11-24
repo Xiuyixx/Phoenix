@@ -241,9 +241,14 @@ func (e *Engine) igniteTarget(ctx context.Context, cfg config.Config, t target, 
 	if err != nil {
 		d := failure.Diagnose(err)
 		if manual {
-			// Keep the automatic retry, circuit and credential state
-			// unchanged. manual=1 without retry_seconds tells the page that
-			// no retry follows.
+			// Record the failure text so the panel keeps showing why the
+			// tap failed. Only the display fields change: the automatic
+			// retry, circuit and credential state stay untouched.
+			// manual=1 without retry_seconds tells the page that no retry
+			// follows.
+			ts.LastError = truncateText(err.Error(), 500)
+			ts.LastFailureEpoch = float64(now.UnixNano()) / 1e9
+			e.dirty = true
 			e.addEventDetail("warn", "ignite_failed", t.group.Key, t.group.Label,
 				err.Error(), fmt.Sprintf("%s 手动点火失败：%v", t.group.Label, err),
 				map[string]string{"manual": "1", "error": err.Error(), "summary": d.Summary})
