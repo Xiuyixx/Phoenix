@@ -66,10 +66,13 @@ type GroupState struct {
 	// ActiveWindows 保存最近一次成功主动查询确认的窗口；nil 表示尚未确认。
 	ActiveWindows []string `json:"active_windows"`
 	// LegacyUnconfirmed 限制磁盘中已有但缺少可靠主动确认信息的组；不持久化。
-	LegacyUnconfirmed bool                    `json:"-"`
-	Label             string                  `json:"label,omitempty"`
-	LastSeen          int64                   `json:"last_seen,omitempty"`
-	Windows           map[string]*WindowState `json:"windows"`
+	LegacyUnconfirmed bool   `json:"-"`
+	Label             string `json:"label,omitempty"`
+	// LastSeen is the last successful quota reading of the group, in Unix
+	// seconds. A reading refreshes it even when the group's alerts wait
+	// for a plan recheck, so it measures the data, not the notifications.
+	LastSeen int64                   `json:"last_seen,omitempty"`
+	Windows  map[string]*WindowState `json:"windows"`
 }
 
 // Observation is the last observed 5-hour reset of an ignition target.
@@ -123,6 +126,10 @@ type State struct {
 	// CooldownNotices maps an auth index to the end of the stale CPA
 	// cooldown that was already notified, in Unix seconds.
 	CooldownNotices map[string]int64 `json:"cooldown_notices,omitempty"`
+	// StaleNotices maps an auth index to the last_seen of the quota data
+	// its stale-data notification was sent for, in Unix seconds. A new
+	// reading clears it, so a later stale episode notifies again.
+	StaleNotices map[string]int64 `json:"stale_notices,omitempty"`
 	// Language is the notification language, the Management Center language
 	// last reported by the management page.
 	Language string `json:"language,omitempty"`
@@ -234,6 +241,15 @@ func (s *State) CooldownNotice(authIndex string, until int64) {
 		s.CooldownNotices = map[string]int64{}
 	}
 	s.CooldownNotices[authIndex] = until
+}
+
+// StaleNotice records that the stale-data notification of authIndex was
+// sent for the quota data last seen at lastSeen.
+func (s *State) StaleNotice(authIndex string, lastSeen int64) {
+	if s.StaleNotices == nil {
+		s.StaleNotices = map[string]int64{}
+	}
+	s.StaleNotices[authIndex] = lastSeen
 }
 
 // NewState returns an empty state.
