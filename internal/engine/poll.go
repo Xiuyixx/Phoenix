@@ -40,7 +40,8 @@ type Cred struct {
 	// account.
 	Note string `json:"note,omitempty"`
 	// Suffix tells accounts apart: "#" and the account name, such as
-	// "#主力号", or the masked email of an unnamed account, such as "#rk".
+	// "#主力号", or the full email of an unnamed account, such as
+	// "#user@example.com".
 	Suffix string `json:"suffix,omitempty"`
 }
 
@@ -231,14 +232,9 @@ func credentialEmail(entry pluginapi.HostAuthFileEntry) string {
 	return ""
 }
 
-func maskedSuffix(email string, ordinal int) string {
-	local, _, _ := strings.Cut(email, "@")
-	runes := []rune(local)
-	switch {
-	case len(runes) >= 2:
-		return "#" + string(runes[len(runes)-2:])
-	case len(runes) == 1:
-		return "#" + local
+func emailSuffix(email string, ordinal int) string {
+	if strings.TrimSpace(email) != "" {
+		return "#" + email
 	}
 	return "#" + strconv.Itoa(ordinal)
 }
@@ -259,10 +255,10 @@ func accountName(note string) string {
 }
 
 // loadCreds reads the credential list and assigns account suffixes. A named
-// account gets "#" and its name. An unnamed account gets the masked email,
+// account gets "#" and its name. An unnamed account gets the full email,
 // unless it is the only monitored credential of its provider. A named account
 // whose suffix equals that of another account of its provider, such as two
-// accounts with the same name, also gets the masked email.
+// accounts with the same name, also gets the full email.
 func (e *Engine) loadCreds(cfg config.Config) ([]*Cred, error) {
 	entries, err := e.host.AuthList()
 	if err != nil {
@@ -299,14 +295,14 @@ func (e *Engine) loadCreds(cfg config.Config) ([]*Cred, error) {
 		counts[provider]++
 	}
 	ordinals := map[string]int{}
-	masked := make([]string, len(creds))
+	emailSuffixes := make([]string, len(creds))
 	taken := map[[2]string]int{}
 	for i, cred := range creds {
 		ordinals[cred.Provider]++
 		if counts[cred.Provider] > 1 {
-			masked[i] = maskedSuffix(cred.Email, ordinals[cred.Provider])
+			emailSuffixes[i] = emailSuffix(cred.Email, ordinals[cred.Provider])
 		}
-		cred.Suffix = masked[i]
+		cred.Suffix = emailSuffixes[i]
 		if name := accountName(cred.Note); name != "" {
 			cred.Suffix = "#" + name
 		}
@@ -314,7 +310,7 @@ func (e *Engine) loadCreds(cfg config.Config) ([]*Cred, error) {
 	}
 	for i, cred := range creds {
 		if accountName(cred.Note) != "" && taken[[2]string{cred.Provider, cred.Suffix}] > 1 {
-			cred.Suffix += masked[i]
+			cred.Suffix += emailSuffixes[i]
 		}
 	}
 	byIndex := make(map[string]*Cred, len(creds))
