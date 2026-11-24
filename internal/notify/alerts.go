@@ -679,6 +679,32 @@ func CircuitMessage(lang string, g Group, until time.Time, summary string, loc *
 	}
 }
 
+// StaleQuotaMessage is sent once when the quota data of an account has not
+// refreshed for a while, so that a failing quota query is noticed even when
+// it is no credential problem. since is the last successful reading.
+func StaleQuotaMessage(lang string, g Group, since time.Time, loc *time.Location, now time.Time) Message {
+	if lang != LangEN {
+		// Phoenix style (v0.0.18): single-⚠️ title and the 账号 / 模型 /
+		// 状态 / 时间 body.
+		return Message{
+			Kind:  KindStale,
+			Title: fmt.Sprintf("⚠️ %s 额度数据已过期", cleanLabel(g.Label)),
+			Body:  phoenixBody(g, "额度查询连续失败，数据停留在 "+FormatTime(since, loc, lang)+"，请检查账号。", false, now.In(displayLoc(loc))),
+			Level: LevelTimeSensitive,
+			Label: g.Label,
+			Group: g.Key,
+		}
+	}
+	return Message{
+		Kind:  KindStale,
+		Title: T(lang, "stale_title", g.Label),
+		Body:  T(lang, "stale_body", FormatTime(since, loc, lang)),
+		Level: LevelTimeSensitive,
+		Label: g.Label,
+		Group: g.Key,
+	}
+}
+
 // Problem describes a credential problem for CredentialMessage.
 type Problem struct {
 	// Kind is KindCredential, KindSuspended or KindRateLimited.
