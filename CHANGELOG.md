@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.6 - 2026-11-24
+
+- 手动“立即重置”按钮加确认：重置会消耗一张真实 reset credit，误触不可撤销；现在点之前先确认，与点火按钮一致（新增 `reset_confirm` 中英文词条）。
+- 设置页“通知已关闭”提示计入 Bark：之前只看 Telegram 与 Webhook，只配 Bark 的用户会看到错误的关闭提示；提示文案与无用词条 `notify_off_telegram` 一并清理。
+- Telegram 发送增加 `ok` 字段校验：HTTP 200 但 `ok:false` 时不再当作发送成功，错误里带上 Bot API 返回的 description。
+- 页面测试的 I18N 键唯一性检查改为剥离字符串字面量后全量扫描，之前只覆盖约一半的键，多键行的重复测不到；补停用通知空值/单值断言与 Did Codex Reset 错误路径测试（畸形 JSON、网络错误、null 项、page/pageSize）。
+- 文档修正：`docs/architecture.md` 的新版本检查段落之前写后台循环每 6 小时读、页面打开时调用，实际自动检查默认关闭、只有手动 `POST /check-update` 触发；`reset_min_interval` 标签改为“重置要求的最短剩余时间”；英文测试推送文案统一为 Telegram。
+
 ## 0.1.5 - 2026-11-24
 
 - 修复面板倒计时归零文案：I18N 里 `reset_now` 键重复，倒计时归零时显示的是“立即重置”；重置按钮改用新键 `reset_action`，倒计时归零恢复显示“已重置”/“reset”，与 Lamplighter 一致；页面测试新增 I18N 键唯一性断言。
