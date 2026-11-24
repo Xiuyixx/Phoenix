@@ -273,3 +273,32 @@ func TestNotificationExamples(t *testing.T) {
 	}
 	show("Did Codex Reset", msg.Title, msg.Body)
 }
+
+// TestSuspendedMessageCodeVariants pins the error-code rendering of the
+// Chinese suspended notice when Status and Code are missing or partial:
+// no stray parentheses or separators may appear.
+func TestSuspendedMessageCodeVariants(t *testing.T) {
+	now := time.Date(2026, 11, 23, 19, 49, 0, 0, time.Local)
+	g := exampleGroup(85, 78, now)
+	for _, tc := range []struct {
+		name   string
+		prob   Problem
+		want   string
+		absent string
+	}{
+		{"both", Problem{Kind: KindSuspended, Status: "403", Code: "TOS_VIOLATION"}, "账号已被停用，请检查凭证。（403 · TOS_VIOLATION）", ""},
+		{"status only", Problem{Kind: KindSuspended, Status: "403"}, "账号已被停用，请检查凭证。（403）", "·"},
+		{"code only", Problem{Kind: KindSuspended, Code: "TOS_VIOLATION"}, "账号已被停用，请检查凭证。（TOS_VIOLATION）", "·"},
+		{"neither", Problem{Kind: KindSuspended}, "账号已被停用，请检查凭证。", "（"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := CredentialMessage(LangZH, g, tc.prob, time.Local, now)
+			if !strings.Contains(msg.Body, tc.want) {
+				t.Errorf("body = %q, want it to contain %q", msg.Body, tc.want)
+			}
+			if tc.absent != "" && strings.Contains(msg.Body, tc.absent) {
+				t.Errorf("body = %q, want it to omit %q", msg.Body, tc.absent)
+			}
+		})
+	}
+}
