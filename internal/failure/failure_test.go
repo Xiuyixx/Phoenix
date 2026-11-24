@@ -86,6 +86,26 @@ func TestDiagnoseDeactivatedOpenAIAccount(t *testing.T) {
 	}
 }
 
+// TestDiagnoseDeactivatedWorkspace402 covers the 2026-11-25 outage: six
+// accounts answered 402 deactivated_workspace on the quota endpoint and
+// their refresh tokens came back 401. The workspace is disabled, so the
+// error is a suspension, not a transient failure. A bare 402 without the
+// code stays transient: it may be an ordinary billing error.
+func TestDiagnoseDeactivatedWorkspace402(t *testing.T) {
+	query := &quota.HTTPError{Status: 402, Body: `{"error":{"message":"Payment Required","code":"deactivated_workspace"},"status":402}`}
+	if d := Diagnose(query); d.Reason != ReasonSuspended || d.Status != 402 || d.Code != "deactivated_workspace" || d.Summary != "Payment Required" {
+		t.Fatalf("quota 402: %+v", d)
+	}
+	ignition := &host.Error{Code: "host_call_failed", Message: `auth_unavailable: no auth available (providers=codex, model=gpt-6-luna; last upstream error: {"error": {"message": "Payment Required", "code": "deactivated_workspace"}, "status": 402})`, Status: 503}
+	if d := Diagnose(ignition); d.Reason != ReasonSuspended || d.Code != "deactivated_workspace" {
+		t.Fatalf("ignition 402: %+v", d)
+	}
+	bare := &host.Error{Code: "host_call_failed", Message: "upstream error", Status: 402}
+	if d := Diagnose(bare); d.Reason != "" || d.Status != 402 {
+		t.Fatalf("bare 402: %+v", d)
+	}
+}
+
 func TestDiagnoseRateLimitAndCooldown(t *testing.T) {
 	limited := &host.Error{Code: "host_call_failed", Message: `{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}`, Status: 429}
 	if d := Diagnose(limited); d.Reason != ReasonRateLimited || d.Code != "RESOURCE_EXHAUSTED" || d.Summary != "Resource has been exhausted (e.g. check quota)." {
