@@ -16,8 +16,8 @@
 // old messages used. Other notification kinds use the same layout
 // (账号 / 模型 / 状态 / 时间, with the 5H/7D lines when they apply).
 //
-// This style applies to Chinese notifications. English keeps the
-// the base wording, which the English tests pin.
+// This style applies to Chinese notifications. English keeps the base
+// wording, which the English tests pin.
 package notify
 
 import (
@@ -208,6 +208,10 @@ func phoenixBody(g Group, status string, withWindows bool, now time.Time) string
 // quotaStatusMessage builds the title/body for a quota-status notification:
 // green Normal (recovery), yellow Warning (threshold) or red Exhausted.
 // trigger is the window kind that fired ("5h"/"7d").
+// Notice, low and critical severities intentionally share the Warning
+// rendering: the user's three-tier template only distinguishes Normal /
+// Warning / Exhausted. Only the percentages in the body and the message
+// Level differ between them, so do not "fix" the shared branch into three.
 func quotaStatusMessage(g Group, trigger, severity string, now time.Time) (title, body string) {
 	var emoji, kind, status string
 	switch severity {
