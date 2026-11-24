@@ -130,12 +130,17 @@ func (t *Telegram) sendOne(ctx context.Context, chatID, text string) error {
 	// Explicit link entities tell the client exactly what is a link and
 	// where it goes. The 账号 line also separates the label from the
 	// address with a space, so a client that auto-detects links from the
-	// plain text only links the address itself.
+	// plain text only links the address itself. The title (the part
+	// before the blank line) is sent as a bold entity.
+	entities := emailLinkEntities(text)
+	if i := strings.Index(text, "\n\n"); i > 0 {
+		entities = append([]messageEntity{{Type: "bold", Offset: 0, Length: utf16Len(text[:i])}}, entities...)
+	}
 	reqBody := struct {
 		ChatID   string          `json:"chat_id"`
 		Text     string          `json:"text"`
 		Entities []messageEntity `json:"entities,omitempty"`
-	}{ChatID: chatID, Text: text, Entities: emailLinkEntities(text)}
+	}{ChatID: chatID, Text: text, Entities: entities}
 	raw, err := json.Marshal(reqBody)
 	if err != nil {
 		return err
