@@ -1,6 +1,6 @@
 // Tests that Phoenix-style (Chinese) notification titles and the 模型 line
-// use the clean service label, never the account suffix ("#name", or a
-// masked "#xx" when two accounts share a name) loadCreds appends to tell
+// use the clean service label, never the account suffix ("#name", or the
+// full email when two accounts share a name) loadCreds appends to tell
 // accounts apart. The account stays on the 账号 line only.
 //
 // The reported shape: both Codex credentials carry the full email as their
@@ -34,9 +34,9 @@ func TestCleanLabel(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"GPT", "GPT"},
 		{"GPT#user@example.com", "GPT"},
-		{"Gemini#rk", "Gemini"},
+		{"Gemini#user@example.com", "Gemini"},
 		{"Claude / GPT#主力号", "Claude / GPT"},
-		{"GPT#name#rk", "GPT"},
+		{"GPT#name#user@example.com", "GPT"},
 		{"GPT#", "GPT"},
 		{"", ""},
 		{"#x", "#x"},
