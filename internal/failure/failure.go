@@ -57,10 +57,11 @@ func (d Diagnosis) StatusText() string {
 const summaryLength = 160
 
 // suspendedCodes are error codes that name a disabled account. Google sends
-// TOS_VIOLATION in google.rpc.ErrorInfo; OpenAI sends account_deactivated.
+// TOS_VIOLATION in google.rpc.ErrorInfo; OpenAI sends account_deactivated,
+// and a deactivated workspace answers 402 deactivated_workspace.
 // SERVICE_DISABLED is missing on purpose: Google uses it for an API that is
 // not enabled in a project, which is a setup problem of that project.
-var suspendedCodes = []string{"tos_violation", "account_deactivated", "account_disabled", "user_disabled", "account_suspended"}
+var suspendedCodes = []string{"tos_violation", "account_deactivated", "account_disabled", "user_disabled", "account_suspended", "deactivated_workspace"}
 
 // suspendedPhrases are messages that say the account itself was disabled.
 // Each names the account or organization, so that an ordinary permission
@@ -89,9 +90,9 @@ var statusPattern = regexp.MustCompile(`(?i)\b(?:http|status)\s*(\d{3})\b`)
 // Diagnose reads the HTTP status, error code, appeal link and one sentence
 // from err and sorts it into a Reason:
 //
-//   - ReasonSuspended: a suspendedCodes code, or a status of 400, 401 or 403
-//     with a suspendedPhrases message. A 403 alone is no suspension; it also
-//     means a missing permission or a disabled API.
+//   - ReasonSuspended: a suspendedCodes code, or a status of 400, 401, 402
+//     or 403 with a suspendedPhrases message. A 403 alone is no suspension;
+//     it also means a missing permission or a disabled API.
 //   - ReasonAuth: HTTP 401, quota.ErrUnauthorized, or an authCodes code such
 //     as invalid_grant.
 //   - ReasonRateLimited: HTTP 429 or RESOURCE_EXHAUSTED, unless the text is
@@ -153,7 +154,7 @@ func Diagnose(err error) Diagnosis {
 	codes := strings.ToLower(strings.Join(info.codes, "\n"))
 	switch {
 	case containsAny(codes, suspendedCodes) || containsAny(lower, []string{"tos_violation", "account_deactivated"}),
-		(d.Status == 400 || d.Status == 401 || d.Status == 403) && containsAny(lower, suspendedPhrases):
+		(d.Status == 400 || d.Status == 401 || d.Status == 402 || d.Status == 403) && containsAny(lower, suspendedPhrases):
 		d.Reason = ReasonSuspended
 	case d.Status == 401 || containsAny(codes, authCodes) || strings.Contains(lower, "invalid_grant"):
 		d.Reason = ReasonAuth
