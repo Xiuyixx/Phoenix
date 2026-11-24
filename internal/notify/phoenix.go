@@ -5,11 +5,11 @@
 //
 //	🟢 GPT 额度状态通知
 //	账号： user@example.com
-//	模型：Codex / GPT
-//	５Ｈ：85% ｜ 23:22 恢复（剩余 03h33m）
-//	７Ｄ：78% ｜ 11/26 04:20 恢复（剩余 2d08h）
-//	状态：Normal（额度充足）
-//	时间：2026-11-23 19:49:00
+//	模型： Codex / GPT
+//	５Ｈ： 85% ｜ 23:22 恢复（剩余 03h33m）
+//	７Ｄ： 78% ｜ 11/26 04:20 恢复（剩余 2d08h）
+//	状态： Normal（额度充足）
+//	时间： 2026-11-23 19:49:00
 //
 // The account is identified by email (falling back to "凭证 <index>" when
 // the host never listed an email for it), never by the raw auth index the
@@ -168,16 +168,17 @@ func formatQuotaReset(t, now time.Time) string {
 	return t.Format("01/02 15:04")
 }
 
-// quotaWindowLine renders one quota line: "５Ｈ：85% ｜ 23:22 恢复（剩余 03h33m）".
+// quotaWindowLine renders one quota line: "５Ｈ： 85% ｜ 23:22 恢复（剩余 03h33m）".
 // The window label uses full-width characters so it is as wide as the
 // two-character labels of the other lines (账号、模型、状态、时间) and the
-// colons line up. Without a reset time it is just "５Ｈ：85%". Empty when
-// the window is nil.
+// colons line up. Every line puts one space after the colon, so the
+// values line up with the 账号 line too. Without a reset time it is just
+// "５Ｈ： 85%". Empty when the window is nil.
 func quotaWindowLine(short string, w *quota.Window, now time.Time) string {
 	if w == nil {
 		return ""
 	}
-	line := fmt.Sprintf("%s：%.0f%%", short, w.Remaining)
+	line := fmt.Sprintf("%s： %.0f%%", short, w.Remaining)
 	if !w.Reset.IsZero() {
 		line += fmt.Sprintf(" ｜ %s 恢复（剩余 %s）", formatQuotaReset(w.Reset, now), formatQuotaRemaining(w.Reset.Sub(now)))
 	}
@@ -197,7 +198,7 @@ func groupWindow(g Group, kind string) *quota.Window {
 // phoenixBody assembles the body of a notification in the Phoenix style:
 // 账号 / 模型, the 5H/7D quota lines when withWindows, 状态, 时间.
 func phoenixBody(g Group, status string, withWindows bool, now time.Time) string {
-	lines := []string{accountLine(g), "模型：" + modelLine(groupProvider(g), cleanLabel(g.Label))}
+	lines := []string{accountLine(g), "模型： " + modelLine(groupProvider(g), cleanLabel(g.Label))}
 	if withWindows {
 		if l := quotaWindowLine("５Ｈ", groupWindow(g, quota.KindFiveHour), now); l != "" {
 			lines = append(lines, l)
@@ -206,7 +207,7 @@ func phoenixBody(g Group, status string, withWindows bool, now time.Time) string
 			lines = append(lines, l)
 		}
 	}
-	lines = append(lines, "状态："+status, "时间："+now.Format("2006-01-02 15:04:05"))
+	lines = append(lines, "状态： "+status, "时间： "+now.Format("2006-01-02 15:04:05"))
 	return strings.Join(lines, "\n")
 }
 
