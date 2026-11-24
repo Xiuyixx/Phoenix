@@ -65,7 +65,7 @@ func TestThresholdCrossingNotifiesWithResetHint(t *testing.T) {
 	if got := sender.sent[0].Title; got != "🟡 GPT 额度不足预警" {
 		t.Fatalf("title %q", got)
 	}
-	if !regexp.MustCompile(`^账号：凭证 1\n模型：Codex / GPT\n５Ｈ：15% ｜ \d\d:\d\d 恢复（剩余 05h00m）\n７Ｄ：80% ｜ \d\d/\d\d \d\d:\d\d 恢复（剩余 6d00h）\n状态：Warning（5H 额度不足）\n时间：`).MatchString(sender.sent[0].Body) {
+	if !regexp.MustCompile(`^账号：凭证 1\n模型： Codex / GPT\n５Ｈ： 15% ｜ \d\d:\d\d 恢复（剩余 05h00m）\n７Ｄ： 80% ｜ \d\d/\d\d \d\d:\d\d 恢复（剩余 6d00h）\n状态： Warning（5H 额度不足）\n时间： `).MatchString(sender.sent[0].Body) {
 		t.Fatalf("body %q", sender.sent[0].Body)
 	}
 	a.ProcessGroup(context.Background(), st, group(12, 80, now), now)
@@ -608,7 +608,7 @@ func TestRecoveryAllNotifiesEveryResetWithPreviousCycle(t *testing.T) {
 		t.Fatalf("want one recovery, got %+v", sender.sent)
 	}
 	msg := sender.sent[0]
-	if msg.Title != "🟢 Claude 额度状态通知" || !strings.Contains(msg.Body, "５Ｈ：100%") || !strings.Contains(msg.Body, "状态：Normal（额度充足）") {
+	if msg.Title != "🟢 Claude 额度状态通知" || !strings.Contains(msg.Body, "５Ｈ： 100%") || !strings.Contains(msg.Body, "状态： Normal（额度充足）") {
 		t.Fatalf("recovery %+v", msg)
 	}
 }
@@ -668,7 +668,7 @@ func TestRecoveryAfterExhaustedNotifiesOnlyAfterUsedUpCycle(t *testing.T) {
 	at = reset.Add(time.Minute)
 	reset = at.Add(5 * time.Hour)
 	a.ProcessGroup(context.Background(), st, fiveHour(100, reset), at)
-	if len(sender.sent) != sent+1 || !strings.Contains(sender.sent[sent].Body, "５Ｈ：100%") || !strings.Contains(sender.sent[sent].Body, "状态：Normal（额度充足）") {
+	if len(sender.sent) != sent+1 || !strings.Contains(sender.sent[sent].Body, "５Ｈ： 100%") || !strings.Contains(sender.sent[sent].Body, "状态： Normal（额度充足）") {
 		t.Fatalf("want a recovery after the used-up cycle, got %+v", sender.sent)
 	}
 	// The next cycle is not used up, so its reset is not notified.
@@ -772,7 +772,7 @@ func TestPreviousCycleIgnoresReadingsAfterTheReset(t *testing.T) {
 	// The provider still reports the passed reset time with the new value.
 	a.ProcessGroup(context.Background(), st, fiveHour(100, r1), r1.Add(time.Minute))
 	a.ProcessGroup(context.Background(), st, fiveHour(100, r1.Add(5*time.Hour)), r1.Add(2*time.Minute))
-	if len(sender.sent) != 1 || !strings.Contains(sender.sent[0].Body, "５Ｈ：100%") || !strings.Contains(sender.sent[0].Body, "状态：Normal（额度充足）") {
+	if len(sender.sent) != 1 || !strings.Contains(sender.sent[0].Body, "５Ｈ： 100%") || !strings.Contains(sender.sent[0].Body, "状态： Normal（额度充足）") {
 		t.Fatalf("want 63%% from before the reset, got %+v", sender.sent)
 	}
 }
