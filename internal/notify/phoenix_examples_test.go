@@ -223,11 +223,11 @@ func TestNotificationExamples(t *testing.T) {
 	}
 	show("账号异常", credential.Title, credential.Body)
 
-	suspended := CredentialMessage(LangZH, g, Problem{Kind: KindSuspended}, time.Local, now)
+	suspended := CredentialMessage(LangZH, g, Problem{Kind: KindSuspended, Status: "403", Code: "TOS_VIOLATION"}, time.Local, now)
 	if suspended.Title != "🔴 GPT 账号已停用" {
 		t.Errorf("suspended title = %q", suspended.Title)
 	}
-	if !strings.Contains(suspended.Body, "账号已被停用，请检查凭证。") {
+	if !strings.Contains(suspended.Body, "账号已被停用，请检查凭证。（403 · TOS_VIOLATION）") {
 		t.Errorf("suspended body = %q", suspended.Body)
 	}
 	show("账号已停用", suspended.Title, suspended.Body)
