@@ -27,6 +27,7 @@ const (
 	KindReminder   = "reminder"
 	KindCooldown   = "cooldown"
 	KindCircuit    = "circuit"
+	KindStale      = "stale"
 	KindPlan       = "plan"
 	KindCodexReset = "codex_reset"
 	KindTest       = "test"
