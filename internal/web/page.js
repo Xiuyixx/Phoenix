@@ -1345,9 +1345,9 @@
       return { kind: "muted", text: blocked, title: until ? tr("blocked_until", fmtDateTime(until)) : tr("blocked_wait") };
     }
     var circuit = parseTime(t.circuit_until);
-    if (circuit) return { kind: "failure", text: tr("paused_until", fmtDateTime(circuit)), title: t.circuit_reason };
-    if (t.consecutive_failures > 0) return { kind: "warning", text: tr("failures", t.consecutive_failures), title: t.last_error };
-    if (t.last_error) return { kind: "warning", text: tr("last_failed"), title: t.last_error };
+    if (circuit) return { kind: "failure", text: tr("paused_until", fmtDateTime(circuit)), hover: t.circuit_reason };
+    if (t.consecutive_failures > 0) return { kind: "warning", text: tr("failures", t.consecutive_failures), hover: t.last_error };
+    if (t.last_error) return { kind: "warning", text: tr("last_failed"), hover: t.last_error };
     if (t.rolling) return { kind: "muted", text: tr("rolling") };
     return { kind: "success", text: tr("normal") };
   }
@@ -1387,6 +1387,11 @@
       var next = parseTime(t.next_due), reset = parseTime(t.reset), last = parseTime(t.last_success);
       var statusCell = el("td", {}, [badge(st.kind, st.text)]);
       if (st.title) statusCell.appendChild(el("div", { class: "cell-note" }, maskedNodes(st.title)));
+      // The failure reason stays out of the column: the full error text is
+      // long and turns the table into a wall of text, so it goes to the
+      // hover tooltip instead. Tooltips that name accounts are left out
+      // while masked, like the other title tooltips on this page.
+      if (st.hover && !(masked && hasSecret(st.hover))) statusCell.title = st.hover;
       body.appendChild(el("tr", {}, [
         el("td", { class: "strong" }, maskedNodes(t.label)),
         el("td", { class: "mono", text: next ? fmtDateTimeDay(next) : "—" }),
