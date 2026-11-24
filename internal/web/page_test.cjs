@@ -1344,3 +1344,40 @@ test("the client commands quote the address and the key for the shell, and the J
   assert.deepEqual(words(snippets.mcp_stdio), ["mcp-remote", url, "--header", "Authorization: Bearer " + secret]);
   assert.deepEqual(JSON.parse(snippets.mcp_json), { mcpServers: { phoenix: { type: "http", url, headers: { Authorization: "Bearer " + secret } } } });
 });
+
+test("I18N keys are unique and reset_now stays the countdown state", () => {
+  // Extract a language block by brace matching: a later key with the same
+  // name would silently win in the object literal, so check the raw text.
+  function block(lang) {
+    const start = source.indexOf("    " + lang + ": {");
+    assert.ok(start >= 0, lang);
+    let depth = 0;
+    for (let i = start; i < source.length; i++) {
+      if (source[i] === "{") depth++;
+      if (source[i] === "}") {
+        depth--;
+        if (depth === 0) return source.slice(start, i + 1);
+      }
+    }
+    assert.fail(lang + " block not closed");
+  }
+  const dict = {};
+  for (const lang of ["zh", "en"]) {
+    const text = block(lang);
+    const keys = [...text.matchAll(/^\s{6}([A-Za-z0-9_]+):/gm)].map((m) => m[1]);
+    assert.equal(new Set(keys).size, keys.length, lang + " has duplicate I18N keys");
+    dict[lang] = vm.runInContext("(" + text.slice(text.indexOf("{")) + ")", vm.createContext({}));
+  }
+  // reset_now is the countdown state ("already reset"); the reset button
+  // has its own key so it cannot shadow it again.
+  assert.equal(dict.zh.reset_now, "已重置");
+  assert.equal(dict.en.reset_now, "reset");
+  assert.equal(dict.zh.reset_action, "立即重置");
+  assert.equal(dict.en.reset_action, "Reset now");
+  const ctx = context(["translate", "fmtCountdown"], { I18N: dict, lang: "zh" });
+  assert.equal(ctx.fmtCountdown(0), "已重置");
+  assert.equal(ctx.translate("reset_action"), "立即重置");
+  ctx.lang = "en";
+  assert.equal(ctx.fmtCountdown(0), "reset");
+  assert.equal(ctx.translate("reset_action"), "Reset now");
+});
