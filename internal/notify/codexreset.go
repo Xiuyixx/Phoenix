@@ -16,8 +16,9 @@ import (
 	"github.com/Xiuyixx/Phoenix/internal/store"
 )
 
-// DidCodexResetURL lists the latest Did Codex Reset records.
-const DidCodexResetURL = "https://didcodexreset.com/openapi/v1/records?kind=all&page=1&pageSize=10"
+// DidCodexResetURL lists the latest Did Codex Reset records. It is a
+// variable so tests can point FetchResetRecords at a local server.
+var DidCodexResetURL = "https://didcodexreset.com/openapi/v1/records?kind=all&page=1&pageSize=10"
 
 const maxSeenKeys = 100
 
