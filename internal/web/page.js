@@ -186,7 +186,7 @@
       cooldown: "CPA 冷却到 {0}（{1}）",
       blocked_5h: "5 小时额度已用完", blocked_7d: "7 天额度已用完", blocked_other: "{0}额度已用完",
       blocked_until: "{0} 重置后恢复点火", blocked_wait: "额度恢复后恢复点火",
-      paused_until: "暂停至 {0}", failures: "失败 {0} 次", rolling: "窗口未开始", normal: "正常",
+      paused_until: "暂停至 {0}", failures: "失败 {0} 次", last_failed: "上次点火失败", rolling: "窗口未开始", normal: "正常",
       ignition_note: "每天 {0}:00 开始，之后在每次重置后 {1} 秒点火，最晚到 {2}。",
       no_targets: "没有启用点火的额度组。",
       ignite_now: "立即点火",
@@ -371,7 +371,7 @@
       cooldown: "CPA cooldown until {0} ({1})",
       blocked_5h: "5-hour quota used up", blocked_7d: "7-day quota used up", blocked_other: "{0} quota used up",
       blocked_until: "Ignition resumes after the reset at {0}", blocked_wait: "Ignition resumes when the quota recovers",
-      paused_until: "Paused until {0}", failures: "{0} failures", rolling: "Window not started", normal: "Normal",
+      paused_until: "Paused until {0}", failures: "{0} failures", last_failed: "Last ignition failed", rolling: "Window not started", normal: "Normal",
       ignition_note: "Starts at {0}:00 every day, then ignites {1} seconds after each reset, until {2}.",
       no_targets: "No quota group has ignition enabled.",
       ignite_now: "Ignite now",
@@ -1347,6 +1347,7 @@
     var circuit = parseTime(t.circuit_until);
     if (circuit) return { kind: "failure", text: tr("paused_until", fmtDateTime(circuit)), title: t.circuit_reason };
     if (t.consecutive_failures > 0) return { kind: "warning", text: tr("failures", t.consecutive_failures), title: t.last_error };
+    if (t.last_error) return { kind: "warning", text: tr("last_failed"), title: t.last_error };
     if (t.rolling) return { kind: "muted", text: tr("rolling") };
     return { kind: "success", text: tr("normal") };
   }
