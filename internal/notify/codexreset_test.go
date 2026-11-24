@@ -13,7 +13,7 @@ import (
 // path is covered end to end instead of only the record processing.
 func TestFetchResetRecords(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("kind") != "all" || r.Header.Get("Accept") != "application/json" {
+		if r.URL.Query().Get("kind") != "all" || r.URL.Query().Get("page") != "1" || r.URL.Query().Get("pageSize") != "10" || r.Header.Get("Accept") != "application/json" {
 			t.Errorf("request = %s accept = %q", r.URL, r.Header.Get("Accept"))
 		}
 		if got := r.Header.Get("User-Agent"); got != "Phoenix/test" {
@@ -22,6 +22,7 @@ func TestFetchResetRecords(t *testing.T) {
 		fmt.Fprint(w, `{"ok":true,"data":{"items":[
 			{"id":"1","kind":"reset_completed","resetType":"global"},
 			{"kind":"reset_completed"},
+			null,
 			{"id":"2","kind":"reset_scheduled","resetType":"banked"}
 		]}}`)
 	}))
@@ -50,6 +51,8 @@ func TestFetchResetRecordsErrors(t *testing.T) {
 			w.WriteHeader(http.StatusBadGateway)
 		case "/bad-payload":
 			fmt.Fprint(w, `{"ok":false}`)
+		case "/bad-json":
+			fmt.Fprint(w, `{not json`)
 		default:
 			fmt.Fprint(w, `{"ok":true,"data":{"items":[]}}`)
 		}
@@ -64,6 +67,7 @@ func TestFetchResetRecordsErrors(t *testing.T) {
 	}{
 		{"non-200", "/bad-status"},
 		{"not-ok payload", "/bad-payload"},
+		{"malformed JSON", "/bad-json"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			DidCodexResetURL = server.URL + tc.path
@@ -71,5 +75,16 @@ func TestFetchResetRecordsErrors(t *testing.T) {
 				t.Fatalf("FetchResetRecords(%s) unexpectedly succeeded", tc.path)
 			}
 		})
+	}
+}
+
+// A transport failure (here: connection refused) must surface as an
+// error instead of an empty record list.
+func TestFetchResetRecordsTransportError(t *testing.T) {
+	oldURL := DidCodexResetURL
+	t.Cleanup(func() { DidCodexResetURL = oldURL })
+	DidCodexResetURL = "http://127.0.0.1:1/openapi/v1/records?kind=all&page=1&pageSize=10"
+	if _, err := FetchResetRecords(context.Background(), nil, "Phoenix/test"); err == nil {
+		t.Fatal("FetchResetRecords unexpectedly succeeded")
 	}
 }
