@@ -55,7 +55,7 @@ func TestSuffixedLabelQuotaTitleAndModelLine(t *testing.T) {
 	if title != "🟢 GPT 额度状态通知" {
 		t.Errorf("title = %q", title)
 	}
-	if !strings.HasPrefix(body, "账号： user@example.com\n模型：Codex / GPT\n") {
+	if !strings.HasPrefix(body, "账号： user@example.com\n模型： Codex / GPT\n") {
 		t.Errorf("body = %q", body)
 	}
 	if strings.Contains(title, "#") || strings.Contains(body, "#") {
@@ -66,7 +66,7 @@ func TestSuffixedLabelQuotaTitleAndModelLine(t *testing.T) {
 	if title != "⏰ GPT 重置提醒" {
 		t.Errorf("reminder title = %q", title)
 	}
-	if !strings.Contains(body, "模型：Codex / GPT\n") {
+	if !strings.Contains(body, "模型： Codex / GPT\n") {
 		t.Errorf("reminder body = %q", body)
 	}
 }
@@ -79,7 +79,7 @@ func TestSuffixedLabelOtherPhoenixTitles(t *testing.T) {
 	if cooldown.Title != "⚠️ GPT 冷却过期提醒" {
 		t.Errorf("cooldown title = %q", cooldown.Title)
 	}
-	if !strings.Contains(cooldown.Body, "模型：Codex / GPT\n") {
+	if !strings.Contains(cooldown.Body, "模型： Codex / GPT\n") {
 		t.Errorf("cooldown body = %q", cooldown.Body)
 	}
 
@@ -100,7 +100,7 @@ func TestSuffixedLabelOtherPhoenixTitles(t *testing.T) {
 		if msg.Title != tc.title {
 			t.Errorf("%s title = %q, want %q", tc.kind, msg.Title, tc.title)
 		}
-		if !strings.Contains(msg.Body, "模型：Codex / GPT\n") {
+		if !strings.Contains(msg.Body, "模型： Codex / GPT\n") {
 			t.Errorf("%s body = %q", tc.kind, msg.Body)
 		}
 	}
@@ -119,7 +119,7 @@ func TestSuffixedLabelAntigravityGroups(t *testing.T) {
 	if title != "🟢 Gemini 额度状态通知" {
 		t.Errorf("gemini title = %q", title)
 	}
-	if !strings.Contains(body, "模型：Antigravity / Gemini\n") {
+	if !strings.Contains(body, "模型： Antigravity / Gemini\n") {
 		t.Errorf("gemini body = %q", body)
 	}
 
@@ -134,7 +134,7 @@ func TestSuffixedLabelAntigravityGroups(t *testing.T) {
 	if title != "🟢 Claude / GPT 额度状态通知" {
 		t.Errorf("claude/gpt title = %q", title)
 	}
-	if !strings.Contains(body, "模型：Antigravity / Claude / GPT\n") {
+	if !strings.Contains(body, "模型： Antigravity / Claude / GPT\n") {
 		t.Errorf("claude/gpt body = %q", body)
 	}
 }
