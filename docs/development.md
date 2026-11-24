@@ -66,16 +66,16 @@ Actions 产物，不创建 Release。
 `VERSION`、`main.go` 的 `pluginVersion` 默认值与 `CHANGELOG.md` 的条目必须
 保持一致，`make check-version` 校验这三处。
 
-每次功能、修复或文档变更都递增版本号，例如从 0.1.2 到 0.1.3。发版前按顺序执行：
+每次功能、修复或文档变更都递增版本号，例如从 0.1.4 到 0.1.5。发版前按顺序执行：
 
 ```bash
-make check-version VERSION=0.1.3
+make check-version VERSION=0.1.5
 go test ./...
 git add .
 git commit -m "..."
 git push origin master
-git tag -a v0.1.3 -m "Phoenix v0.1.3"
-git push origin v0.1.3
+git tag -a v0.1.5 -m "Phoenix v0.1.5"
+git push origin v0.1.5
 ```
 
 推送版本 tag 后，GitHub Actions 会自动构建并发布；发布完成后在
