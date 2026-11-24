@@ -81,7 +81,7 @@ func providerDisplayName(provider string) string {
 	}
 }
 
-// cleanLabel strips the account suffix ("#name", or a masked "#xx" when
+// cleanLabel strips the account suffix ("#name", or the full email when
 // two accounts share a name) from a group label, so titles and the 模型
 // line name the service only ("GPT", "Gemini", "Claude / GPT"). The
 // account itself stays on the 账号 line. Labels without a suffix pass
