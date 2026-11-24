@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5 - 2026-11-24
+
+- 修复面板倒计时归零文案：I18N 里 `reset_now` 键重复，倒计时归零时显示的是“立即重置”；重置按钮改用新键 `reset_action`，倒计时归零恢复显示“已重置”/“reset”，与 Lamplighter 一致；页面测试新增 I18N 键唯一性断言。
+- 中文账号停用通知恢复错误码与状态：状态行后追加 `（403 · TOS_VIOLATION）` 形式的信息，与 Lamplighter 一致；英文文案与事件 Detail 本就包含该信息。
+- Did Codex Reset 拉取地址改为包级变量，新增 httptest 端到端测试覆盖拉取与解析（成功、非 200、异常 payload）。
+- README 与开发文档里的版本号更新到 0.1.5；修正一处从 Lamplighter 抄来的注释版本号。
+
 ## 0.1.4 - 2026-11-24
 
 - 新增仓库根目录 `registry.json`，为上架 CLIProxyAPI 官方插件商店做准备：schema_version 1，github-release 安装方式，含英文描述、作者、仓库、许可证与 zh-CN 本地化描述。
