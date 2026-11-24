@@ -55,7 +55,7 @@ func TestSuffixedLabelQuotaTitleAndModelLine(t *testing.T) {
 	if title != "🟢 GPT 额度状态通知" {
 		t.Errorf("title = %q", title)
 	}
-	if !strings.HasPrefix(body, "账号：user@example.com\n模型：Codex / GPT\n") {
+	if !strings.HasPrefix(body, "账号： user@example.com\n模型：Codex / GPT\n") {
 		t.Errorf("body = %q", body)
 	}
 	if strings.Contains(title, "#") || strings.Contains(body, "#") {
