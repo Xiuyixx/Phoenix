@@ -159,5 +159,14 @@ func (t *Telegram) sendOne(ctx context.Context, chatID, text string) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("Telegram HTTP %d: %s", resp.StatusCode, truncate(strings.TrimSpace(string(body)), 200))
 	}
+	// A 200 with ok=false is still a failed delivery: without this check
+	// the message would be silently lost while the panel reports success.
+	var result struct {
+		OK          *bool  `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(body, &result); err == nil && result.OK != nil && !*result.OK {
+		return fmt.Errorf("Telegram API ok=false: %s", truncate(strings.TrimSpace(result.Description), 200))
+	}
 	return nil
 }
