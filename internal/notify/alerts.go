@@ -707,6 +707,9 @@ func CredentialMessage(lang string, g Group, p Problem, loc *time.Location, now 
 		case KindSuspended:
 			title = fmt.Sprintf("🔴 %s 账号已停用", cleanLabel(g.Label))
 			status = "账号已被停用，请检查凭证。"
+			if head := joinNonEmpty(" · ", p.Status, p.Code); head != "" {
+				status += "（" + head + "）"
+			}
 			if p.AppealURL != "" {
 				status += "申诉：" + p.AppealURL
 			}
