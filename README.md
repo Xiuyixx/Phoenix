@@ -6,7 +6,7 @@
 
 Phoenix 是一个面向 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的原生插件，围绕 Codex、Claude 与 Antigravity 订阅凭证提供额度状态、账号错误通知、自动点火、自动重置以及管理页面操作入口。Kimi 与 Grok 在服务列表中标记为不支持，不参与轮询与点火。
 
-当前版本：`0.1.3`。通知支持 Bark、Telegram 与 webhook 三个渠道，Telegram 为 Phoenix 默认提供的渠道；reset credit 自动/手动重置是 Phoenix 相对底本的差异功能。
+当前版本：`0.1.5`。通知支持 Bark、Telegram 与 webhook 三个渠道，Telegram 为 Phoenix 默认提供的渠道；reset credit 自动/手动重置是 Phoenix 相对底本的差异功能。
 
 ## 目录
 
@@ -48,12 +48,12 @@ uname -m
 - `x86_64` → `amd64`。
 - `aarch64` 或 `arm64` → `arm64`。
 
-打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.1.3`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
+打开 [Phoenix Releases](https://github.com/Xiuyixx/Phoenix/releases)，选择目标版本，例如 `v0.1.5`，下载与 CPA 运行平台匹配的压缩包和对应 `.sha256` 文件。
 
 Linux amd64 示例：
 
 ```bash
-VERSION=0.1.3
+VERSION=0.1.5
 mkdir -p /tmp/phoenix-$VERSION
 cd /tmp/phoenix-$VERSION
 curl -fL -o phoenix.zip "https://github.com/Xiuyixx/Phoenix/releases/download/v$VERSION/phoenix_${VERSION}_linux_amd64.zip"
@@ -71,7 +71,7 @@ unzip -o phoenix.zip
 Windows 使用 PowerShell 校验：
 
 ```powershell
-$version = "0.1.3"
+$version = "0.1.5"
 $file = "phoenix_${version}_windows_amd64.zip"
 (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
 Get-Content "${file}.sha256"
