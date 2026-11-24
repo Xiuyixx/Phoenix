@@ -492,6 +492,20 @@ func TestFormatTime(t *testing.T) {
 	}
 }
 
+func TestStaleQuotaMessage(t *testing.T) {
+	since := time.Date(2026, 11, 25, 3, 55, 0, 0, time.UTC)
+	now := time.Date(2026, 11, 25, 5, 55, 0, 0, time.UTC)
+	shanghai := time.FixedZone("CST", 8*3600)
+	zh := StaleQuotaMessage(LangZH, Group{Key: "codex:aa:codex:main", Label: "GPT#aa@1717077.xyz", Provider: "codex", Account: "aa@1717077.xyz"}, since, shanghai, now)
+	if zh.Kind != KindStale || zh.Title != "⚠️ GPT 额度数据已过期" || !strings.Contains(zh.Body, "账号： aa@1717077.xyz") || !strings.Contains(zh.Body, "数据停留在 11/25 周三 11:55") {
+		t.Fatalf("stale zh %+v", zh)
+	}
+	en := StaleQuotaMessage(LangEN, Group{Label: "GPT#aa@1717077.xyz"}, since, time.UTC, now)
+	if en.Title != "⚠️ GPT#aa@1717077.xyz quota data is stale" || !strings.Contains(en.Body, "11/25 Wed 03:55") {
+		t.Fatalf("stale en %+v", en)
+	}
+}
+
 // The content kept for a sent schedule has no weekday, so that a later post
 // repeating a schedule sent before weekdays were shown is not taken for a
 // change.
