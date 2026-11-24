@@ -354,6 +354,67 @@ func mcpText(t *testing.T, e *Engine, tool string, args map[string]string) strin
 	return string(raw)
 }
 
+// A 402 deactivated_workspace on the quota endpoint is a suspension from
+// the first query: the workspace was disabled upstream, as on 2026-11-25,
+// when six accounts stopped refreshing quota and no notification was sent.
+func TestDeactivatedWorkspaceQueryNotifiesAtOnce(t *testing.T) {
+	c := &clock{t: time.Date(2026, 11, 25, 5, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	base := h.http
+	h.http = func(req pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+		if req.URL == providers.CodexUsageURL && req.Headers.Get("Authorization") == "Bearer t1" {
+			return pluginapi.HTTPResponse{StatusCode: 402, Body: []byte(`{"error":{"message":"Payment Required","code":"deactivated_workspace"},"status":402}`)}
+		}
+		return base(req)
+	}
+	e, sender := newTestEngine(t, h, c)
+	ctx := context.Background()
+	e.poll(ctx, e.config(), c.t, "", true)
+	suspended := messagesOf(sender, notify.KindSuspended)
+	if len(sender.sent) != 1 || len(suspended) != 1 || !strings.Contains(suspended[0].Title, "账号已停用") || !strings.Contains(suspended[0].Body, "402 · deactivated_workspace") {
+		t.Fatalf("want one suspension notification, got %+v", sender.sent)
+	}
+	invalid := eventsOf(e, "credential_invalid")
+	if len(invalid) != 1 || invalid[0].Params["reason"] != "suspended" || invalid[0].Params["source"] != "query" || invalid[0].Params["code"] != "deactivated_workspace" || invalid[0].Params["status"] != "402" {
+		t.Fatalf("events %+v", invalid)
+	}
+}
+
+// A stale quota reading notifies once per episode: the second check stays
+// silent, and a fresh reading in between lets the next episode notify
+// again.
+func TestStaleQuotaNotifiesOncePerEpisode(t *testing.T) {
+	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
+	h := standardHost(c)
+	e, sender := newTestEngine(t, h, c)
+	ctx := context.Background()
+	e.poll(ctx, e.config(), c.t, "", false)
+	age := func() {
+		aged := c.t.Add(-31 * time.Minute).Unix()
+		for _, g := range e.groups {
+			if g.AuthIndex == "1" {
+				e.state.Group(g.Key).LastSeen = aged
+			}
+		}
+	}
+	age()
+	e.checkStaleQuotas(ctx, e.config())
+	stale := messagesOf(sender, notify.KindStale)
+	if len(stale) != 1 || !strings.Contains(stale[0].Title, "额度数据已过期") || !strings.Contains(stale[0].Body, "alice.work@example.com") {
+		t.Fatalf("want one stale notification, got %+v", sender.sent)
+	}
+	e.checkStaleQuotas(ctx, e.config())
+	if len(messagesOf(sender, notify.KindStale)) != 1 {
+		t.Fatalf("stale episode repeated: %+v", sender.sent)
+	}
+	e.poll(ctx, e.config(), c.t, "", true)
+	age()
+	e.checkStaleQuotas(ctx, e.config())
+	if len(messagesOf(sender, notify.KindStale)) != 2 {
+		t.Fatalf("second stale episode must notify again, got %+v", sender.sent)
+	}
+}
+
 // A 401 that names a disabled account is a suspension from the first query,
 // also for an account whose first query fails and that has no quota group;
 // MCP still reports its event, also after a restart.
