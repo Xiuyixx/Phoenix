@@ -33,8 +33,15 @@ func checkManualFailure(t *testing.T, e *Engine, sender *fakeSender, c *clock, c
 		}
 		got := *ts
 		got.LastAttemptEpoch = before.LastAttemptEpoch
+		// A manual failure records its error text for display, but the
+		// automatic retry, circuit and credential state must not move.
+		got.LastError = before.LastError
+		got.LastFailureEpoch = before.LastFailureEpoch
 		if !reflect.DeepEqual(got, before) || !e.schedule(e.config()).DueAt(ts, chosen.reset, c.t).Equal(due) {
 			t.Fatalf("manual failure changed automatic state: before=%+v after=%+v", before, ts)
+		}
+		if ts.LastError != truncateText(err.Error(), 500) || ts.LastFailureEpoch != float64(c.t.UnixNano())/1e9 {
+			t.Fatalf("manual failure must record its error: last_error=%q last_failure=%v", ts.LastError, ts.LastFailureEpoch)
 		}
 		ev := e.events[len(e.events)-1]
 		if p := ev.Params; ev.Kind != "ignite_failed" || p["manual"] != "1" || p["error"] != err.Error() || p["summary"] == "" || p["retry_seconds"] != "" ||
