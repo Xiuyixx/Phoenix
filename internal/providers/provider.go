@@ -173,8 +173,10 @@ func Request(p *Provider, model string) (string, []byte, error) {
 // Antigravity. A configured override goes first, then the listed candidates
 // for the provider, then gpt-5-codex as a last resort for Codex when it is
 // in the list: a rejected override must fall back instead of ending the
-// ignition. The override must exist in available; a missing override is
-// still an error. Only models from available are returned.
+// ignition. The fallback to the listed candidates also applies when the
+// override belongs to a non-Codex provider. The override must exist in
+// available; a missing override is still an error. Only models from
+// available are returned.
 func Candidates(p *Provider, group, override string, available []string) ([]string, error) {
 	if override != "" {
 		for _, model := range available {
