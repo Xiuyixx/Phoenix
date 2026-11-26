@@ -627,40 +627,7 @@ func (e *Engine) run() {
 		e.nextPoll = nextPoll
 		e.mu.Unlock()
 
-		wakeAt := now.Add(maxSleep)
-		for _, candidate := range []time.Time{nextPoll, nextEnabledCheck, nextPrune} {
-			if candidate.Before(wakeAt) {
-				wakeAt = candidate
-			}
-		}
-		if enabled && cfg.CodexResetUpdates.Enabled && nextFeed.Before(wakeAt) {
-			wakeAt = nextFeed
-		}
-		if enabled && release.Comparable(e.version) && nextRelease.Before(wakeAt) {
-			wakeAt = nextRelease
-		}
-		if enabled && cfg.Ignition.Enabled {
-			if due := e.nextDue(cfg); !due.IsZero() && due.Before(wakeAt) {
-				wakeAt = due
-			}
-		}
-		if enabled {
-			// A query that came due while this round ran is run right away.
-			if due, probe := e.probes(e.now()); len(due) > 0 {
-				wakeAt = e.now()
-			} else if !probe.IsZero() && probe.Before(wakeAt) {
-				wakeAt = probe
-			}
-		}
-		if len(e.pendingSamp) > 0 {
-			if flush := e.now().Add(time.Minute); flush.Before(wakeAt) {
-				wakeAt = flush
-			}
-		}
-		wait := wakeAt.Sub(e.now())
-		if wait < 0 {
-			wait = 0
-		}
+		wait := e.nextWake(now, cfg, enabled, nextPoll, nextFeed, nextRelease, nextEnabledCheck, nextPrune)
 		timer := time.NewTimer(wait)
 		select {
 		case <-e.stopCh:
@@ -680,6 +647,50 @@ func (e *Engine) run() {
 	}
 	e.flushSamples(e.now(), true)
 	e.saveState()
+}
+
+// nextWake returns how long the loop sleeps before its next round. Only
+// deadlines of work that is actually scheduled count: a stale deadline of
+// disabled work would otherwise wake the loop at once on every round. That
+// is what nextRelease does when the automatic release check is off: it is
+// never advanced, so without the releaseAutoCheck guard the loop would spin
+// with no sleep whenever the plugin is enabled.
+func (e *Engine) nextWake(now time.Time, cfg config.Config, enabled bool, nextPoll, nextFeed, nextRelease, nextEnabledCheck, nextPrune time.Time) time.Duration {
+	wakeAt := now.Add(maxSleep)
+	for _, candidate := range []time.Time{nextPoll, nextEnabledCheck, nextPrune} {
+		if candidate.Before(wakeAt) {
+			wakeAt = candidate
+		}
+	}
+	if enabled && cfg.CodexResetUpdates.Enabled && nextFeed.Before(wakeAt) {
+		wakeAt = nextFeed
+	}
+	if enabled && releaseAutoCheck && release.Comparable(e.version) && nextRelease.Before(wakeAt) {
+		wakeAt = nextRelease
+	}
+	if enabled && cfg.Ignition.Enabled {
+		if due := e.nextDue(cfg); !due.IsZero() && due.Before(wakeAt) {
+			wakeAt = due
+		}
+	}
+	if enabled {
+		// A query that came due while this round ran is run right away.
+		if due, probe := e.probes(e.now()); len(due) > 0 {
+			wakeAt = e.now()
+		} else if !probe.IsZero() && probe.Before(wakeAt) {
+			wakeAt = probe
+		}
+	}
+	if len(e.pendingSamp) > 0 {
+		if flush := e.now().Add(time.Minute); flush.Before(wakeAt) {
+			wakeAt = flush
+		}
+	}
+	wait := wakeAt.Sub(e.now())
+	if wait < 0 {
+		wait = 0
+	}
+	return wait
 }
 
 // checkRelease reads the latest release and returns when to read it again.
