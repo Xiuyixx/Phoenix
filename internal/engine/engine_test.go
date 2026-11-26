@@ -934,6 +934,39 @@ func TestQueriesAroundResetRunOncePerReset(t *testing.T) {
 	}
 }
 
+// TestLoopSleepsWhenReleaseCheckIsOff: the automatic release check is off
+// by default, so nextRelease is never advanced past the loop start. A stale
+// nextRelease must not wake the loop at once: without the guard the loop
+// spins with no sleep whenever the plugin is enabled, and a single-core
+// server runs at 100% CPU.
+func TestLoopSleepsWhenReleaseCheckIsOff(t *testing.T) {
+	start := time.Date(2026, 11, 26, 10, 0, 0, 0, shanghai)
+	c := &clock{t: start}
+	h := standardHost(c)
+	e, _ := newTestEngine(t, h, c)
+	// A release version, like a deployed build: Comparable is true.
+	e.version = "0.1.15"
+	cfg := e.config()
+	cfg.Ignition.Enabled = false
+	cfg.CodexResetUpdates.Enabled = false
+	// nextRelease is stuck at the loop start; the next poll is 5 minutes
+	// out and the next enabled check 30 seconds out.
+	wait := e.nextWake(start, cfg, true, start.Add(5*time.Minute), start, start, start.Add(30*time.Second), start.Add(6*time.Hour))
+	if wait <= 0 {
+		t.Fatalf("loop must sleep with the release check off, got wait %v", wait)
+	}
+	if wait > 30*time.Second {
+		t.Fatalf("loop must wake for the enabled check, got wait %v", wait)
+	}
+	// With the check on, a due nextRelease does wake the loop at once.
+	releaseAutoCheck = true
+	t.Cleanup(func() { releaseAutoCheck = false })
+	wait = e.nextWake(start, cfg, true, start.Add(5*time.Minute), start, start, start.Add(30*time.Second), start.Add(6*time.Hour))
+	if wait != 0 {
+		t.Fatalf("loop must wake at once for a due release check, got wait %v", wait)
+	}
+}
+
 func TestPassiveRelativeResetCountsFromTheRequest(t *testing.T) {
 	c := &clock{t: time.Date(2026, 10, 4, 10, 0, 0, 0, shanghai)}
 	h := standardHost(c)
