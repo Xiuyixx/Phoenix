@@ -86,6 +86,15 @@ func (s Schedule) HeldUntil(ts *store.TargetState, now time.Time) time.Time {
 	return time.Time{}
 }
 
+// retryAt returns the pending retry time, if any. It leaves out the
+// post-success hold, which must not pull an ignition forward.
+func retryAt(ts *store.TargetState, now time.Time) time.Time {
+	if retry := epochTime(ts.RetryAtEpoch); retry.After(now) {
+		return retry
+	}
+	return time.Time{}
+}
+
 // DueAt returns when the target should be ignited next. reset is the current
 // 5-hour reset time, or zero when unknown.
 func (s Schedule) DueAt(ts *store.TargetState, reset, now time.Time) time.Time {
@@ -107,10 +116,19 @@ func (s Schedule) DueAt(ts *store.TargetState, reset, now time.Time) time.Time {
 		target := reset.Add(time.Duration(s.Cfg.GraceSeconds) * time.Second)
 		targetLocal := target.In(s.Loc)
 		sameDay := targetLocal.Year() == localNow.Year() && targetLocal.YearDay() == localNow.YearDay()
+		var due time.Time
 		if sameDay && !targetLocal.Before(start) && !targetLocal.After(end) {
-			return target.UTC()
+			due = target.UTC()
+		} else {
+			due = s.NextDailyStart(now)
 		}
-		return s.NextDailyStart(now)
+		// A retry pending from the previous window fires before the new
+		// window's ignition, so the window is not lost when it rolls over
+		// before the retry runs.
+		if retry := retryAt(ts, now); !retry.IsZero() && retry.Before(due) {
+			return retry
+		}
+		return due
 	}
 	if !hold.IsZero() {
 		return hold
@@ -148,7 +166,16 @@ func Observe(ts *store.TargetState, reset, now time.Time, passive bool) bool {
 	}
 	ts.RollingReset = rolling
 	if !rolling && !reset.IsZero() && reset.After(now) {
+		// A retry pending when the window rolls over survives into the
+		// new window, so a failure just before the reset is retried once
+		// instead of being dropped with the old cycle. A circuit pause
+		// is a deliberate backoff and still clears.
+		retry := float64(0)
+		if retryAt := epochTime(ts.RetryAtEpoch); retryAt.After(now) && !epochTime(ts.CircuitOpenUntilEpoch).After(now) {
+			retry = ts.RetryAtEpoch
+		}
 		ClearFailures(ts)
+		ts.RetryAtEpoch = retry
 	}
 	ts.ResetObservation = &store.Observation{SeenEpoch: epoch(now), ResetEpoch: resetEpoch}
 	return rolling

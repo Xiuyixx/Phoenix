@@ -92,6 +92,54 @@ func TestPassiveObservationIsNeverRolling(t *testing.T) {
 	}
 }
 
+// TestRolloverKeepsOneRetry covers the i@ outage: an ignition failed on
+// upstream overload just before the 5-hour window reset, and the retry was
+// lost when the window rolled over. A pending retry survives the rollover
+// and fires once in the new window instead of waiting for its reset.
+func TestRolloverKeepsOneRetry(t *testing.T) {
+	ts := &store.TargetState{}
+	// The old window resets at 10:20.
+	Observe(ts, local(10, 20), local(10, 19), false)
+	// The ignition at the reset fails; the retry is due in 5 minutes.
+	failAt := local(10, 20)
+	if o := schedule().RecordFailure(ts, failAt, errors.New("connection reset")); o.CircuitOpened || o.RetryIn != 5*time.Minute {
+		t.Fatalf("first failure %+v", o)
+	}
+	want := epochTime(epoch(failAt.Add(5 * time.Minute)))
+	// The window rolls over a minute later; the poll observes the new reset.
+	if Observe(ts, local(15, 20), local(10, 21), false) {
+		t.Fatal("a new fixed reset is not rolling")
+	}
+	if got := epochTime(ts.RetryAtEpoch); !got.Equal(want) {
+		t.Fatalf("retry must survive the rollover, got %v want %v", got.In(shanghai), want.In(shanghai))
+	}
+	if due := schedule().DueAt(ts, local(15, 20), local(10, 21)); !due.Equal(want) {
+		t.Fatalf("due must be the retry, got %v want %v", due.In(shanghai), want.In(shanghai))
+	}
+}
+
+// TestRolloverClearsCircuitPause covers the other side: a circuit pause is
+// a deliberate backoff, so a window rollover still clears it instead of
+// pulling an ignition forward.
+func TestRolloverClearsCircuitPause(t *testing.T) {
+	ts := &store.TargetState{}
+	Observe(ts, local(10, 20), local(10, 19), false)
+	now := local(10, 20)
+	err := &host.Error{Code: "host_call_failed", Message: "upstream rejected", Status: 429}
+	if o := schedule().RecordFailure(ts, now, err); !o.CircuitOpened {
+		t.Fatalf("hard failure must open the circuit: %+v", o)
+	}
+	if Observe(ts, local(15, 20), local(10, 21), false) {
+		t.Fatal("a new fixed reset is not rolling")
+	}
+	if ts.RetryAtEpoch != 0 || ts.CircuitOpenUntilEpoch != 0 {
+		t.Fatalf("circuit pause must clear on rollover: %+v", ts)
+	}
+	if due := schedule().DueAt(ts, local(15, 20), local(10, 21)); !due.Equal(local(15, 20).Add(3 * time.Second)) {
+		t.Fatalf("due must be the new reset plus grace, got %v", due.In(shanghai))
+	}
+}
+
 func TestHardFailureOpensCircuitImmediately(t *testing.T) {
 	ts := &store.TargetState{}
 	now := local(10, 0)
