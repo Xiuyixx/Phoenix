@@ -23,7 +23,8 @@ const (
 // access token yet, which its next refresh fixes. CPA refreshes credentials
 // every 15 minutes, so a rejection that lasts queryProblemAge and
 // queryProblemCount queries in a row is no expired token. A suspended
-// account is reported with the first query.
+// account, and a credential the provider revoked, are reported with the
+// first query.
 const (
 	queryProblemAge   = 30 * time.Minute
 	queryProblemCount = 3
@@ -137,9 +138,9 @@ func (e *Engine) credentialFingerprint(cred *Cred) string {
 	return providers.Fingerprint(raw)
 }
 
-// noteQueryFailure handles a failed quota query of cred. A suspended account
-// is a problem right away, a rejected credential once it lasts; see
-// queryProblemAge.
+// noteQueryFailure handles a failed quota query of cred. A suspended
+// account, and a credential the provider revoked, are a problem right away;
+// a rejected credential once it lasts; see queryProblemAge.
 func (e *Engine) noteQueryFailure(ctx context.Context, cred *Cred, fingerprint string, err error) {
 	if e.state == nil {
 		return
@@ -163,7 +164,7 @@ func (e *Engine) noteQueryFailure(ctx context.Context, cred *Cred, fingerprint s
 	}
 	st.QueryCount++
 	e.dirty = true
-	if d.Reason == failure.ReasonAuth && (st.QueryCount < queryProblemCount || now.Sub(time.Unix(st.QuerySince, 0)) < queryProblemAge) {
+	if d.Reason == failure.ReasonAuth && !failure.RevokedCode(d.Code) && (st.QueryCount < queryProblemCount || now.Sub(time.Unix(st.QuerySince, 0)) < queryProblemAge) {
 		return
 	}
 	e.noteCredentialProblem(ctx, cred, e.accountGroup(cred.AuthIndex), d, sourceQuery, fingerprint)

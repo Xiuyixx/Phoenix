@@ -181,6 +181,22 @@ func SuspendedCode(code string) bool {
 	return false
 }
 
+// revokedCodes are error codes that say the credential itself is dead: the
+// token was revoked or the refresh grant is invalid. Only logging in again
+// fixes it, so there is nothing to wait out.
+var revokedCodes = []string{"token_revoked", "invalid_grant", "refresh_token_invalidated"}
+
+// RevokedCode reports whether code names a credential that is dead.
+func RevokedCode(code string) bool {
+	code = strings.ToLower(strings.TrimSpace(code))
+	for _, known := range revokedCodes {
+		if code == known {
+			return true
+		}
+	}
+	return false
+}
+
 // SuspendedPhrase returns the suspendedPhrases entry text contains, empty
 // when there is none. The result is a constant and never provider text.
 func SuspendedPhrase(text string) string {

@@ -380,6 +380,33 @@ func TestDeactivatedWorkspaceQueryNotifiesAtOnce(t *testing.T) {
 	}
 }
 
+// A revoked credential notifies with the first query: the token is dead and
+// only logging in again fixes it, so there is nothing to wait out. This
+// covers the qqa@ outage, where the rejection was recorded but the
+// notification waited for the 30-minute threshold and never fired.
+func TestRevokedQueryNotifiesAtOnce(t *testing.T) {
+	c := &clock{t: time.Date(2026, 11, 28, 0, 40, 0, 0, shanghai)}
+	h := standardHost(c)
+	base := h.http
+	h.http = func(req pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+		if req.URL == providers.CodexUsageURL && req.Headers.Get("Authorization") == "Bearer t1" {
+			return pluginapi.HTTPResponse{StatusCode: 401, Body: []byte(`{"error":{"message":"Encountered invalidated oauth token for user, failing request","type":"invalid_request_error","code":"token_revoked"}}`)}
+		}
+		return base(req)
+	}
+	e, sender := newTestEngine(t, h, c)
+	ctx := context.Background()
+	e.poll(ctx, e.config(), c.t, "", true)
+	credential := messagesOf(sender, notify.KindCredential)
+	if len(sender.sent) != 1 || len(credential) != 1 || !strings.Contains(credential[0].Title, "账号异常") || !strings.Contains(credential[0].Body, "认证失败（HTTP 401），请检查凭证。") {
+		t.Fatalf("want one credential notification, got %+v", sender.sent)
+	}
+	invalid := eventsOf(e, "credential_invalid")
+	if len(invalid) != 1 || invalid[0].Params["reason"] != "auth" || invalid[0].Params["source"] != "query" || invalid[0].Params["code"] != "token_revoked" || invalid[0].Params["status"] != "401" {
+		t.Fatalf("events %+v", invalid)
+	}
+}
+
 // A stale quota reading notifies once per episode: the second check stays
 // silent, and a fresh reading in between lets the next episode notify
 // again.
